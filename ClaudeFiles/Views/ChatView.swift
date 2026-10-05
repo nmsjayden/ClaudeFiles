@@ -25,17 +25,12 @@ struct ChatView: View {
         .sheet(item: $vm.pendingWrite) { write in
             WriteApprovalSheet(write: write)
         }
-        .overlay(alignment: .top) {
-            if let err = vm.error {
-                Text(err)
-                    .font(.caption).padding(10)
-                    .background(Color.red.opacity(0.9))
-                    .foregroundColor(.white)
-                    .cornerRadius(8).padding(.top, 8)
-                    .onTapGesture { vm.error = nil }
-            }
+        .sheet(isPresented: Binding(
+            get: { vm.error != nil },
+            set: { if !$0 { vm.error = nil } }
+        )) {
+            ErrorSheet(message: vm.error ?? "", onDismiss: { vm.error = nil })
         }
-        .animation(.easeInOut, value: vm.error != nil)
     }
 
     // MARK: - Message list
@@ -132,6 +127,57 @@ struct TypingIndicator: View {
         .padding(12)
         .background(Color(.secondarySystemBackground)).cornerRadius(18)
         .onAppear { on = true }
+    }
+}
+
+// MARK: - Error sheet (copyable)
+
+struct ErrorSheet: View {
+    let message: String
+    let onDismiss: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Label("Error", systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                        .foregroundColor(.red)
+
+                    Text(message)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(Color(.secondarySystemBackground))
+                        .cornerRadius(10)
+
+                    Button {
+                        UIPasteboard.general.string = message
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                    } label: {
+                        Label(copied ? "Copied!" : "Copy error",
+                              systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.accentColor)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("Error")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { onDismiss(); dismiss() }
+                }
+            }
+        }
     }
 }
 

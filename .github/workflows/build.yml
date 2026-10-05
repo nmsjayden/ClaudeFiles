@@ -16,40 +16,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode 16.1
-        run: |
-          # Xcode 16.4 has an unfixable SwiftUICore linker bug.
-          # 16.1 doesn't ship SwiftUICore as a separate framework.
-          for v in 16.1 16.0; do
-            APP="/Applications/Xcode_${v}.app"
-            if [ -d "$APP" ]; then
-              sudo xcode-select -s "$APP/Contents/Developer"
-              echo "Selected Xcode $v"
-              break
-            fi
-          done
-          xcodebuild -version
+      - name: Show Xcode version
+        run: xcodebuild -version
 
-      - name: Install XcodeGen (compatible version)
-        run: |
-          # Install XcodeGen 2.38.0 which generates project format
-          # compatible with Xcode 16.1 (not format 77)
-          brew tap xcodegen/xcodegen 2>/dev/null || true
-          brew install xcodegen
-          xcodegen version
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
-
-      - name: Downgrade project format if needed
-        run: |
-          # If XcodeGen generated format 77, downgrade to 56
-          OBJVER=$(grep -m1 objectVersion ClaudeFiles.xcodeproj/project.pbxproj | tr -dc '0-9')
-          echo "Project format: $OBJVER"
-          if [ "$OBJVER" -gt "56" ]; then
-            echo "Downgrading from $OBJVER to 56..."
-            sed -i '' "s/objectVersion = $OBJVER/objectVersion = 56/" ClaudeFiles.xcodeproj/project.pbxproj
-          fi
 
       - name: Build archive (unsigned)
         env:
@@ -71,7 +45,7 @@ jobs:
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
               {
-                grep -E "error:|ld:|undefined|Undefined|linker" /tmp/build.log | tail -40
+                grep -E "error:|ld:|undefined|Undefined|symbol" /tmp/build.log | tail -40
                 echo "--- LAST 80 LINES ---"
                 tail -80 /tmp/build.log
               } > /tmp/errors_combined.txt

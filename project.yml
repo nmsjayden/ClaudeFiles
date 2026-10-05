@@ -1,6 +1,7 @@
 name: ClaudeFiles
 options:
   bundleIdPrefix: com.claudefiles
+  xcodeVersion: "14.0"
   deploymentTarget:
     iOS: "16.0"
 

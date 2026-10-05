@@ -1,0 +1,16 @@
+//
+//  ClaudeFiles-Bridging-Header.h
+//  Exposes the FilzaJailedDS sandbox-escape C/ObjC API to Swift.
+//
+
+// Core sandbox escape (walks kernel proc_ro → ucred → cr_label → sandbox)
+#import "FilzaJailedDS-SSV-Bypass/sandbox_escape.h"
+
+// Kernel exploit (opa334 exploit for iOS 17–26)
+#import "FilzaJailedDS-SSV-Bypass/kexploit/kexploit_opa334.h"
+
+// Kernel read/write utilities (proc_self, etc.)
+#import "FilzaJailedDS-SSV-Bypass/kexploit/kutils.h"
+
+// Sandbox extension patching (enables SSV-protected area writes)
+#import "FilzaJailedDS-SSV-Bypass/kexploit/sandbox.h"

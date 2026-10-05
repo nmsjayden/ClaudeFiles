@@ -9,7 +9,12 @@ targets:
     type: application
     platform: iOS
     sources:
-      - ClaudeFiles
+      - path: ClaudeFiles
+        excludes:
+          # Filza-specific Substrate tweak — replaced by SandboxManager.swift
+          - FilzaJailedDS-SSV-Bypass/Tweak.m
+          # Uses #import <substrate.h> (Cydia), won't compile in a normal app
+          - FilzaJailedDS-SSV-Bypass/FilzaPadlockBypass.m
     settings:
       base:
         SWIFT_VERSION: "5.9"
@@ -21,3 +26,14 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         ENABLE_BITCODE: "NO"
         INFOPLIST_FILE: ClaudeFiles/Info.plist
+        # Bridge Swift → FilzaJailedDS C/ObjC headers
+        SWIFT_OBJC_BRIDGING_HEADER: "ClaudeFiles/ClaudeFiles-Bridging-Header.h"
+        # Header search paths so #import "sandbox_escape.h" etc. resolve correctly
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kpf"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/SSV"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/utils"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src"

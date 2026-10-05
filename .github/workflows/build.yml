@@ -22,11 +22,29 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
-      - name: List generated files
+      - name: Dump project file for debugging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Root ===" && ls -la
-          echo "=== xcodeproj ===" && ls ClaudeFiles.xcodeproj/ 2>/dev/null || echo "No xcodeproj found"
-          echo "=== Schemes ===" && ls ClaudeFiles.xcodeproj/xcshareddata/xcschemes/ 2>/dev/null || echo "No schemes"
+          echo "=== ls root ===" && ls -la
+          echo "=== xcodeproj ===" && ls ClaudeFiles.xcodeproj/ 2>/dev/null || echo "MISSING"
+          
+          # Commit pbxproj so Claude can inspect it
+          if [ -f ClaudeFiles.xcodeproj/project.pbxproj ]; then
+            SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/debug-pbxproj.txt" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+            CONTENT=$(head -100 ClaudeFiles.xcodeproj/project.pbxproj | base64 | tr -d '\n')
+            PAYLOAD="{\"message\":\"debug pbxproj\",\"content\":\"$CONTENT\"}"
+            [ -n "$SHA" ] && PAYLOAD="{\"message\":\"debug pbxproj\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
+            curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/debug-pbxproj.txt" \
+              -d "$PAYLOAD"
+            echo "Committed pbxproj sample"
+          else
+            echo "No pbxproj found!"
+          fi
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
@@ -47,10 +65,10 @@ jobs:
             CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log || {
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
-                | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('sha',''))" 2>/dev/null || echo "")
-              CONTENT=$(grep -E "error:|warning:" /tmp/build.log | tail -150 | base64 | tr -d '\n')
-              PAYLOAD="{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\"}"
-              [ -n "$SHA" ] && PAYLOAD="{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
+                | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+              CONTENT=$(tail -100 /tmp/build.log | base64 | tr -d '\n')
+              PAYLOAD="{\"message\":\"build errors\",\"content\":\"$CONTENT\"}"
+              [ -n "$SHA" ] && PAYLOAD="{\"message\":\"build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
               curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
                 -H "Content-Type: application/json" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
@@ -61,7 +79,6 @@ jobs:
       - name: Package IPA
         run: |
           APP_PATH=$(find "$RUNNER_TEMP/ClaudeFiles.xcarchive" -name "*.app" -maxdepth 6 | head -1)
-          echo "App: $APP_PATH"
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP" && zip -r ClaudeFiles-unsigned.ipa Payload/

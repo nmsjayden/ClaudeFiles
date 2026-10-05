@@ -1,4 +1,1 @@
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][iphone][20x20][][][1x][][][][][2d][icon_20@1x.png]: warning: The app icon set "AppIcon" has an unassigned child.
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/SandboxManager.swift:42:41: warning: call to main actor-isolated static method 'runEscape()' in a synchronous nonisolated context; this is an error in the Swift 6 language mode
 /Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:1:10: error: 'choma/Fat.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')

@@ -10,22 +10,14 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-14
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode 16.2
-        run: |
-          # Xcode 16.4 has a SwiftUICore.tbd linker bug; 16.2 doesn't
-          ls /Applications/Xcode*.app/Contents/Developer || true
-          if [ -d "/Applications/Xcode_16.2.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
-          elif [ -d "/Applications/Xcode_16.1.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer
-          fi
-          xcodebuild -version
+      - name: Show Xcode version
+        run: xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -52,7 +44,6 @@ jobs:
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
-              # Capture: all errors/warnings PLUS the last 60 lines (linker detail)
               {
                 grep -E "error:|warning:|ld:|undefined|Undefined|linker" /tmp/build.log | tail -80
                 echo "--- LAST 60 LINES ---"

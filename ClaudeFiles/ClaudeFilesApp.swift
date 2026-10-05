@@ -8,9 +8,6 @@ struct ClaudeFilesApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(auth)
-                .onOpenURL { url in
-                    auth.handleCallback(url: url)
-                }
         }
     }
 }

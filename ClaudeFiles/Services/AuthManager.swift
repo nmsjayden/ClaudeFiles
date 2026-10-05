@@ -38,7 +38,8 @@ final class AuthManager: NSObject, ObservableObject {
 
         let verifier  = randomBase64(32)
         let challenge = pkceChallenge(verifier)
-        let state     = randomBase64(16)
+        // Claude Code uses the verifier itself as the state parameter
+        let state     = verifier
         pendingVerifier = verifier
         pendingState    = state
 

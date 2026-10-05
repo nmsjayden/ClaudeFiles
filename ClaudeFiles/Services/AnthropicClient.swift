@@ -1,39 +1,32 @@
 import Foundation
 
-// MARK: - Client
-
 final class AnthropicClient {
     private let apiURL    = URL(string: "https://api.anthropic.com/v1/messages")!
-    // Session ID is stable across requests in this app launch (one Claude Code process = one session)
     private let sessionId = UUID().uuidString.lowercased()
+
     @MainActor
-    func send(messages: [ChatMessage], system: String, accessToken: String) async throws -> APIResponse {
+    func sendStreaming(
+        messages: [ChatMessage],
+        system: String,
+        accessToken: String,
+        onEvent: @escaping (StreamEvent) -> Void
+    ) async throws {
         let model = SettingsStore.shared.selectedModel
 
-        // Add ?beta=true query param (part of Claude Code's signature)
         var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "beta", value: "true")]
         var req = URLRequest(url: components.url!)
         req.httpMethod = "POST"
 
-        // Core auth + API
         req.setValue("Bearer \(accessToken)",            forHTTPHeaderField: "Authorization")
         req.setValue("application/json",                 forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json",                 forHTTPHeaderField: "Accept")
+        req.setValue("text/event-stream",                forHTTPHeaderField: "Accept")
         req.setValue("2023-06-01",                       forHTTPHeaderField: "anthropic-version")
-
-        // Full Claude Code CLI 2.1.x beta header stack
         req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
                      forHTTPHeaderField: "anthropic-beta")
-
-        // Browser-direct access flag (required for OAuth validation since 2026-04-04)
         req.setValue("true",                             forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
-
-        // Claude Code CLI identity
         req.setValue("claude-cli/2.1.92 (external, cli)", forHTTPHeaderField: "User-Agent")
         req.setValue("cli",                               forHTTPHeaderField: "x-app")
-
-        // Stainless SDK fingerprint (lowercase — Claude Code uses lowercase)
         req.setValue("js",                                forHTTPHeaderField: "x-stainless-lang")
         req.setValue("0.74.0",                            forHTTPHeaderField: "x-stainless-package-version")
         req.setValue("MacOS",                             forHTTPHeaderField: "x-stainless-os")
@@ -42,43 +35,97 @@ final class AnthropicClient {
         req.setValue("v22.14.0",                          forHTTPHeaderField: "x-stainless-runtime-version")
         req.setValue("0",                                 forHTTPHeaderField: "x-stainless-retry-count")
         req.setValue("600",                               forHTTPHeaderField: "x-stainless-timeout")
-
-        // Per-request identity + stable session ID
         req.setValue(UUID().uuidString.lowercased(),      forHTTPHeaderField: "x-client-request-id")
         req.setValue(sessionId,                           forHTTPHeaderField: "x-claude-code-session-id")
 
-        // System prompt must be an array of blocks.
-        // The first block must be EXACTLY the Claude Code identifier so the server
-        // strips it as an attribution block. Our custom instructions go in a second block.
         let systemBlocks: [SystemBlock] = [
             SystemBlock(type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude."),
             SystemBlock(type: "text", text: system),
         ]
 
-        let body = RequestBody(model: model, maxTokens: 4096, system: systemBlocks,
-                               messages: messages, tools: FileToolDefinitions.all)
+        let body = RequestBody(model: model, maxTokens: 8192, stream: true,
+                               system: systemBlocks, messages: messages,
+                               tools: FileToolDefinitions.all)
         req.httpBody = try JSONEncoder().encode(body)
 
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
-        if http.statusCode != 200 {
-            let rawBody = String(data: data, encoding: .utf8) ?? "<non-utf8 body>"
-            let parsed  = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error.message
-            let msg = """
-            HTTP \(http.statusCode)
-            \(parsed.map { "Message: \($0)\n" } ?? "")
-            Raw response:
-            \(rawBody.prefix(2000))
-            """
-            throw APIError.serverError(msg)
+        let (bytes, response) = try await URLSession.shared.bytes(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.invalidResponse
         }
-        do {
-            return try JSONDecoder().decode(APIResponse.self, from: data)
-        } catch {
-            let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-            throw APIError.serverError("Decode failed: \(error.localizedDescription)\n\nRaw:\n\(raw.prefix(2000))")
+
+        if http.statusCode != 200 {
+            var buf = Data()
+            for try await byte in bytes { buf.append(byte) }
+            let raw = String(data: buf, encoding: .utf8) ?? "<non-utf8>"
+            throw APIError.serverError("HTTP \(http.statusCode)\n\n\(raw.prefix(2000))")
+        }
+
+        // Parse SSE events
+        var currentEvent = ""
+        var currentData = ""
+
+        for try await line in bytes.lines {
+            if try Task.checkCancellation() == () {}
+            if line.isEmpty {
+                if !currentData.isEmpty {
+                    processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
+                }
+                currentEvent = ""
+                currentData = ""
+            } else if line.hasPrefix("event: ") {
+                currentEvent = String(line.dropFirst(7))
+            } else if line.hasPrefix("data: ") {
+                currentData = String(line.dropFirst(6))
+            }
         }
     }
+
+    private func processSSE(event: String, data: String, onEvent: (StreamEvent) -> Void) {
+        guard let payload = data.data(using: .utf8) else { return }
+
+        switch event {
+        case "content_block_start":
+            if let p = try? JSONDecoder().decode(ContentBlockStartEvent.self, from: payload) {
+                if p.content_block.type == "tool_use" {
+                    onEvent(.toolUseStart(index: p.index,
+                                          id: p.content_block.id ?? "",
+                                          name: p.content_block.name ?? ""))
+                } else if p.content_block.type == "text" {
+                    onEvent(.textStart(index: p.index))
+                }
+            }
+        case "content_block_delta":
+            if let p = try? JSONDecoder().decode(ContentBlockDeltaEvent.self, from: payload) {
+                if p.delta.type == "text_delta", let text = p.delta.text {
+                    onEvent(.textDelta(index: p.index, text: text))
+                } else if p.delta.type == "input_json_delta", let json = p.delta.partial_json {
+                    onEvent(.toolInputDelta(index: p.index, partialJSON: json))
+                }
+            }
+        case "content_block_stop":
+            if let p = try? JSONDecoder().decode(ContentBlockStopEvent.self, from: payload) {
+                onEvent(.blockStop(index: p.index))
+            }
+        case "message_delta":
+            if let p = try? JSONDecoder().decode(MessageDeltaEvent.self, from: payload) {
+                if let reason = p.delta.stop_reason {
+                    onEvent(.messageStop(stopReason: reason))
+                }
+            }
+        default: break
+        }
+    }
+}
+
+// MARK: - Events the view model listens for
+
+enum StreamEvent {
+    case textStart(index: Int)
+    case textDelta(index: Int, text: String)
+    case toolUseStart(index: Int, id: String, name: String)
+    case toolInputDelta(index: Int, partialJSON: String)
+    case blockStop(index: Int)
+    case messageStop(stopReason: String)
 }
 
 // MARK: - Request
@@ -86,11 +133,12 @@ final class AnthropicClient {
 private struct RequestBody: Encodable {
     let model: String
     let maxTokens: Int
+    let stream: Bool
     let system: [SystemBlock]
     let messages: [ChatMessage]
     let tools: [ToolDef]
     enum CodingKeys: String, CodingKey {
-        case model, system, messages, tools
+        case model, stream, system, messages, tools
         case maxTokens = "max_tokens"
     }
 }
@@ -100,47 +148,35 @@ struct SystemBlock: Encodable {
     let text: String
 }
 
-// MARK: - Response
+// MARK: - SSE event payload structs
 
-struct APIResponse: Decodable {
-    let stopReason: String?
-    let content: [ContentBlock]
-    enum CodingKeys: String, CodingKey {
-        case content
-        case stopReason = "stop_reason"
-    }
-
-    var text: String {
-        content.compactMap { if case .text(let t) = $0 { return t } else { return nil } }.joined()
-    }
-    var toolUses: [ToolUseBlock] {
-        content.compactMap { if case .toolUse(let t) = $0 { return t } else { return nil } }
+private struct ContentBlockStartEvent: Decodable {
+    let index: Int
+    let content_block: BlockInfo
+    struct BlockInfo: Decodable {
+        let type: String
+        let id: String?
+        let name: String?
     }
 }
-
-enum ContentBlock: Decodable {
-    case text(String)
-    case toolUse(ToolUseBlock)
-    case unknown
-
-    enum CK: String, CodingKey { case type, text }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CK.self)
-        switch try c.decode(String.self, forKey: .type) {
-        case "text":     self = .text(try c.decode(String.self, forKey: .text))
-        case "tool_use": self = .toolUse(try ToolUseBlock(from: decoder))
-        default:         self = .unknown
-        }
+private struct ContentBlockDeltaEvent: Decodable {
+    let index: Int
+    let delta: Delta
+    struct Delta: Decodable {
+        let type: String
+        let text: String?
+        let partial_json: String?
     }
 }
-
-struct ToolUseBlock: Decodable {
-    let id:    String
-    let name:  String
-    let input: [String: AnyJSON]
+private struct ContentBlockStopEvent: Decodable {
+    let index: Int
+}
+private struct MessageDeltaEvent: Decodable {
+    let delta: Delta
+    struct Delta: Decodable { let stop_reason: String? }
 }
 
-// MARK: - Tool definitions
+// MARK: - Tool definitions (unchanged)
 
 struct ToolDef: Encodable {
     let name: String
@@ -185,30 +221,30 @@ enum FileToolDefinitions {
     ]
 }
 
-// MARK: - AnyJSON (replaces JSONValue)
+// MARK: - JSON values (needed by Message model)
 
 enum AnyJSON: Codable {
     case string(String), number(Double), bool(Bool), array([AnyJSON]), object([String: AnyJSON]), null
 
     init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
-        if c.decodeNil()                                    { self = .null }
-        else if let b = try? c.decode(Bool.self)            { self = .bool(b) }
-        else if let n = try? c.decode(Double.self)          { self = .number(n) }
-        else if let s = try? c.decode(String.self)          { self = .string(s) }
-        else if let a = try? c.decode([AnyJSON].self)       { self = .array(a) }
+        if c.decodeNil()                                     { self = .null }
+        else if let b = try? c.decode(Bool.self)             { self = .bool(b) }
+        else if let n = try? c.decode(Double.self)           { self = .number(n) }
+        else if let s = try? c.decode(String.self)           { self = .string(s) }
+        else if let a = try? c.decode([AnyJSON].self)        { self = .array(a) }
         else if let o = try? c.decode([String: AnyJSON].self){ self = .object(o) }
-        else { throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown")) }
+        else { throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "?")) }
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.singleValueContainer()
         switch self {
-        case .null:         try c.encodeNil()
-        case .bool(let b):  try c.encode(b)
-        case .number(let n):try c.encode(n)
-        case .string(let s):try c.encode(s)
-        case .array(let a): try c.encode(a)
-        case .object(let o):try c.encode(o)
+        case .null:          try c.encodeNil()
+        case .bool(let b):   try c.encode(b)
+        case .number(let n): try c.encode(n)
+        case .string(let s): try c.encode(s)
+        case .array(let a):  try c.encode(a)
+        case .object(let o): try c.encode(o)
         }
     }
     var string: String? { if case .string(let s) = self { return s } else { return nil } }
@@ -217,15 +253,12 @@ enum AnyJSON: Codable {
 // MARK: - Errors
 
 enum APIError: LocalizedError {
-    case invalidResponse, serverError(String)
+    case invalidResponse, serverError(String), cancelled
     var errorDescription: String? {
         switch self {
         case .invalidResponse:   return "Invalid response"
         case .serverError(let m):return m
+        case .cancelled:         return "Cancelled"
         }
     }
-}
-struct APIErrorBody: Decodable {
-    let error: Msg
-    struct Msg: Decodable { let message: String }
 }

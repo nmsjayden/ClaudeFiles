@@ -159,30 +159,25 @@ final class ChatViewModel: ObservableObject {
                 // Combine all text blocks (preserving order)
                 let combinedText = allIndices.compactMap { textBlocks[$0] }.joined(separator: "\n")
 
-                // If we got absolutely nothing back, that's an error
-                if apiBlocks.isEmpty && combinedText.isEmpty {
-                    error = "Received empty response from server. Try again?"
-                    return
-                }
-
-                if var conv = store.selected {
-                    conv.messages.append(StoredMessage(
-                        role: "assistant",
-                        text: combinedText,
-                        apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
-                        toolUseId: nil, toolResult: nil
-                    ))
-                    store.update(conv)
+                // Append whatever we have (even partial) so user sees the response
+                if !apiBlocks.isEmpty || !combinedText.isEmpty {
+                    if var conv = store.selected {
+                        conv.messages.append(StoredMessage(
+                            role: "assistant",
+                            text: combinedText,
+                            apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
+                            toolUseId: nil, toolResult: nil
+                        ))
+                        store.update(conv)
+                    }
                 }
 
                 streamingText = ""
 
-                // Only continue the loop if we actually got tool_use
-                // Any other stop reason (end_turn, max_tokens, nil) → we're done
+                // Only continue the loop if the model requested tools
                 let hasTools = !toolBlocks.isEmpty
-                if finalStopReason != "tool_use" && !hasTools { return }
-                if finalStopReason == "end_turn" || finalStopReason == "max_tokens" { return }
                 if !hasTools { return }
+                if finalStopReason != nil && finalStopReason != "tool_use" { return }
 
                 // Execute every tool call
                 for (_, tool) in toolBlocks.sorted(by: { $0.key < $1.key }) {

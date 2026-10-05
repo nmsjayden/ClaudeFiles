@@ -48,15 +48,21 @@ final class AnthropicClient {
                                tools: FileToolDefinitions.all)
         req.httpBody = try JSONEncoder().encode(body)
 
+        DebugLog.log("API send: model=\(model), messages=\(messages.count)")
+
         let (bytes, response) = try await URLSession.shared.bytes(for: req)
         guard let http = response as? HTTPURLResponse else {
+            DebugLog.log("No HTTPURLResponse")
             throw APIError.invalidResponse
         }
+
+        DebugLog.log("HTTP status: \(http.statusCode)")
 
         if http.statusCode != 200 {
             var buf = Data()
             for try await byte in bytes { buf.append(byte) }
             let raw = String(data: buf, encoding: .utf8) ?? "<non-utf8>"
+            DebugLog.log("Error body: \(raw.prefix(500))")
             throw APIError.serverError("HTTP \(http.statusCode)\n\n\(raw.prefix(2000))")
         }
 
@@ -66,8 +72,13 @@ final class AnthropicClient {
         var currentData  = ""
         var eventCount   = 0
 
+        var totalLines = 0
         for try await line in bytes.lines {
             try Task.checkCancellation()
+            totalLines += 1
+            if totalLines <= 20 {
+                DebugLog.log("SSE line \(totalLines): \(line.prefix(200))")
+            }
 
             if line.isEmpty {
                 // End of event — dispatch what we have
@@ -113,13 +124,19 @@ final class AnthropicClient {
             eventCount += 1
         }
 
+        DebugLog.log("Stream done: lines=\(totalLines), events=\(eventCount)")
+
         if eventCount == 0 {
             throw APIError.serverError("Stream ended with no SSE events received. The connection may have been dropped.")
         }
     }
 
     private func processSSE(event: String, data: String, onEvent: (StreamEvent) -> Void) {
-        guard let payload = data.data(using: .utf8) else { return }
+        DebugLog.log("processSSE event=\(event) data=\(data.prefix(200))")
+        guard let payload = data.data(using: .utf8) else {
+            DebugLog.log("  → data couldn't be converted to UTF8")
+            return
+        }
 
         switch event {
         case "content_block_start":

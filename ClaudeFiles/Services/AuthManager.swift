@@ -44,6 +44,7 @@ final class AuthManager: NSObject, ObservableObject {
 
         var c = URLComponents(string: authorizeURL)!
         c.queryItems = [
+            .init(name: "code",                 value: "true"),
             .init(name: "client_id",            value: clientId),
             .init(name: "response_type",         value: "code"),
             .init(name: "redirect_uri",          value: redirectURI),

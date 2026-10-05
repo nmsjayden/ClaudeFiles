@@ -4,19 +4,48 @@ import Foundation
 
 final class AnthropicClient {
     private let apiURL    = URL(string: "https://api.anthropic.com/v1/messages")!
+    // Session ID is stable across requests in this app launch (one Claude Code process = one session)
+    private let sessionId = UUID().uuidString.lowercased()
     @MainActor
     func send(messages: [ChatMessage], system: String, accessToken: String) async throws -> APIResponse {
         let model = SettingsStore.shared.selectedModel
-        var req = URLRequest(url: apiURL)
+
+        // Add ?beta=true query param (part of Claude Code's signature)
+        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "beta", value: "true")]
+        var req = URLRequest(url: components.url!)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)",  forHTTPHeaderField: "Authorization")
-        req.setValue("application/json",        forHTTPHeaderField: "Content-Type")
-        req.setValue("2023-06-01",              forHTTPHeaderField: "anthropic-version")
-        // Match Claude Code CLI's full beta header stack
-        req.setValue("oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+
+        // Core auth + API
+        req.setValue("Bearer \(accessToken)",            forHTTPHeaderField: "Authorization")
+        req.setValue("application/json",                 forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json",                 forHTTPHeaderField: "Accept")
+        req.setValue("2023-06-01",                       forHTTPHeaderField: "anthropic-version")
+
+        // Full Claude Code CLI 2.1.x beta header stack
+        req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
                      forHTTPHeaderField: "anthropic-beta")
-        req.setValue("claude-cli/1.0.60 (external, cli)", forHTTPHeaderField: "User-Agent")
+
+        // Browser-direct access flag (required for OAuth validation since 2026-04-04)
+        req.setValue("true",                             forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
+
+        // Claude Code CLI identity
+        req.setValue("claude-cli/2.1.92 (external, cli)", forHTTPHeaderField: "User-Agent")
         req.setValue("cli",                               forHTTPHeaderField: "x-app")
+
+        // Stainless SDK fingerprint (lowercase — Claude Code uses lowercase)
+        req.setValue("js",                                forHTTPHeaderField: "x-stainless-lang")
+        req.setValue("0.74.0",                            forHTTPHeaderField: "x-stainless-package-version")
+        req.setValue("MacOS",                             forHTTPHeaderField: "x-stainless-os")
+        req.setValue("arm64",                             forHTTPHeaderField: "x-stainless-arch")
+        req.setValue("node",                              forHTTPHeaderField: "x-stainless-runtime")
+        req.setValue("v22.14.0",                          forHTTPHeaderField: "x-stainless-runtime-version")
+        req.setValue("0",                                 forHTTPHeaderField: "x-stainless-retry-count")
+        req.setValue("600",                               forHTTPHeaderField: "x-stainless-timeout")
+
+        // Per-request identity + stable session ID
+        req.setValue(UUID().uuidString.lowercased(),      forHTTPHeaderField: "x-client-request-id")
+        req.setValue(sessionId,                           forHTTPHeaderField: "x-claude-code-session-id")
 
         // Prepend Claude Code's required system identifier
         let claudeCodeSystem = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + system

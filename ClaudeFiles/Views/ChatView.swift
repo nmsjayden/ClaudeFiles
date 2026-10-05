@@ -591,10 +591,24 @@ struct ChatListSheet: View {
 struct SettingsSheet: View {
     @ObservedObject var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
+    @State private var showDebugLog = false
 
     var body: some View {
         NavigationView {
             Form {
+                Section("Debug") {
+                    Button {
+                        showDebugLog = true
+                    } label: {
+                        Label("View debug log", systemImage: "doc.text.magnifyingglass")
+                    }
+                    Button(role: .destructive) {
+                        DebugLog.clear()
+                    } label: {
+                        Label("Clear debug log", systemImage: "trash")
+                    }
+                }
+
                 ForEach(ModelOption.grouped(), id: \.0) { family, models in
                     Section(family.rawValue) {
                         ForEach(models) { opt in
@@ -631,6 +645,46 @@ struct SettingsSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .sheet(isPresented: $showDebugLog) {
+                DebugLogSheet()
+            }
+        }
+    }
+}
+
+// MARK: - Debug log viewer
+
+struct DebugLogSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var logText = ""
+    @State private var copied = false
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                Text(logText.isEmpty ? "(empty)" : logText)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Debug log")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        UIPasteboard.general.string = logText
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                    } label: {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    }
+                }
+            }
+            .onAppear { logText = DebugLog.readAll() }
         }
     }
 }

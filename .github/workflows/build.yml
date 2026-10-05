@@ -24,6 +24,7 @@ jobs:
 
       - name: Build archive (unsigned)
         run: |
+          set -o pipefail
           xcodebuild archive \
             -scheme ClaudeFiles \
             -configuration Release \
@@ -31,34 +32,26 @@ jobs:
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Debug archive contents
-        run: |
-          echo "=== Archive structure ==="
-          find "$RUNNER_TEMP/ClaudeFiles.xcarchive" -maxdepth 4 | head -30
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log || {
+              # Commit the last 300 lines of errors so Claude can read them
+              tail -300 /tmp/build.log > build-errors.txt
+              git config user.email "actions@github.com"
+              git config user.name "GitHub Actions"
+              git add build-errors.txt
+              git commit -m "ci: build error log"
+              git push
+              exit 1
+            }
 
       - name: Package IPA
         run: |
-          # Find the .app — location varies with signing settings
           APP_PATH=$(find "$RUNNER_TEMP/ClaudeFiles.xcarchive" -name "*.app" -maxdepth 6 | head -1)
-          echo "Found app at: $APP_PATH"
-
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app found in archive"
-            exit 1
-          fi
-
-          PAYLOAD_DIR="$RUNNER_TEMP/Payload"
-          mkdir -p "$PAYLOAD_DIR"
-          cp -r "$APP_PATH" "$PAYLOAD_DIR/"
-
-          IPA_PATH="$RUNNER_TEMP/ClaudeFiles-unsigned.ipa"
+          echo "App: $APP_PATH"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
-          zip -r "$IPA_PATH" Payload/
-
-          echo "IPA size: $(du -sh "$IPA_PATH" | cut -f1)"
-          echo "IPA_PATH=$IPA_PATH" >> $GITHUB_ENV
+          zip -r ClaudeFiles-unsigned.ipa Payload/
+          echo "IPA_PATH=$RUNNER_TEMP/ClaudeFiles-unsigned.ipa" >> $GITHUB_ENV
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4

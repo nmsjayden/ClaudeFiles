@@ -28,11 +28,22 @@ final class AnthropicClient {
         let (data, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
         if http.statusCode != 200 {
-            let msg = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error.message
-                      ?? "HTTP \(http.statusCode)"
+            let rawBody = String(data: data, encoding: .utf8) ?? "<non-utf8 body>"
+            let parsed  = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error.message
+            let msg = """
+            HTTP \(http.statusCode)
+            \(parsed.map { "Message: \($0)\n" } ?? "")
+            Raw response:
+            \(rawBody.prefix(2000))
+            """
             throw APIError.serverError(msg)
         }
-        return try JSONDecoder().decode(APIResponse.self, from: data)
+        do {
+            return try JSONDecoder().decode(APIResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            throw APIError.serverError("Decode failed: \(error.localizedDescription)\n\nRaw:\n\(raw.prefix(2000))")
+        }
     }
 }
 

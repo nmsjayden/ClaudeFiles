@@ -4,7 +4,7 @@ import Foundation
 
 final class AnthropicClient {
     private let apiURL    = URL(string: "https://api.anthropic.com/v1/messages")!
-    private let model     = "claude-sonnet-4-6"
+    private let model     = "claude-sonnet-4-5-20250929"
 
     func send(messages: [ChatMessage], system: String, accessToken: String) async throws -> APIResponse {
         var req = URLRequest(url: apiURL)
@@ -12,9 +12,16 @@ final class AnthropicClient {
         req.setValue("Bearer \(accessToken)",  forHTTPHeaderField: "Authorization")
         req.setValue("application/json",        forHTTPHeaderField: "Content-Type")
         req.setValue("2023-06-01",              forHTTPHeaderField: "anthropic-version")
-        req.setValue("oauth-2025-04-20",        forHTTPHeaderField: "anthropic-beta")
+        // Match Claude Code CLI's full beta header stack
+        req.setValue("oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+                     forHTTPHeaderField: "anthropic-beta")
+        req.setValue("claude-cli/1.0.60 (external, cli)", forHTTPHeaderField: "User-Agent")
+        req.setValue("cli",                               forHTTPHeaderField: "x-app")
 
-        let body = RequestBody(model: model, maxTokens: 4096, system: system,
+        // Prepend Claude Code's required system identifier
+        let claudeCodeSystem = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + system
+
+        let body = RequestBody(model: model, maxTokens: 4096, system: claudeCodeSystem,
                                messages: messages, tools: FileToolDefinitions.all)
         req.httpBody = try JSONEncoder().encode(body)
 

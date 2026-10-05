@@ -1,17 +1,4 @@
-Command line invocation:
-    /Applications/Xcode_15.4.app/Contents/Developer/usr/bin/xcodebuild archive -project ClaudeFiles.xcodeproj -scheme ClaudeFiles -configuration Release -archivePath /Users/runner/work/_temp/ClaudeFiles.xcarchive -destination generic/platform=iOS CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
-
-User defaults from command line:
-    IDEArchivePathOverride = /Users/runner/work/_temp/ClaudeFiles.xcarchive
-    IDEPackageSupportUseBuiltinSCM = YES
-
-Build settings from command line:
-    CODE_SIGN_IDENTITY = 
-    CODE_SIGNING_ALLOWED = NO
-    CODE_SIGNING_REQUIRED = NO
-
-2026-10-05 08:31:00.569 xcodebuild[2257:9686] Writing error result bundle to /var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/ResultBundle_2026-05-10_08-31-0000.xcresult
-xcodebuild: error: Unable to read project 'ClaudeFiles.xcodeproj'.
-	Reason: The project ‘ClaudeFiles’ cannot be opened because it is in a future Xcode project file format (77). Adjust the project format using a compatible version of Xcode to allow it to be opened by this version of Xcode.
-
-
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:177:9: warning: result of call to 'SecRandomCopyBytes' is unused
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:26: error: value of type 'AuthManager' has no dynamic member 'handleCallback' using key path from root type 'AuthManager'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:21: error: referencing subscript 'subscript(dynamicMember:)' requires wrapper 'ObservedObject<AuthManager>.Wrapper'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:26: error: cannot call value of non-function type 'Binding<Subject>'

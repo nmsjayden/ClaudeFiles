@@ -80,8 +80,8 @@ final class AnthropicClient {
                 DebugLog.log("SSE line \(totalLines): \(line.prefix(200))")
             }
 
+            // Blank line = event boundary
             if line.isEmpty {
-                // End of event — dispatch what we have
                 if !currentData.isEmpty {
                     processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
                     eventCount += 1
@@ -91,10 +91,9 @@ final class AnthropicClient {
                 continue
             }
 
-            // Lines starting with ":" are SSE comments — skip
+            // SSE comments — skip
             if line.hasPrefix(":") { continue }
 
-            // Parse "field: value" or "field:value"
             guard let colonIdx = line.firstIndex(of: ":") else { continue }
             let field = String(line[..<colonIdx])
             var valueStart = line.index(after: colonIdx)
@@ -105,9 +104,15 @@ final class AnthropicClient {
 
             switch field {
             case "event":
+                // New event starting — dispatch previous one if we have it
+                // (URLSession.bytes.lines strips the blank-line separator between events)
+                if !currentData.isEmpty {
+                    processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
+                    eventCount += 1
+                    currentData = ""
+                }
                 currentEvent = value
             case "data":
-                // SSE "data:" can arrive on multiple lines; append with newline
                 if currentData.isEmpty {
                     currentData = value
                 } else {
@@ -118,7 +123,7 @@ final class AnthropicClient {
             }
         }
 
-        // Dispatch any trailing event that wasn't followed by blank line
+        // Dispatch any trailing event
         if !currentData.isEmpty {
             processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
             eventCount += 1

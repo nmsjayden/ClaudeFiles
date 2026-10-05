@@ -144,45 +144,103 @@ private struct ChatViewContent: View {
 
     // MARK: - Message list
 
+    @State private var followBottom: Bool = true
+    @State private var showJumpButton: Bool = false
+
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
-                        MessageBubble(message: msg).id(idx)
-                    }
+            GeometryReader { outerGeo in
+                ZStack(alignment: .bottom) {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 16) {
+                            ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
+                                MessageBubble(message: msg).id(idx)
+                            }
 
-                    // Streaming assistant bubble
-                    if vm.isSending && (!vm.streamingText.isEmpty || !vm.streamingToolCalls.isEmpty) {
-                        StreamingBubble(text: vm.streamingText, toolCalls: Array(vm.streamingToolCalls.values))
-                            .id("streaming")
-                    } else if vm.isSending {
-                        TypingIndicator().id("typing")
+                            if vm.isSending && (!vm.streamingText.isEmpty || !vm.streamingToolCalls.isEmpty) {
+                                StreamingBubble(text: vm.streamingText, toolCalls: Array(vm.streamingToolCalls.values))
+                                    .id("streaming")
+                            } else if vm.isSending {
+                                TypingIndicator().id("typing")
+                            }
+
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottomAnchor")
+                                .background(
+                                    GeometryReader { geo in
+                                        Color.clear.preference(
+                                            key: BottomDistanceKey.self,
+                                            value: geo.frame(in: .named("scroll")).minY - outerGeo.size.height
+                                        )
+                                    }
+                                )
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 16)
+                    }
+                    .coordinateSpace(name: "scroll")
+                    .onPreferenceChange(BottomDistanceKey.self) { distance in
+                        // distance < 80 means we're within 80pt of the actual bottom
+                        let nearBottom = distance < 80
+                        if followBottom != nearBottom {
+                            followBottom = nearBottom
+                        }
+                        let shouldShow = !nearBottom && vm.isSending
+                        if shouldShow != showJumpButton {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                showJumpButton = shouldShow
+                            }
+                        }
+                    }
+                    .onChange(of: vm.displayMessages.count) { _ in scrollIfFollowing(proxy) }
+                    .onChange(of: vm.streamingText) { _ in scrollIfFollowing(proxy) }
+                    .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfFollowing(proxy) }
+                    .onChange(of: vm.isSending) { newValue in
+                        if newValue {
+                            followBottom = true
+                            showJumpButton = false
+                            scrollToBottom(proxy)
+                        }
+                    }
+                    .scrollDismissesKeyboard(.interactively)
+                    .onTapGesture { inputFocused = false }
+
+                    if showJumpButton {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            followBottom = true
+                            showJumpButton = false
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundColor(.primary)
+                                .frame(width: 38, height: 38)
+                                .background(Color(.secondarySystemBackground))
+                                .clipShape(Circle())
+                                .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
+                                .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
+                        }
+                        .padding(.bottom, 12)
+                        .transition(.scale.combined(with: .opacity))
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 16)
             }
-            .onChange(of: vm.displayMessages.count) { _ in scrollToBottom(proxy) }
-            .onChange(of: vm.streamingText) { _ in scrollToBottom(proxy) }
-            .onChange(of: vm.streamingToolCalls.count) { _ in scrollToBottom(proxy) }
-            .onChange(of: vm.isSending) { newValue in
-                if newValue { scrollToBottom(proxy) }
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .onTapGesture { inputFocused = false }
         }
     }
 
+    private func scrollIfFollowing(_ proxy: ScrollViewProxy) {
+        guard followBottom else { return }
+        scrollToBottom(proxy)
+    }
+
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
             withAnimation(.easeOut(duration: 0.15)) {
-                if vm.isSending {
-                    proxy.scrollTo("streaming", anchor: .bottom)
-                    proxy.scrollTo("typing", anchor: .bottom)
-                } else if !vm.displayMessages.isEmpty {
-                    proxy.scrollTo(vm.displayMessages.count - 1, anchor: .bottom)
-                }
+                proxy.scrollTo("bottomAnchor", anchor: .bottom)
             }
         }
     }
@@ -798,5 +856,14 @@ struct WriteApprovalSheet: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Preference key for tracking distance from bottom
+
+private struct BottomDistanceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }

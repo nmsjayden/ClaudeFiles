@@ -360,7 +360,7 @@ private struct SuggestionChip: View {
             HStack(spacing: 8) {
                 Image(systemName: icon)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.accentColor)
+                    .foregroundStyle(Color.accentColor)
                 Text(text)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.primary)
@@ -462,7 +462,7 @@ struct ToolCallCard: View {
                 HStack(spacing: 8) {
                     Image(systemName: iconName)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(tool.isComplete ? .accentColor : .orange)
+                        .foregroundStyle(tool.isComplete ? Color.accentColor : Color.orange)
                         .frame(width: 16)
 
                     Text(humanName)
@@ -668,71 +668,107 @@ struct ChatListSheet: View {
 
     var body: some View {
         NavigationView {
-            List {
-                ForEach(store.conversations) { c in
-                    HStack(spacing: 10) {
-                        Button {
-                            store.selectedId = c.id
-                            isPresented = false
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(c.title).foregroundStyle(.primary).lineLimit(1)
-                                    Text(c.updatedAt, style: .relative)
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                if c.id == store.selectedId {
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.accentColor)
-                                }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-
-                        Menu {
-                            Button { renamingId = c.id; renameText = c.title } label: {
-                                Label("Rename", systemImage: "pencil")
-                            }
-                            Button(role: .destructive) { deletingId = c.id } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                                .font(.title3).foregroundStyle(.secondary)
-                                .frame(width: 32, height: 32).contentShape(Rectangle())
-                        }
-                    }
-                    .padding(.vertical, 4)
+            chatList
+                .listStyle(.plain)
+                .navigationTitle("Chats")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { chatToolbar }
+                .alert("Rename chat", isPresented: renameBinding) { renameAlert }
+                .alert("Delete chat?", isPresented: deleteBinding) { deleteAlert } message: {
+                    Text("This cannot be undone.")
                 }
-            }
-            .listStyle(.plain)
-            .navigationTitle("Chats")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) { Button("Done") { isPresented = false } }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { store.newConversation(); isPresented = false } label: {
-                        Label("New", systemImage: "square.and.pencil").font(.body.weight(.medium))
-                    }
-                }
-            }
-            .alert("Rename chat", isPresented: Binding(get: { renamingId != nil }, set: { if !$0 { renamingId = nil } })) {
-                TextField("Title", text: $renameText)
-                Button("Cancel", role: .cancel) { renamingId = nil }
-                Button("Save") {
-                    if let id = renamingId { store.rename(id, to: renameText.isEmpty ? "Untitled" : renameText) }
-                    renamingId = nil
-                }
-            }
-            .alert("Delete chat?", isPresented: Binding(get: { deletingId != nil }, set: { if !$0 { deletingId = nil } })) {
-                Button("Cancel", role: .cancel) { deletingId = nil }
-                Button("Delete", role: .destructive) {
-                    if let id = deletingId { store.delete(id) }
-                    deletingId = nil
-                }
-            } message: { Text("This cannot be undone.") }
         }
+    }
+
+    private var chatList: some View {
+        List {
+            ForEach(store.conversations) { c in
+                ChatListRow(
+                    conversation: c,
+                    isSelected: c.id == store.selectedId,
+                    onSelect: { store.selectedId = c.id; isPresented = false },
+                    onRename: { renamingId = c.id; renameText = c.title },
+                    onDelete: { deletingId = c.id }
+                )
+            }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var chatToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigationBarLeading) { Button("Done") { isPresented = false } }
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Button { store.newConversation(); isPresented = false } label: {
+                Label("New", systemImage: "square.and.pencil").font(.body.weight(.medium))
+            }
+        }
+    }
+
+    private var renameBinding: Binding<Bool> {
+        Binding(get: { renamingId != nil }, set: { if !$0 { renamingId = nil } })
+    }
+    private var deleteBinding: Binding<Bool> {
+        Binding(get: { deletingId != nil }, set: { if !$0 { deletingId = nil } })
+    }
+
+    @ViewBuilder
+    private var renameAlert: some View {
+        TextField("Title", text: $renameText)
+        Button("Cancel", role: .cancel) { renamingId = nil }
+        Button("Save") {
+            if let id = renamingId {
+                store.rename(id, to: renameText.isEmpty ? "Untitled" : renameText)
+            }
+            renamingId = nil
+        }
+    }
+
+    @ViewBuilder
+    private var deleteAlert: some View {
+        Button("Cancel", role: .cancel) { deletingId = nil }
+        Button("Delete", role: .destructive) {
+            if let id = deletingId { store.delete(id) }
+            deletingId = nil
+        }
+    }
+}
+
+private struct ChatListRow: View {
+    let conversation: Conversation
+    let isSelected:   Bool
+    let onSelect:     () -> Void
+    let onRename:     () -> Void
+    let onDelete:     () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onSelect) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(conversation.title).foregroundStyle(.primary).lineLimit(1)
+                        Text(conversation.updatedAt, style: .relative)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if isSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Menu {
+                Button(action: onRename) { Label("Rename", systemImage: "pencil") }
+                Button(role: .destructive, action: onDelete) { Label("Delete", systemImage: "trash") }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.title3).foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32).contentShape(Rectangle())
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -747,50 +783,9 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationView {
             Form {
-                // Sandbox status section
-                Section("Filesystem") {
-                    HStack(spacing: 10) {
-                        Image(systemName: sandboxIcon)
-                            .foregroundStyle(sandboxColor)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Sandbox escape")
-                                .font(.body)
-                            Text(sandbox.status.label)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                }
-
-                Section("Debug") {
-                    Button { showDebugLog = true } label: {
-                        Label("View debug log", systemImage: "doc.text.magnifyingglass")
-                    }
-                    Button(role: .destructive) { DebugLog.clear() } label: {
-                        Label("Clear debug log", systemImage: "trash")
-                    }
-                }
-
-                ForEach(ModelOption.grouped(), id: \.0) { family, models in
-                    Section(family.rawValue) {
-                        ForEach(models) { opt in
-                            Button { settings.selectedModel = opt.id } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(opt.displayName).foregroundStyle(.primary)
-                                        Text(opt.subtitle).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if settings.selectedModel == opt.id {
-                                        Image(systemName: "checkmark").foregroundStyle(.accentColor)
-                                    }
-                                }
-                                .contentShape(Rectangle())
-                            }
-                        }
-                    }
-                }
+                sandboxSection
+                debugSection
+                modelSections
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -798,6 +793,43 @@ struct SettingsSheet: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
             .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
+        }
+    }
+
+    private var sandboxSection: some View {
+        Section("Filesystem") {
+            HStack(spacing: 10) {
+                Image(systemName: sandboxIcon).foregroundStyle(sandboxColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Sandbox escape").font(.body)
+                    Text(sandbox.status.label).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var debugSection: some View {
+        Section("Debug") {
+            Button { showDebugLog = true } label: {
+                Label("View debug log", systemImage: "doc.text.magnifyingglass")
+            }
+            Button(role: .destructive) { DebugLog.clear() } label: {
+                Label("Clear debug log", systemImage: "trash")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelSections: some View {
+        ForEach(ModelOption.grouped(), id: \.0) { family, models in
+            Section(family.rawValue) {
+                ForEach(models) { opt in
+                    ModelRow(opt: opt, isSelected: settings.selectedModel == opt.id) {
+                        settings.selectedModel = opt.id
+                    }
+                }
+            }
         }
     }
 
@@ -815,6 +847,30 @@ struct SettingsSheet: View {
         case .exploiting: return .orange
         case .failed:     return .red
         case .idle:       return .gray
+        }
+    }
+}
+
+// MARK: - Model picker row (extracted to help type-checker)
+
+private struct ModelRow: View {
+    let opt:        ModelOption
+    let isSelected: Bool
+    let onSelect:   () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(opt.displayName).foregroundStyle(.primary)
+                    Text(opt.subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                }
+            }
+            .contentShape(Rectangle())
         }
     }
 }
@@ -866,7 +922,7 @@ struct WriteApprovalSheet: View {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(spacing: 10) {
                         Image(systemName: "pencil.circle.fill")
-                            .font(.title3).foregroundStyle(.accentColor)
+                            .font(.title3).foregroundStyle(Color.accentColor)
                         Text("Approve file write?").font(.headline)
                         Spacer()
                     }

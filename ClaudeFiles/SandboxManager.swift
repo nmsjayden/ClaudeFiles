@@ -2,7 +2,7 @@ import Foundation
 
 /// Manages the FilzaJailedDS sandbox escape and SSV write bypass.
 /// Call `activate()` once at app launch; it runs the kernel exploit
-/// on a background thread so the UI is never blocked.
+/// on a background DispatchQueue thread so the UI is never blocked.
 @MainActor
 final class SandboxManager: ObservableObject {
     static let shared = SandboxManager()
@@ -15,10 +15,10 @@ final class SandboxManager: ObservableObject {
 
         var label: String {
             switch self {
-            case .idle:            return "Idle"
-            case .exploiting:      return "Acquiring filesystem access…"
-            case .escaped:         return "Full filesystem access active"
-            case .failed(let msg): return "Sandbox escape failed: \(msg)"
+            case .idle:              return "Idle"
+            case .exploiting:        return "Acquiring filesystem access…"
+            case .escaped:           return "Full filesystem access active"
+            case .failed(let msg):   return "Sandbox escape failed: \(msg)"
             }
         }
 
@@ -31,18 +31,23 @@ final class SandboxManager: ObservableObject {
 
     private init() {}
 
-    /// Trigger the exploit once.  Safe to call multiple times; subsequent calls are no-ops.
+    /// Trigger the exploit once. Safe to call multiple times; subsequent calls are no-ops.
     func activate() {
         guard !activated else { return }
         activated = true
         status = .exploiting
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let result = Self.runEscape()
-            await MainActor.run { self?.status = result }
+        // Use DispatchQueue (not Task.detached) to avoid Swift Concurrency
+        // conflicts with @MainActor isolation on the static helper below.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = SandboxManager.runEscape()
+            DispatchQueue.main.async {
+                SandboxManager.shared.status = result
+            }
         }
     }
 
-    // MARK: - Exploit sequence (runs off main thread)
+    // MARK: - Exploit sequence (runs off main thread via DispatchQueue)
+    // Deliberately NOT @MainActor so it can run freely on the background queue.
 
     private static func runEscape() -> Status {
         DebugLog.log("[Sandbox] Starting kexploit_opa334…")

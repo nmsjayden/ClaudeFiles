@@ -1,47 +1,60 @@
 import Foundation
 
-// MARK: - Message
+// MARK: - Chat message (sent to API)
 
-struct Message: Identifiable {
-    let id = UUID()
-    let role: Role
-    var content: MessageContent
-    var toolCalls: [ToolCall] = []      // populated when assistant requests tool use
-    var isLoading: Bool = false
+struct ChatMessage: Encodable, Identifiable {
+    let id   = UUID()
+    let role : Role
+    let content: MessageContent
 
-    enum Role: String { case user, assistant }
+    enum Role: String, Encodable { case user, assistant }
+
+    enum CodingKeys: String, CodingKey { case role, content }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(role, forKey: .role)
+        switch content {
+        case .text(let t):
+            try c.encode(t, forKey: .content)
+        case .blocks(let b):
+            try c.encode(b, forKey: .content)
+        case .toolResult(let id, let result):
+            let block = ToolResultBlock(type: "tool_result", toolUseId: id, content: result)
+            try c.encode([block], forKey: .content)
+        }
+    }
 }
 
 enum MessageContent {
     case text(String)
+    case blocks([APIBlock])
     case toolResult(toolUseId: String, result: String)
-    case assistantBlocks([ContentBlock])   // mirrors API response blocks
 }
 
-// MARK: - Tool call (pending / completed)
+// Encodable block for API messages
+struct APIBlock: Encodable {
+    let type:  String
+    let text:  String?
+    let id:    String?
+    let name:  String?
+    let input: [String: AnyJSON]?
+}
 
-struct ToolCall: Identifiable {
-    let id = UUID()
+struct ToolResultBlock: Encodable {
+    let type:      String
     let toolUseId: String
-    let name:      String
-    let input:     [String: JSONValue]
-    var state:     State = .pending
-    var result:    String = ""
-
-    enum State { case pending, needsApproval, running, done, denied }
+    let content:   String
+    enum CodingKeys: String, CodingKey {
+        case type, content
+        case toolUseId = "tool_use_id"
+    }
 }
 
-// MARK: - Display helper
+// MARK: - Display message (shown in UI)
 
-extension Message {
-    var displayText: String {
-        switch content {
-        case .text(let t):                        return t
-        case .toolResult(_, let r):               return r
-        case .assistantBlocks(let blocks):
-            return blocks.compactMap {
-                if case .text(let t) = $0 { return t } else { return nil }
-            }.joined()
-        }
-    }
+struct DisplayMessage: Identifiable {
+    let id       = UUID()
+    let role     : ChatMessage.Role
+    var text     : String
+    var isLoading: Bool = false
 }

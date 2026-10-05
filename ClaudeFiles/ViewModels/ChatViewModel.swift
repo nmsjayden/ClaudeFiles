@@ -7,8 +7,10 @@ final class ChatViewModel: ObservableObject {
     @Published var isSending:    Bool   = false
     @Published var error:        String?
     @Published var pendingWrite: PendingWrite?
-    @Published var streamingText: String = ""         // current partial assistant text
-    @Published var streamingToolCalls: [UUID: ToolCallInfo] = [:]
+
+    // Live streaming state — keyed by block index so updates are applied in-place
+    @Published var streamingText:      String = ""
+    @Published var streamingToolCalls: [Int: ToolCallInfo] = [:]  // key = block index
 
     private let api      = AnthropicClient()
     private let executor = FileToolsExecutor()
@@ -21,28 +23,24 @@ final class ChatViewModel: ObservableObject {
         self.store = store
     }
 
+    // MARK: - System prompt
+
     private let systemPrompt = """
-    You are running inside a custom iOS app on a jailbroken device with filesystem access via \
-    the DarkSword kernel exploit. You have 5 tools: read_file, write_file, list_directory, \
-    search_files, get_file_info.
+    You are running inside a custom iOS app on a device with filesystem access via \
+    the FilzaJailedDS kernel exploit (opa334). You have 5 tools: read_file, write_file, \
+    list_directory, search_files, get_file_info.
 
-    FILESYSTEM REALITY on this device:
-    - You CAN access the root iOS filesystem: /System, /Applications, /usr, /bin, /sbin, /Library, /tmp
-    - /var is a symlink to /private/var, and /tmp is a symlink to /private/tmp — if a /var path \
-      fails, ALWAYS try the /private/var equivalent before concluding you lack access
-    - /var/mobile/* paths often need to be addressed as /private/var/mobile/* instead
-    - User-data directories under /var/mobile/ (Containers, Library/Preferences, Library/Logs) \
-      may be gated by Data Protection class keys. If a path returns an error, don't assume it's \
-      permanently blocked — try the /private/var/mobile/ form, try a parent directory first to \
-      see what's visible, and report what actually happened rather than guessing
+    FILESYSTEM NOTES:
+    - /var is a symlink to /private/var, /tmp → /private/tmp, /etc → /private/etc
+    - If a /var path fails, ALWAYS try the /private/var equivalent
+    - User-data paths like /var/mobile/* may need /private/var/mobile/*
+    - When a tool errors, use the exact error message to decide your next move
 
-    When a tool errors, the exact error message tells you WHY it failed (not found, permission \
-    denied, etc.). Use that to decide the next move. Don't give up after one failed path.
-
-    Format responses with markdown: code blocks with language tags, bold for emphasis, lists \
-    where helpful. Keep responses focused — don't lecture about what you can't do until you've \
-    actually tried. Confirm before writing files.
+    Always try paths before concluding you lack access. Use markdown in responses: \
+    code blocks with language tags, bold for emphasis. Confirm before writing files.
     """
+
+    // MARK: - Computed display messages
 
     var displayMessages: [DisplayMessage] {
         guard let c = store.selected else { return [] }
@@ -51,14 +49,12 @@ final class ChatViewModel: ObservableObject {
             if m.toolUseId != nil { continue }
             if m.text.isEmpty && (m.apiBlocks?.isEmpty ?? true) { continue }
 
-            // Extract tool calls from stored assistant blocks
             var toolCalls: [ToolCallInfo] = []
             if let blocks = m.apiBlocks {
                 for b in blocks where b.type == "tool_use" {
                     if let id = b.id, let name = b.name {
                         toolCalls.append(ToolCallInfo(
-                            id: id,
-                            name: name,
+                            id: id, name: name,
                             input: b.input ?? [:],
                             result: findResult(for: id, in: c.messages),
                             isComplete: true
@@ -91,9 +87,7 @@ final class ChatViewModel: ObservableObject {
 
         conv.messages.append(StoredMessage(role: "user", text: text,
                                            apiBlocks: nil, toolUseId: nil, toolResult: nil))
-        if conv.title == "New chat" {
-            conv.title = String(text.prefix(50))
-        }
+        if conv.title == "New chat" { conv.title = String(text.prefix(50)) }
         store.update(conv)
 
         currentTask = Task { await runTurn() }
@@ -102,7 +96,6 @@ final class ChatViewModel: ObservableObject {
     func stopGenerating() {
         currentTask?.cancel()
         currentTask = nil
-        // Save partial response if we have any
         if !streamingText.isEmpty, var conv = store.selected {
             conv.messages.append(StoredMessage(
                 role: "assistant",
@@ -120,24 +113,21 @@ final class ChatViewModel: ObservableObject {
 
     private func runTurn() async {
         defer { isSending = false; streamingText = ""; streamingToolCalls = [:] }
-
-        guard let token = await authMgr.accessToken() else {
-            error = "Not logged in"; return
-        }
+        guard let token = await authMgr.accessToken() else { error = "Not logged in"; return }
 
         do {
             var history = buildAPIHistory()
-
             while true {
                 if Task.isCancelled { return }
 
-                // Track streaming state for this iteration
                 var currentText = ""
                 var toolBlocks: [Int: StreamingTool] = [:]
                 var textBlocks: [Int: String] = [:]
                 var finalStopReason: String?
 
-                try await api.sendStreaming(messages: history, system: systemPrompt, accessToken: token) { event in
+                try await api.sendStreaming(messages: history, system: systemPrompt,
+                                            accessToken: token) { [weak self] event in
+                    guard let self else { return }
                     switch event {
                     case .textStart(let idx):
                         textBlocks[idx] = ""
@@ -147,18 +137,27 @@ final class ChatViewModel: ObservableObject {
                         self.streamingText = currentText
                     case .toolUseStart(let idx, let id, let name):
                         toolBlocks[idx] = StreamingTool(id: id, name: name, partialJSON: "")
-                        let info = ToolCallInfo(id: id, name: name, input: [:], result: nil, isComplete: false)
-                        self.streamingToolCalls[UUID()] = info
+                        // Keyed by block index so updates land on the same card
+                        self.streamingToolCalls[idx] = ToolCallInfo(
+                            id: id, name: name, input: [:], result: nil, isComplete: false)
                     case .toolInputDelta(let idx, let partial):
                         toolBlocks[idx]?.partialJSON += partial
-                    case .blockStop:
-                        break
+                        // Update the streaming card's input as JSON accumulates
+                        if let raw = toolBlocks[idx]?.partialJSON,
+                           let parsed = self.parseJSON(raw) {
+                            self.streamingToolCalls[idx]?.input = parsed
+                        }
+                    case .blockStop(let idx):
+                        // Mark tool card complete so the spinner disappears
+                        if toolBlocks[idx] != nil {
+                            self.streamingToolCalls[idx]?.isComplete = true
+                        }
                     case .messageStop(let reason):
                         finalStopReason = reason
                     }
                 }
 
-                // Build the assistant turn to persist and send back
+                // Build persistent blocks
                 var apiBlocks: [StoredBlock] = []
                 let allIndices = Set(textBlocks.keys).union(toolBlocks.keys).sorted()
                 for i in allIndices {
@@ -170,38 +169,31 @@ final class ChatViewModel: ObservableObject {
                                                      id: tool.id, name: tool.name, input: input))
                     }
                 }
-
-                // Combine all text blocks (preserving order)
                 let combinedText = allIndices.compactMap { textBlocks[$0] }.joined(separator: "\n")
 
-                DebugLog.log("Turn complete: text=\(combinedText.count) chars, blocks=\(apiBlocks.count), stop=\(finalStopReason ?? "nil")")
+                DebugLog.log("Turn: text=\(combinedText.count)c blocks=\(apiBlocks.count) stop=\(finalStopReason ?? "nil")")
 
-                // Append whatever we have (even partial) so user sees the response
                 if !apiBlocks.isEmpty || !combinedText.isEmpty {
                     if var conv = store.selected {
                         conv.messages.append(StoredMessage(
-                            role: "assistant",
-                            text: combinedText,
+                            role: "assistant", text: combinedText,
                             apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
                             toolUseId: nil, toolResult: nil
                         ))
                         store.update(conv)
                     }
                 }
-
                 streamingText = ""
 
-                // Only continue the loop if the model requested tools
                 let hasTools = !toolBlocks.isEmpty
                 if !hasTools { return }
-                if finalStopReason != nil && finalStopReason != "tool_use" { return }
+                if let reason = finalStopReason, reason != "tool_use" { return }
 
-                // Execute every tool call
+                // Execute tools sequentially
                 for (_, tool) in toolBlocks.sorted(by: { $0.key < $1.key }) {
                     if Task.isCancelled { return }
                     let input = parseJSON(tool.partialJSON) ?? [:]
-                    let toolUseBlock = ToolCallContext(id: tool.id, name: tool.name, input: input)
-                    let result = await executeTool(toolUseBlock)
+                    let result = await executeTool(id: tool.id, name: tool.name, input: input)
                     if var conv = store.selected {
                         conv.messages.append(StoredMessage(
                             role: "user", text: "",
@@ -214,9 +206,8 @@ final class ChatViewModel: ObservableObject {
                 streamingToolCalls = [:]
                 history = buildAPIHistory()
             }
-
         } catch is CancellationError {
-            // Already handled by stopGenerating
+            // handled by stopGenerating
         } catch {
             self.error = error.localizedDescription
         }
@@ -234,13 +225,9 @@ final class ChatViewModel: ObservableObject {
             if let toolId = m.toolUseId, let result = m.toolResult {
                 return ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: result))
             }
-            if m.role == "user" {
-                return ChatMessage(role: .user, content: .text(m.text))
-            }
+            if m.role == "user" { return ChatMessage(role: .user, content: .text(m.text)) }
             if let blocks = m.apiBlocks, !blocks.isEmpty {
-                let apiBlocks = blocks.map { b in
-                    APIBlock(type: b.type, text: b.text, id: b.id, name: b.name, input: b.input)
-                }
+                let apiBlocks = blocks.map { APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input) }
                 return ChatMessage(role: .assistant, content: .blocks(apiBlocks))
             }
             return ChatMessage(role: .assistant, content: .text(m.text))
@@ -249,19 +236,13 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Tool execution
 
-    private struct ToolCallContext {
-        let id: String
-        let name: String
-        let input: [String: AnyJSON]
-    }
-
-    private func executeTool(_ tu: ToolCallContext) async -> String {
-        if tu.name == "write_file",
-           let path    = tu.input["path"]?.string,
-           let content = tu.input["content"]?.string {
+    private func executeTool(id: String, name: String, input: [String: AnyJSON]) async -> String {
+        if name == "write_file",
+           let path    = input["path"]?.string,
+           let content = input["content"]?.string {
             return await requestWriteApproval(path: path, content: content)
         }
-        return await executor.execute(name: tu.name, input: tu.input)
+        return await executor.execute(name: name, input: input)
     }
 
     private func requestWriteApproval(path: String, content: String) async -> String {
@@ -288,11 +269,8 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - User can resend/retry
-
     func regenerateLast() {
         guard var conv = store.selected else { return }
-        // Remove last assistant turn + any trailing tool results
         while let last = conv.messages.last,
               last.role == "assistant" || last.toolUseId != nil {
             conv.messages.removeLast()
@@ -303,7 +281,7 @@ final class ChatViewModel: ObservableObject {
     }
 }
 
-// MARK: - Models
+// MARK: - Support types
 
 private struct StreamingTool {
     let id: String
@@ -312,14 +290,14 @@ private struct StreamingTool {
 }
 
 struct ToolCallInfo: Identifiable, Equatable {
-    let id: String
-    let name: String
+    let id:    String
+    let name:  String
     var input: [String: AnyJSON]
     var result: String?
     var isComplete: Bool
 
     static func == (l: ToolCallInfo, r: ToolCallInfo) -> Bool {
-        l.id == r.id && l.isComplete == r.isComplete
+        l.id == r.id && l.isComplete == r.isComplete && l.result == r.result
     }
 }
 

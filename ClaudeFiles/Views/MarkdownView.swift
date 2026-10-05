@@ -1,15 +1,12 @@
 import SwiftUI
 
-/// Lightweight markdown renderer that handles headers, bold/italic, inline code,
-/// code blocks (with copy), bullet lists, numbered lists, blockquotes, and horizontal rules.
+/// Lightweight markdown renderer: headers, bold/italic, inline code,
+/// fenced code blocks (with copy button), bullet & numbered lists,
+/// blockquotes, and horizontal rules.
 struct MarkdownView: View {
-    let text:  String
-    let onDark: Bool
+    let text: String
 
-    init(_ text: String, onDark: Bool = false) {
-        self.text   = text
-        self.onDark = onDark
-    }
+    init(_ text: String) { self.text = text }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -19,7 +16,7 @@ struct MarkdownView: View {
         }
     }
 
-    // MARK: - Block types
+    // MARK: - Block model
 
     private enum Block {
         case heading(level: Int, text: String)
@@ -39,33 +36,20 @@ struct MarkdownView: View {
         while i < lines.count {
             let line = lines[i]
 
-            // Code block
+            // Fenced code block
             if line.hasPrefix("```") {
                 let lang = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                 var code: [String] = []
                 i += 1
-                while i < lines.count && !lines[i].hasPrefix("```") {
-                    code.append(lines[i])
-                    i += 1
-                }
+                while i < lines.count && !lines[i].hasPrefix("```") { code.append(lines[i]); i += 1 }
                 result.append(.codeBlock(language: lang, code: code.joined(separator: "\n")))
-                i += 1
-                continue
+                i += 1; continue
             }
 
-            // Heading
-            if line.hasPrefix("### ") {
-                result.append(.heading(level: 3, text: String(line.dropFirst(4))))
-                i += 1; continue
-            }
-            if line.hasPrefix("## ") {
-                result.append(.heading(level: 2, text: String(line.dropFirst(3))))
-                i += 1; continue
-            }
-            if line.hasPrefix("# ") {
-                result.append(.heading(level: 1, text: String(line.dropFirst(2))))
-                i += 1; continue
-            }
+            // Headings
+            if line.hasPrefix("### ") { result.append(.heading(level: 3, text: String(line.dropFirst(4)))); i += 1; continue }
+            if line.hasPrefix("## ")  { result.append(.heading(level: 2, text: String(line.dropFirst(3)))); i += 1; continue }
+            if line.hasPrefix("# ")   { result.append(.heading(level: 1, text: String(line.dropFirst(2)))); i += 1; continue }
 
             // Horizontal rule
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -77,8 +61,7 @@ struct MarkdownView: View {
             if line.hasPrefix("- ") || line.hasPrefix("* ") {
                 var items: [String] = []
                 while i < lines.count && (lines[i].hasPrefix("- ") || lines[i].hasPrefix("* ")) {
-                    items.append(String(lines[i].dropFirst(2)))
-                    i += 1
+                    items.append(String(lines[i].dropFirst(2))); i += 1
                 }
                 result.append(.bulletList(items)); continue
             }
@@ -89,8 +72,7 @@ struct MarkdownView: View {
                 while i < lines.count,
                       let r2 = lines[i].range(of: #"^\d+\.\s"#, options: .regularExpression),
                       r2.lowerBound == lines[i].startIndex {
-                    items.append(String(lines[i][r2.upperBound...]))
-                    i += 1
+                    items.append(String(lines[i][r2.upperBound...])); i += 1
                 }
                 result.append(.numberList(items)); continue
             }
@@ -98,45 +80,39 @@ struct MarkdownView: View {
             // Blockquote
             if line.hasPrefix("> ") {
                 var quote: [String] = []
-                while i < lines.count && lines[i].hasPrefix("> ") {
-                    quote.append(String(lines[i].dropFirst(2)))
-                    i += 1
-                }
+                while i < lines.count && lines[i].hasPrefix("> ") { quote.append(String(lines[i].dropFirst(2))); i += 1 }
                 result.append(.quote(quote.joined(separator: "\n"))); continue
             }
 
-            // Blank line
+            // Blank line → skip
             if line.isEmpty { i += 1; continue }
 
-            // Paragraph (combine consecutive non-special lines)
-            var para: [String] = [line]
-            i += 1
+            // Paragraph: combine consecutive non-special lines
+            var para: [String] = [line]; i += 1
             while i < lines.count {
                 let l = lines[i]
                 if l.isEmpty || l.hasPrefix("#") || l.hasPrefix("```")
-                    || l.hasPrefix("- ") || l.hasPrefix("* ") || l.hasPrefix("> ") {
-                    break
-                }
+                    || l.hasPrefix("- ") || l.hasPrefix("* ") || l.hasPrefix("> ") { break }
                 if l.range(of: #"^\d+\.\s"#, options: .regularExpression) != nil { break }
                 para.append(l); i += 1
             }
             result.append(.paragraph(para.joined(separator: " ")))
         }
-
         return result
     }
+
+    // MARK: - Block rendering
 
     @ViewBuilder
     private func blockView(_ block: Block) -> some View {
         switch block {
         case .heading(let level, let text):
-            Text(inlineAttributed(text))
+            Text(inline(text))
                 .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
                 .padding(.top, 2)
 
         case .paragraph(let s):
-            Text(inlineAttributed(s))
-                .fixedSize(horizontal: false, vertical: true)
+            Text(inline(s)).fixedSize(horizontal: false, vertical: true)
 
         case .codeBlock(let lang, let code):
             CodeBlockView(code: code, language: lang)
@@ -145,9 +121,8 @@ struct MarkdownView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     HStack(alignment: .top, spacing: 8) {
-                        Text("•").foregroundColor(.secondary)
-                        Text(inlineAttributed(item))
-                            .fixedSize(horizontal: false, vertical: true)
+                        Text("•").foregroundStyle(.secondary)
+                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -156,20 +131,17 @@ struct MarkdownView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
                     HStack(alignment: .top, spacing: 8) {
-                        Text("\(idx + 1).").foregroundColor(.secondary)
-                            .frame(minWidth: 20, alignment: .trailing)
-                        Text(inlineAttributed(item))
-                            .fixedSize(horizontal: false, vertical: true)
+                        Text("\(idx + 1).").foregroundStyle(.secondary).frame(minWidth: 20, alignment: .trailing)
+                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
 
         case .quote(let s):
             HStack(alignment: .top, spacing: 0) {
-                Rectangle().fill(Color.accentColor.opacity(0.5))
-                    .frame(width: 3)
-                Text(inlineAttributed(s))
-                    .foregroundColor(.secondary)
+                Rectangle().fill(Color.accentColor.opacity(0.5)).frame(width: 3)
+                Text(inline(s))
+                    .foregroundStyle(.secondary)
                     .padding(.leading, 10)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -179,14 +151,13 @@ struct MarkdownView: View {
         }
     }
 
-    // MARK: - Inline formatting (bold, italic, code, links)
+    // MARK: - Inline formatting via AttributedString markdown
 
-    private func inlineAttributed(_ s: String) -> AttributedString {
-        // AttributedString handles **bold**, *italic*, `code`, [links] natively via markdown
-        if let attr = try? AttributedString(markdown: s,
-                                            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            return attr
-        }
+    private func inline(_ s: String) -> AttributedString {
+        if let attr = try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) { return attr }
         return AttributedString(s)
     }
 }
@@ -202,8 +173,8 @@ struct CodeBlockView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(language.isEmpty ? "code" : language)
-                    .font(.caption.monospaced())
-                    .foregroundColor(.secondary)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button {
                     UIPasteboard.general.string = code
@@ -212,23 +183,22 @@ struct CodeBlockView: View {
                 } label: {
                     Image(systemName: copied ? "checkmark" : "doc.on.doc")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 7)
             .background(Color(.tertiarySystemBackground))
 
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .font(.system(.footnote, design: .monospaced))
                     .padding(10)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .background(Color(.secondarySystemBackground))
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color(.separator), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(.separator), lineWidth: 0.5))
     }
 }

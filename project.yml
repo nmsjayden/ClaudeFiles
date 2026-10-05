@@ -13,7 +13,7 @@ targets:
         excludes:
           # Filza-specific Substrate tweak — replaced by SandboxManager.swift
           - FilzaJailedDS-SSV-Bypass/Tweak.m
-          # Uses #import <substrate.h> (Cydia), won't compile in a normal app
+          # Uses #import <substrate.h> (Cydia Substrate), won't compile in a normal app
           - FilzaJailedDS-SSV-Bypass/FilzaPadlockBypass.m
     settings:
       base:
@@ -26,9 +26,9 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         ENABLE_BITCODE: "NO"
         INFOPLIST_FILE: ClaudeFiles/Info.plist
-        # Bridge Swift → FilzaJailedDS C/ObjC headers
+        # Swift ↔ FilzaJailedDS C/ObjC bridge
         SWIFT_OBJC_BRIDGING_HEADER: "ClaudeFiles/ClaudeFiles-Bridging-Header.h"
-        # Header search paths so #import "sandbox_escape.h" etc. resolve correctly
+        # Header search paths for all FilzaJailedDS subdirectories
         HEADER_SEARCH_PATHS:
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit"
@@ -37,3 +37,6 @@ targets:
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/utils"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src"
+        # App icon from asset catalog
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

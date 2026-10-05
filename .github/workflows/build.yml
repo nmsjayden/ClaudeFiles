@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
@@ -40,14 +40,16 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
-            SKIP_INSTALL=NO 2>&1 | tee /tmp/build.log || {
+            SKIP_INSTALL=NO \
+            OTHER_LDFLAGS='$(inherited) -Wl,-weak_framework,SwiftUICore' \
+            2>&1 | tee /tmp/build.log || {
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
               {
-                grep -E "error:|warning:|ld:|undefined|Undefined|linker" /tmp/build.log | tail -80
-                echo "--- LAST 60 LINES ---"
-                tail -60 /tmp/build.log
+                grep -E "error:|ld:|undefined|Undefined|linker" /tmp/build.log | tail -40
+                echo "--- LAST 80 LINES ---"
+                tail -80 /tmp/build.log
               } > /tmp/errors_combined.txt
               CONTENT=$(base64 < /tmp/errors_combined.txt | tr -d '\n')
               PAYLOAD="{\"message\":\"build errors\",\"content\":\"$CONTENT\"}"

@@ -1,0 +1,100 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		049A5A160B06213892AC6A4C /* ChatViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77E81A99DC40D8F8F290A870 /* ChatViewModel.swift */; };
+		34D6CF185B04230B2EB6A089 /* FileToolsExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B952EF25F50929BE17C95099 /* FileToolsExecutor.swift */; };
+		68D85DE8486F416B025DBA9D /* AuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A678AB7973C1A36C1259973 /* AuthManager.swift */; };
+		7628F1351799D64D1AA2AA9A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 349DD4BC5BD7226045686E5D /* ChatView.swift */; };
+		7C7EA4D1EFB1D6F5B5779DE7 /* LoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC1C72DE2B401896E323F5E6 /* LoginView.swift */; };
+		8138D2D3CCBC0EFD97C5F1A0 /* Message.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DDF33E771070EF195515FEA /* Message.swift */; };
+		99F7310088836FF5B8959878 /* AnthropicClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4D2CE027233819EB20DCCDC /* AnthropicClient.swift */; };
+		D30D76075873BFC2D878CD09 /* ClaudeFilesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDBAC68B44116BE82983E46E /* ClaudeFilesApp.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		05160A739E775AD35DA74387 /* ClaudeFiles.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ClaudeFiles.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		09FD49485F7249CB7B99BF49 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		349DD4BC5BD7226045686E5D /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		6DDF33E771070EF195515FEA /* Message.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Message.swift; sourceTree = "<group>"; };
+		77E81A99DC40D8F8F290A870 /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
+		7A678AB7973C1A36C1259973 /* AuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthManager.swift; sourceTree = "<group>"; };
+		B952EF25F50929BE17C95099 /* FileToolsExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileToolsExecutor.swift; sourceTree = "<group>"; };
+		BDBAC68B44116BE82983E46E /* ClaudeFilesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeFilesApp.swift; sourceTree = "<group>"; };
+		DC1C72DE2B401896E323F5E6 /* LoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoginView.swift; sourceTree = "<group>"; };
+		E4D2CE027233819EB20DCCDC /* AnthropicClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnthropicClient.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		1034C1F22F77EDE01B6E6755 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				77E81A99DC40D8F8F290A870 /* ChatViewModel.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		6C8DC9ACD64BB98CAD320D7B /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				349DD4BC5BD7226045686E5D /* ChatView.swift */,
+				DC1C72DE2B401896E323F5E6 /* LoginView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		6E16BF2DC652159358CFE7DA /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				E4D2CE027233819EB20DCCDC /* AnthropicClient.swift */,
+				7A678AB7973C1A36C1259973 /* AuthManager.swift */,
+				B952EF25F50929BE17C95099 /* FileToolsExecutor.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		DAB4FE48B7237841905239A2 /* ClaudeFiles */ = {
+			isa = PBXGroup;
+			children = (
+				BDBAC68B44116BE82983E46E /* ClaudeFilesApp.swift */,
+				09FD49485F7249CB7B99BF49 /* Info.plist */,
+				E33FA341D0232C9CDA75607E /* Models */,
+				6E16BF2DC652159358CFE7DA /* Services */,
+				1034C1F22F77EDE01B6E6755 /* ViewModels */,
+				6C8DC9ACD64BB98CAD320D7B /* Views */,
+			);
+			path = ClaudeFiles;
+			sourceTree = "<group>";
+		};
+		DF633CEA4D313B8935C34243 = {
+			isa = PBXGroup;
+			children = (
+				DAB4FE48B7237841905239A2 /* ClaudeFiles */,
+				EBC1AC17BABE285835CF3D87 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E33FA341D0232C9CDA75607E /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				6DDF33E771070EF195515FEA /* Message.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		EBC1AC17BABE285835CF3D87 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				05160A739E775AD35DA74387 /* ClaudeFiles.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */

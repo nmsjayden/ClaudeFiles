@@ -1,2 +1,4 @@
 /Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:56:76: error: extra argument 'toolCalls' in call
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:134:36: error: cannot find type 'ToolUseBlock' in scope
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:69:42: error: value of type 'AnthropicClient' has no member 'send'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:100:42: error: value of type 'AnthropicClient' has no member 'send'

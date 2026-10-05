@@ -51,12 +51,15 @@ targets:
           - "-Wno-comma"
           - "-Wno-incompatible-pointer-types-discards-qualifiers"
           - "-Wno-strict-prototypes"
-        # Xcode 16.4: the new linker rejects SwiftUICore.tbd with "not an
-        # allowed client", then fails with "symbol(s) not found" because
-        # SwiftUI re-exports symbols from SwiftUICore. The classic linker
-        # doesn't enforce the tbd allowlist.
+        # Xcode 16.4: the new linker rejects SwiftUICore.tbd ("not an
+        # allowed client"). Classic linker can't find it without a path.
+        # Solution: classic linker + explicit framework search path so it
+        # resolves SwiftUICore from the SDK.
         OTHER_LDFLAGS:
           - "-ld_classic"
+          - "-F$(SDKROOT)/System/Library/Frameworks"
+          - "-framework"
+          - "SwiftUICore"
         # App icon from asset catalog
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

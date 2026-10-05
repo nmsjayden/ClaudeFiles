@@ -51,11 +51,12 @@ targets:
           - "-Wno-comma"
           - "-Wno-incompatible-pointer-types-discards-qualifiers"
           - "-Wno-strict-prototypes"
-        # Xcode 16.4: SwiftUICore.tbd gets pulled in via EagerLinkingTBDs
-        # but the linker rejects it ("not an allowed client"). Disabling
-        # eager linking stops ld from seeing the tbd at all.
-        EAGER_LINKING: "NO"
-        MERGED_BINARY_TYPE: ""
+        # Xcode 16.4: the new linker rejects SwiftUICore.tbd with "not an
+        # allowed client", then fails with "symbol(s) not found" because
+        # SwiftUI re-exports symbols from SwiftUICore. The classic linker
+        # doesn't enforce the tbd allowlist.
+        OTHER_LDFLAGS:
+          - "-ld_classic"
         # App icon from asset catalog
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

@@ -176,7 +176,7 @@ final class AuthManager: NSObject, ObservableObject {
     }
     private func randomBase64(_ n: Int) -> String {
         var b = [UInt8](repeating: 0, count: n)
-        SecRandomCopyBytes(kSecRandomDefault, n, &b)
+        _ = SecRandomCopyBytes(kSecRandomDefault, n, &b)
         return Data(b).base64URLEncoded()
     }
 }

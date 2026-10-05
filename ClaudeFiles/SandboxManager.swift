@@ -47,9 +47,10 @@ final class SandboxManager: ObservableObject {
     }
 
     // MARK: - Exploit sequence (runs off main thread via DispatchQueue)
-    // Deliberately NOT @MainActor so it can run freely on the background queue.
+    // Marked `nonisolated` so it escapes the enclosing @MainActor isolation and
+    // can be called synchronously from a background DispatchQueue closure.
 
-    private static func runEscape() -> Status {
+    private nonisolated static func runEscape() -> Status {
         DebugLog.log("[Sandbox] Starting kexploit_opa334…")
 
         let kret = kexploit_opa334()

@@ -60,23 +60,61 @@ final class AnthropicClient {
             throw APIError.serverError("HTTP \(http.statusCode)\n\n\(raw.prefix(2000))")
         }
 
-        // Parse SSE events
+        // Parse SSE events. Spec: fields separated by \n, events separated by blank line.
+        // Field format: "field: value" (one space after colon is optional).
         var currentEvent = ""
-        var currentData = ""
+        var currentData  = ""
+        var eventCount   = 0
 
         for try await line in bytes.lines {
-            if try Task.checkCancellation() == () {}
+            try Task.checkCancellation()
+
             if line.isEmpty {
+                // End of event — dispatch what we have
                 if !currentData.isEmpty {
                     processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
+                    eventCount += 1
                 }
                 currentEvent = ""
-                currentData = ""
-            } else if line.hasPrefix("event: ") {
-                currentEvent = String(line.dropFirst(7))
-            } else if line.hasPrefix("data: ") {
-                currentData = String(line.dropFirst(6))
+                currentData  = ""
+                continue
             }
+
+            // Lines starting with ":" are SSE comments — skip
+            if line.hasPrefix(":") { continue }
+
+            // Parse "field: value" or "field:value"
+            guard let colonIdx = line.firstIndex(of: ":") else { continue }
+            let field = String(line[..<colonIdx])
+            var valueStart = line.index(after: colonIdx)
+            if valueStart < line.endIndex && line[valueStart] == " " {
+                valueStart = line.index(after: valueStart)
+            }
+            let value = String(line[valueStart...])
+
+            switch field {
+            case "event":
+                currentEvent = value
+            case "data":
+                // SSE "data:" can arrive on multiple lines; append with newline
+                if currentData.isEmpty {
+                    currentData = value
+                } else {
+                    currentData += "\n" + value
+                }
+            default:
+                break
+            }
+        }
+
+        // Dispatch any trailing event that wasn't followed by blank line
+        if !currentData.isEmpty {
+            processSSE(event: currentEvent, data: currentData, onEvent: onEvent)
+            eventCount += 1
+        }
+
+        if eventCount == 0 {
+            throw APIError.serverError("Stream ended with no SSE events received. The connection may have been dropped.")
         }
     }
 

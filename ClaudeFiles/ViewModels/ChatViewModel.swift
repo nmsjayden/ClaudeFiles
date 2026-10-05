@@ -159,6 +159,8 @@ final class ChatViewModel: ObservableObject {
                 // Combine all text blocks (preserving order)
                 let combinedText = allIndices.compactMap { textBlocks[$0] }.joined(separator: "\n")
 
+                DebugLog.log("Turn complete: text=\(combinedText.count) chars, blocks=\(apiBlocks.count), stop=\(finalStopReason ?? "nil")")
+
                 // Append whatever we have (even partial) so user sees the response
                 if !apiBlocks.isEmpty || !combinedText.isEmpty {
                     if var conv = store.selected {

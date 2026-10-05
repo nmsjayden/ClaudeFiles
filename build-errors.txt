@@ -1,1 +1,33 @@
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:19:9: error: '../research/sandbox_research.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:383:7: warning: unused variable 'r' [-Wunused-variable]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:392:8: warning: unused variable 'r' [-Wunused-variable]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:538:11: warning: unused variable 'setCount' [-Wunused-variable]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/utils/hexdump.c:23:44: warning: format specifies type 'unsigned long long' but the argument has type 'const void **' [-Wformat]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/utils/../kexploit/xpaci.h:13:17: warning: unused function 'xpaci' [-Wunused-function]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/common.c:172:6: warning: unused variable 'r' [-Wunused-variable]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/common.c:612:90: warning: implicit conversion loses integer precision: 'uint64_t' (aka 'unsigned long long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/bad_recovery.c:246:17: warning: unused function 'xpf_find_thread_machine_kstackptr' [-Wunused-function]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/SSV/SSVUtils.m:81:15: warning: implicit conversion loses integer precision: 'uint64_t' (aka 'unsigned long long') to 'int' [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src/PatchFinder_arm64.c:110:59: warning: implicit conversion loses integer precision: 'uint64_t' (aka 'unsigned long long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src/MemoryStream.c:182:39: warning: implicit conversion loses integer precision: 'size_t' (aka 'unsigned long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src/MachOLoadCommand.c:143:39: warning: implicit conversion loses integer precision: 'const uint64_t' (aka 'const unsigned long long') to 'uint32_t' (aka 'unsigned int') [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src/MachOLoadCommand.c:178:40: warning: implicit conversion loses integer precision: 'uint64_t' (aka 'unsigned long long') to 'int' [-Wshorten-64-to-32]
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:155:26: error: variable has incomplete type 'struct sandbox_label'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:156:29: error: invalid application of 'sizeof' to an incomplete type 'struct sandbox_label'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:157:57: error: invalid application of 'sizeof' to an incomplete type 'struct sandbox_label'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:161:26: error: variable has incomplete type 'struct extension_set'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:162:83: error: invalid application of 'sizeof' to an incomplete type 'struct extension_set'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:163:38: error: invalid application of 'sizeof' to an incomplete type 'struct extension_set'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:169:41: error: variable has incomplete type 'struct extension_class_node'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:171:66: error: invalid application of 'sizeof' to an incomplete type 'struct extension_class_node'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:198:30: error: variable has incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:241:40: error: offsetof of incomplete type 'struct extension_class_node'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:248:33: error: offsetof of incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:249:32: error: offsetof of incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:250:32: error: offsetof of incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:250:80: error: use of undeclared identifier 'SC_ISSUED'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:255:33: error: offsetof of incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:256:33: error: offsetof of incomplete type 'struct extension'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:260:41: error: offsetof of incomplete type 'struct extension_set'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:299:26: error: variable has incomplete type 'struct sandbox_label'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:300:39: error: invalid application of 'sizeof' to an incomplete type 'struct sandbox_label'
+fatal error: too many errors emitted, stopping now [-ferror-limit=]

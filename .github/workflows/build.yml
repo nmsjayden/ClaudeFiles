@@ -38,7 +38,9 @@ jobs:
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log || {
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            SKIP_INSTALL=NO 2>&1 | tee /tmp/build.log || {
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
@@ -66,4 +68,4 @@ jobs:
         with:
           name: ClaudeFiles-unsigned
           path: ${{ env.IPA_PATH }}
-          retention-days: 30
+          retention-days: 90

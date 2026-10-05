@@ -37,6 +37,7 @@ targets:
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/utils"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/include"
         # App icon from asset catalog
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

@@ -22,6 +22,12 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
+      - name: List generated files
+        run: |
+          echo "=== Root ===" && ls -la
+          echo "=== xcodeproj ===" && ls ClaudeFiles.xcodeproj/ 2>/dev/null || echo "No xcodeproj found"
+          echo "=== Schemes ===" && ls ClaudeFiles.xcodeproj/xcshareddata/xcschemes/ 2>/dev/null || echo "No schemes"
+
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
@@ -29,36 +35,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -o pipefail
           xcodebuild archive \
+            -project ClaudeFiles.xcodeproj \
             -scheme ClaudeFiles \
             -configuration Release \
             -archivePath "$RUNNER_TEMP/ClaudeFiles.xcarchive" \
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log
-          
-          if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            # Get current file SHA if it exists (needed for update)
-            SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
-              | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('sha',''))" 2>/dev/null || echo "")
-            
-            CONTENT=$(grep -E "error:|warning:|note:" /tmp/build.log | tail -150 | base64 | tr -d '\n')
-            
-            if [ -z "$SHA" ]; then
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log || {
+              SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
+                | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('sha',''))" 2>/dev/null || echo "")
+              CONTENT=$(grep -E "error:|warning:" /tmp/build.log | tail -150 | base64 | tr -d '\n')
+              PAYLOAD="{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\"}"
+              [ -n "$SHA" ] && PAYLOAD="{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
               curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
                 -H "Content-Type: application/json" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
-                -d "{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\"}"
-            else
-              curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
-                -H "Content-Type: application/json" \
-                "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
-                -d "{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
-            fi
-            exit 1
-          fi
+                -d "$PAYLOAD"
+              exit 1
+            }
 
       - name: Package IPA
         run: |
@@ -66,8 +64,7 @@ jobs:
           echo "App: $APP_PATH"
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
-          cd "$RUNNER_TEMP"
-          zip -r ClaudeFiles-unsigned.ipa Payload/
+          cd "$RUNNER_TEMP" && zip -r ClaudeFiles-unsigned.ipa Payload/
           echo "IPA_PATH=$RUNNER_TEMP/ClaudeFiles-unsigned.ipa" >> $GITHUB_ENV
 
       - name: Upload IPA artifact

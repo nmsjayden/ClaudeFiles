@@ -22,19 +22,73 @@ final class FileToolsExecutor {
 
     private func readFile(path: String) -> String {
         guard !path.isEmpty else { return "Error: path required" }
+        DebugLog.log("readFile: \(path)")
         do {
             let text = try String(contentsOfFile: path, encoding: .utf8)
+            DebugLog.log("  → success, \(text.count) chars")
             return text.count > 20_000
                 ? String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
                 : text
         } catch {
-            // Try binary fallback
+            let ns = error as NSError
+            DebugLog.log("  → text failed: domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)")
+            // Try FileManager binary
             if let data = FileManager.default.contents(atPath: path) {
+                DebugLog.log("  → FileManager binary read ok, \(data.count) bytes")
+                if let text = String(data: data, encoding: .utf8) {
+                    return text.count > 20_000
+                        ? String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
+                        : text
+                }
                 return "Binary (\(data.count) bytes). Hex: " +
                     data.prefix(128).map { String(format: "%02x", $0) }.joined(separator: " ")
             }
+            // POSIX fallback
+            if let data = posixRead(path: path) {
+                DebugLog.log("  → POSIX read ok, \(data.count) bytes")
+                if let text = String(data: data, encoding: .utf8) {
+                    return text.count > 20_000
+                        ? String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
+                        : text
+                }
+                return "Binary (\(data.count) bytes). Hex: " +
+                    data.prefix(128).map { String(format: "%02x", $0) }.joined(separator: " ")
+            }
+            DebugLog.log("  → POSIX read failed, errno=\(errno) (\(String(cString: strerror(errno))))")
             return "Error reading \(path): \(describe(error, at: path))"
         }
+    }
+
+    private func posixRead(path: String) -> Data? {
+        let fd = open(path, O_RDONLY)
+        if fd < 0 { return nil }
+        defer { close(fd) }
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = buf.withUnsafeMutableBufferPointer { ptr in
+                read(fd, ptr.baseAddress, ptr.count)
+            }
+            if n < 0 { return nil }
+            if n == 0 { break }
+            data.append(buf, count: n)
+            if data.count > 2_000_000 { break } // safety cap
+        }
+        return data
+    }
+
+    private func posixListDir(path: String) -> [String]? {
+        guard let dir = opendir(path) else { return nil }
+        defer { closedir(dir) }
+        var names: [String] = []
+        while let entry = readdir(dir) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) { ptr -> String in
+                ptr.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+            names.append(name)
+        }
+        return names
     }
 
     private func writeFile(path: String, content: String) -> String {
@@ -56,12 +110,39 @@ final class FileToolsExecutor {
 
     private func listDir(path: String) -> String {
         guard !path.isEmpty else { return "Error: path required" }
+        DebugLog.log("listDir: \(path)")
         let fm = FileManager.default
-        let items: [String]
+
+        // Diagnostic: does the path exist? Is it a directory? What are its POSIX perms?
+        var isDir: ObjCBool = false
+        let exists = fm.fileExists(atPath: path, isDirectory: &isDir)
+        DebugLog.log("  → exists=\(exists), isDir=\(isDir.boolValue)")
+        if exists {
+            if let attrs = try? fm.attributesOfItem(atPath: path) {
+                let perm = (attrs[.posixPermissions] as? Int).map { String(format: "%o", $0) } ?? "?"
+                let owner = attrs[.ownerAccountName] as? String ?? "?"
+                let type = (attrs[.type] as? FileAttributeType)?.rawValue ?? "?"
+                DebugLog.log("  → attrs: perm=\(perm) owner=\(owner) type=\(type)")
+            }
+            DebugLog.log("  → isReadable=\(fm.isReadableFile(atPath: path))")
+        }
+
+        var items: [String] = []
         do {
             items = try fm.contentsOfDirectory(atPath: path)
+            DebugLog.log("  → FileManager success, \(items.count) items")
         } catch {
-            return "Error listing \(path): \(describe(error, at: path))"
+            let ns = error as NSError
+            DebugLog.log("  → FileManager failed: domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)")
+
+            // Fallback: try POSIX opendir — DarkSword may expose fs through this path differently
+            if let posixItems = posixListDir(path: path) {
+                DebugLog.log("  → POSIX opendir succeeded with \(posixItems.count) items")
+                items = posixItems
+            } else {
+                DebugLog.log("  → POSIX opendir also failed, errno=\(errno) (\(String(cString: strerror(errno))))")
+                return "Error listing \(path): \(describe(error, at: path))"
+            }
         }
         return items.sorted().map { name -> String in
             var isDir: ObjCBool = false

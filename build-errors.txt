@@ -1,3 +1,2 @@
 /Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:4:50: error: missing argument for parameter 'store' in call
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:25:42: error: cannot infer type of closure parameter 'write' without a type annotation
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:56:76: error: extra argument 'toolCalls' in call

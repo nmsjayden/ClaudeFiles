@@ -3,10 +3,11 @@ import AuthenticationServices
 
 struct LoginView: View {
     @EnvironmentObject var auth: AuthManager
-    @State private var windowScene: UIWindowScene?
+    @State private var scene: UIWindowScene?
+    @State private var codeText: String = ""
 
     var body: some View {
-        VStack(spacing: 32) {
+        VStack(spacing: 24) {
             Spacer()
 
             Image(systemName: "externaldrive.fill.badge.wifi")
@@ -19,8 +20,10 @@ struct LoginView: View {
                     .multilineTextAlignment(.center).padding(.horizontal, 32)
             }
 
-            if auth.isLoading {
-                ProgressView("Signing in…")
+            if auth.awaitingCode {
+                codeEntry
+            } else if auth.isLoading {
+                ProgressView("Opening Claude.ai…")
             } else {
                 Button(action: login) {
                     Label("Sign in with Claude", systemImage: "person.badge.key.fill")
@@ -38,31 +41,68 @@ struct LoginView: View {
 
             Spacer()
 
-            Text("Uses your existing Claude.ai subscription · No API key needed")
-                .font(.caption).foregroundColor(.secondary)
-                .multilineTextAlignment(.center).padding(.bottom, 32)
+            Text("Uses your Claude.ai account · OAuth via Claude Code's flow")
+                .font(.caption2).foregroundColor(.secondary)
+                .multilineTextAlignment(.center).padding(.bottom, 24)
         }
-        .background(SceneFinder { scene in windowScene = scene })
+        .background(SceneFinder { s in scene = s })
+    }
+
+    // MARK: - Paste code UI
+
+    private var codeEntry: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Paste the authorization code")
+                .font(.headline)
+            Text("After clicking **Authorize** on claude.ai, you'll see a page with a code. Copy it and paste it below.")
+                .font(.caption).foregroundColor(.secondary)
+
+            TextField("Paste code here", text: $codeText, axis: .vertical)
+                .lineLimit(2...4)
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .cornerRadius(10)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+
+            HStack {
+                Button("Cancel") {
+                    codeText = ""
+                    auth.cancelCodeEntry()
+                }
+                .foregroundColor(.red)
+
+                Spacer()
+
+                Button {
+                    auth.submitCode(codeText)
+                    codeText = ""
+                } label: {
+                    Text("Submit").bold()
+                        .padding(.horizontal, 20).padding(.vertical, 10)
+                        .background(Color.accentColor)
+                        .foregroundColor(.white).cornerRadius(10)
+                }
+                .disabled(codeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(.horizontal, 32)
     }
 
     private func login() {
-        guard let scene = windowScene,
-              let window = scene.windows.first else { return }
+        guard let scene, let window = scene.windows.first else { return }
         auth.startLogin(anchor: window)
     }
 }
 
-// MARK: - Scene finder (gets UIWindowScene without UIViewRepresentable UIWindow dependency)
-
 private struct SceneFinder: UIViewRepresentable {
     let onScene: (UIWindowScene) -> Void
-
     func makeUIView(context: Context) -> UIView {
         let v = UIView(); v.isHidden = true; return v
     }
     func updateUIView(_ v: UIView, context: Context) {
         DispatchQueue.main.async {
-            if let scene = v.window?.windowScene { onScene(scene) }
+            if let s = v.window?.windowScene { onScene(s) }
         }
     }
 }

@@ -16,8 +16,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      - name: Select Xcode 16.2
+        run: |
+          # Xcode 16.4 has a SwiftUICore.tbd linker bug; 16.2 doesn't
+          ls /Applications/Xcode*.app/Contents/Developer || true
+          if [ -d "/Applications/Xcode_16.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_16.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer
+          fi
+          xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -44,7 +52,13 @@ jobs:
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
                 | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
-              CONTENT=$(grep -E "error:|warning:" /tmp/build.log | tail -100 | base64 | tr -d '\n')
+              # Capture: all errors/warnings PLUS the last 60 lines (linker detail)
+              {
+                grep -E "error:|warning:|ld:|undefined|Undefined|linker" /tmp/build.log | tail -80
+                echo "--- LAST 60 LINES ---"
+                tail -60 /tmp/build.log
+              } > /tmp/errors_combined.txt
+              CONTENT=$(base64 < /tmp/errors_combined.txt | tr -d '\n')
               PAYLOAD="{\"message\":\"build errors\",\"content\":\"$CONTENT\"}"
               [ -n "$SHA" ] && PAYLOAD="{\"message\":\"build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
               curl -s -X PUT -H "Authorization: token $GH_TOKEN" \

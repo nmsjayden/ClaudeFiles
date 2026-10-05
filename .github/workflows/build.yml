@@ -1,0 +1,51 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # lets you trigger it manually from GitHub
+
+jobs:
+  build:
+    runs-on: macos-14   # Xcode 15, Apple Silicon runner
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Build archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -scheme ClaudeFiles \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/ClaudeFiles.xcarchive" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || true
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/ClaudeFiles.xcarchive" -name "*.app" | head -1)
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r ClaudeFiles-unsigned.ipa Payload/
+          echo "IPA size: $(du -sh ClaudeFiles-unsigned.ipa | cut -f1)"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeFiles-unsigned
+          path: ${{ runner.temp }}/ClaudeFiles-unsigned.ipa
+          retention-days: 30

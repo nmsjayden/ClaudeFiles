@@ -369,16 +369,53 @@ struct ToolCallCard: View {
             }
             .buttonStyle(.plain)
 
-            if expanded, let result = tool.result {
+            if expanded {
                 Divider()
-                ScrollView {
-                    Text(result)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
+                VStack(alignment: .leading, spacing: 10) {
+                    // Input section
+                    if !tool.input.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("INPUT")
+                                .font(.caption2.bold()).foregroundColor(.secondary)
+                            ForEach(Array(tool.input.keys.sorted()), id: \.self) { key in
+                                HStack(alignment: .top, spacing: 4) {
+                                    Text("\(key):")
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                    Text(valueString(tool.input[key]))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                        .textSelection(.enabled)
+                                    Spacer(minLength: 0)
+                                }
+                            }
+                        }
+                    }
+
+                    // Result section
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("RESULT")
+                            .font(.caption2.bold()).foregroundColor(.secondary)
+                        if let result = tool.result, !result.isEmpty {
+                            ScrollView {
+                                Text(result)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(maxHeight: 300)
+                        } else if !tool.isComplete {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.mini)
+                                Text("Running…").font(.caption).foregroundColor(.secondary)
+                            }
+                        } else {
+                            Text("(no output)")
+                                .font(.caption).foregroundColor(.secondary).italic()
+                        }
+                    }
                 }
-                .frame(maxHeight: 250)
+                .padding(10)
                 .background(Color(.tertiarySystemBackground))
             }
         }
@@ -409,6 +446,20 @@ struct ToolCallCard: View {
     }
     private var pathArg: String? {
         tool.input["path"]?.string ?? tool.input["directory"]?.string
+    }
+
+    private func valueString(_ v: AnyJSON?) -> String {
+        guard let v else { return "" }
+        switch v {
+        case .string(let s): return s
+        case .number(let n): return n.truncatingRemainder(dividingBy: 1) == 0 ? "\(Int(n))" : "\(n)"
+        case .bool(let b):   return b ? "true" : "false"
+        case .null:          return "null"
+        default:
+            if let data = try? JSONEncoder().encode(v),
+               let str = String(data: data, encoding: .utf8) { return str }
+            return "?"
+        }
     }
 }
 

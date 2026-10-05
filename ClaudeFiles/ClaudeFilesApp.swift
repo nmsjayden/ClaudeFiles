@@ -2,24 +2,24 @@ import SwiftUI
 
 @main
 struct ClaudeFilesApp: App {
-    @StateObject private var authManager = AuthManager.shared
+    @StateObject private var auth = AuthManager.shared
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(authManager)
+                .environmentObject(auth)
                 .onOpenURL { url in
-                    authManager.handleCallback(url: url)
+                    auth.handleCallback(url: url)
                 }
         }
     }
 }
 
 struct ContentView: View {
-    @EnvironmentObject var authManager: AuthManager
+    @EnvironmentObject var auth: AuthManager
 
     var body: some View {
-        if authManager.isAuthenticated {
+        if auth.isAuthenticated {
             ChatView()
         } else {
             LoginView()

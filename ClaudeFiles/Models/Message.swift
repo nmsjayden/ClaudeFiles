@@ -31,13 +31,24 @@ enum MessageContent {
     case toolResult(toolUseId: String, result: String)
 }
 
-// Encodable block for API messages
+// Encodable block for API messages — omits nil fields explicitly
 struct APIBlock: Encodable {
     let type:  String
     let text:  String?
     let id:    String?
     let name:  String?
     let input: [String: AnyJSON]?
+
+    enum CodingKeys: String, CodingKey { case type, text, id, name, input }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(type, forKey: .type)
+        if let text  = text  { try c.encode(text,  forKey: .text) }
+        if let id    = id    { try c.encode(id,    forKey: .id) }
+        if let name  = name  { try c.encode(name,  forKey: .name) }
+        if let input = input { try c.encode(input, forKey: .input) }
+    }
 }
 
 struct ToolResultBlock: Encodable {

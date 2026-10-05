@@ -1,4 +1,15 @@
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][iphone][20x20][][][1x][][][][][2d][icon_20@1x.png]: warning: The app icon set "AppIcon" has 2 unassigned children.
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][ipad][83.5x83.5][][][2x][][][][]: warning: AppIcon.appiconset/icon_83@2x.png is 166x166 but should be 167x167.
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset: warning: A 83.5x83.5@2x app icon is required for iPad apps targeting iOS 9.0 and later
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][iphone][20x20][][][1x][][][][][2d][icon_20@1x.png]: warning: The app icon set "AppIcon" has 2 unassigned children.
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][ipad][83.5x83.5][][][2x][][][][]: warning: AppIcon.appiconset/icon_83@2x.png is 166x166 but should be 167x167.
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][iphone][20x20][][][1x][][][][][2d][icon_20@1x.png]: warning: The app icon set "AppIcon" has 2 unassigned children.
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Assets.xcassets:./AppIcon.appiconset/[][ipad][83.5x83.5][][][2x][][][][]: warning: AppIcon.appiconset/icon_83@2x.png is 166x166 but should be 167x167.
 /Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:1:10: error: 'choma/Fat.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox_backup.m:16:9: error: '../research/sandbox_research.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:19:9: error: '../research/sandbox_research.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:363:39: error: type 'ShapeStyle' has no member 'accentColor'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:465:61: error: type 'ShapeStyle' has no member 'accentColor'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:669:25: error: the compiler is unable to type-check this expression in reasonable time; try breaking up the expression into distinct sub-expressions
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:747:25: error: the compiler is unable to type-check this expression in reasonable time; try breaking up the expression into distinct sub-expressions
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:869:61: error: type 'ShapeStyle' has no member 'accentColor'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/SandboxManager.swift:41:35: warning: reference to captured var 'self' in concurrently-executing code; this is an error in the Swift 6 language mode
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/SandboxManager.swift:40:26: error: expression is 'async' but is not marked with 'await'

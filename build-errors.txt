@@ -1,4 +1,3 @@
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:177:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:26: error: value of type 'AuthManager' has no dynamic member 'handleCallback' using key path from root type 'AuthManager'
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:21: error: referencing subscript 'subscript(dynamicMember:)' requires wrapper 'ObservedObject<AuthManager>.Wrapper'
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ClaudeFilesApp.swift:12:26: error: cannot call value of non-function type 'Binding<Subject>'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:4:50: error: missing argument for parameter 'store' in call
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Views/ChatView.swift:25:42: error: cannot infer type of closure parameter 'write' without a type annotation

@@ -35,6 +35,7 @@ targets:
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/include"
+          - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/shims"
         OTHER_CFLAGS:
           - "-Wno-unused-variable"
           - "-Wno-shorten-64-to-32"

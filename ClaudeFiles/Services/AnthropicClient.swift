@@ -4,9 +4,9 @@ import Foundation
 
 final class AnthropicClient {
     private let apiURL    = URL(string: "https://api.anthropic.com/v1/messages")!
-    private let model     = "claude-sonnet-4-5-20250929"
-
+    @MainActor
     func send(messages: [ChatMessage], system: String, accessToken: String) async throws -> APIResponse {
+        let model = SettingsStore.shared.selectedModel
         var req = URLRequest(url: apiURL)
         req.httpMethod = "POST"
         req.setValue("Bearer \(accessToken)",  forHTTPHeaderField: "Authorization")

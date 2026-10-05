@@ -135,10 +135,11 @@ private struct ChatContent: View {
 
     private var sandboxDotColor: Color {
         switch sandbox.status {
-        case .escaped:    return .green
-        case .exploiting: return .orange
-        case .failed:     return .red
-        case .idle:       return .gray
+        case .escaped:       return .green
+        case .partial:       return .yellow
+        case .exploiting:    return .orange
+        case .failed:        return .red
+        case .idle:          return .gray
         }
     }
 
@@ -214,7 +215,8 @@ private struct EmptyStateView: View {
         let (text, color): (String, Color) = {
             switch sandbox.status {
             case .escaped:       return ("Full filesystem access active", .green)
-            case .exploiting:    return ("Initialising filesystem access…", .orange)
+            case .partial(let m): return (m, .yellow)
+            case .exploiting(let s): return (s, .orange)
             case .failed(let m): return ("Sandbox escape failed · \(m)", .red)
             case .idle:          return ("Filesystem access pending", .gray)
             }
@@ -1108,18 +1110,20 @@ struct SettingsSheet: View {
 
     private var sandboxIcon: String {
         switch sandbox.status {
-        case .escaped:    return "checkmark.shield.fill"
-        case .exploiting: return "shield.lefthalf.filled"
-        case .failed:     return "xmark.shield.fill"
-        case .idle:       return "shield"
+        case .escaped:       return "checkmark.shield.fill"
+        case .partial:       return "exclamationmark.shield.fill"
+        case .exploiting:    return "shield.lefthalf.filled"
+        case .failed:        return "xmark.shield.fill"
+        case .idle:          return "shield"
         }
     }
     private var sandboxColor: Color {
         switch sandbox.status {
-        case .escaped:    return .green
-        case .exploiting: return .orange
-        case .failed:     return .red
-        case .idle:       return .gray
+        case .escaped:       return .green
+        case .partial:       return .yellow
+        case .exploiting:    return .orange
+        case .failed:        return .red
+        case .idle:          return .gray
         }
     }
 }

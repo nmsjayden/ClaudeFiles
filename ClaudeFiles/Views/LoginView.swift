@@ -108,10 +108,10 @@ struct LoginView: View {
                     Circle()
                         .fill(statusColor.opacity(0.4))
                         .frame(width: 14, height: 14)
-                        .opacity(sandbox.status == .exploiting ? 1 : 0)
-                        .scaleEffect(sandbox.status == .exploiting ? 1.4 : 1)
+                        .opacity(sandbox.status.isWorking ? 1 : 0)
+                        .scaleEffect(sandbox.status.isWorking ? 1.4 : 1)
                         .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true),
-                                   value: sandbox.status == .exploiting)
+                                   value: sandbox.status.isWorking)
                 )
             Text(sandbox.status.label)
                 .font(.caption2)
@@ -121,10 +121,11 @@ struct LoginView: View {
 
     private var statusColor: Color {
         switch sandbox.status {
-        case .idle:       return .gray
-        case .exploiting: return .orange
-        case .escaped:    return .green
-        case .failed:     return .red
+        case .idle:          return .gray
+        case .exploiting:    return .orange
+        case .escaped:       return .green
+        case .partial:       return .yellow
+        case .failed:        return .red
         }
     }
 

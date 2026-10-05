@@ -76,9 +76,6 @@ final class AnthropicClient {
         for try await line in bytes.lines {
             try Task.checkCancellation()
             totalLines += 1
-            if totalLines <= 20 {
-                DebugLog.log("SSE line \(totalLines): \(line.prefix(200))")
-            }
 
             // Blank line = event boundary
             if line.isEmpty {
@@ -137,12 +134,7 @@ final class AnthropicClient {
     }
 
     private func processSSE(event: String, data: String, onEvent: (StreamEvent) -> Void) {
-        DebugLog.log("processSSE event=\(event) data=\(data.prefix(200))")
-        guard let payload = data.data(using: .utf8) else {
-            DebugLog.log("  → data couldn't be converted to UTF8")
-            return
-        }
-
+        guard let payload = data.data(using: .utf8) else { return }
         switch event {
         case "content_block_start":
             if let p = try? JSONDecoder().decode(ContentBlockStartEvent.self, from: payload) {

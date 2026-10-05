@@ -1,8 +1,36 @@
 import SwiftUI
 
 struct ChatView: View {
-    @StateObject private var vm  = ChatViewModel()
-    @EnvironmentObject var auth  : AuthManager
+    @EnvironmentObject var auth:  AuthManager
+    @EnvironmentObject var store: ConversationStore
+    @StateObject private var settings = SettingsStore.shared
+    @State private var showingSidebar  = false
+    @State private var showingSettings = false
+
+    var body: some View {
+        ChatViewContent(store: store, settings: settings,
+                        showingSidebar: $showingSidebar,
+                        showingSettings: $showingSettings)
+            .environmentObject(auth)
+    }
+}
+
+private struct ChatViewContent: View {
+    @ObservedObject var store: ConversationStore
+    @ObservedObject var settings: SettingsStore
+    @Binding var showingSidebar: Bool
+    @Binding var showingSettings: Bool
+    @EnvironmentObject var auth: AuthManager
+    @StateObject private var vm: ChatViewModel
+
+    init(store: ConversationStore, settings: SettingsStore,
+         showingSidebar: Binding<Bool>, showingSettings: Binding<Bool>) {
+        self.store = store
+        self.settings = settings
+        self._showingSidebar  = showingSidebar
+        self._showingSettings = showingSettings
+        self._vm = StateObject(wrappedValue: ChatViewModel(store: store))
+    }
 
     var body: some View {
         NavigationView {
@@ -11,16 +39,37 @@ struct ChatView: View {
                 Divider()
                 inputBar
             }
-            .navigationTitle("Claude Files")
+            .navigationTitle(store.selected?.title ?? "Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Clear") { vm.clearHistory() }
+                    Button { showingSidebar = true } label: {
+                        Image(systemName: "line.3.horizontal")
+                    }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Logout") { auth.logout() }
+                    Menu {
+                        Button { store.newConversation() } label: {
+                            Label("New chat", systemImage: "square.and.pencil")
+                        }
+                        Button { showingSettings = true } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                        Divider()
+                        Button(role: .destructive) { auth.logout() } label: {
+                            Label("Logout", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
             }
+        }
+        .sheet(isPresented: $showingSidebar) {
+            ChatListSheet(store: store, isPresented: $showingSidebar)
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsSheet(settings: settings)
         }
         .sheet(item: $vm.pendingWrite) { write in
             WriteApprovalSheet(write: write)
@@ -33,14 +82,12 @@ struct ChatView: View {
         }
     }
 
-    // MARK: - Message list
-
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(vm.displayMessages) { msg in
-                        MessageBubble(message: msg).id(msg.id)
+                    ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
+                        MessageBubble(message: msg).id(idx)
                     }
                     if vm.isSending {
                         TypingIndicator().id("typing")
@@ -49,14 +96,13 @@ struct ChatView: View {
                 .padding()
             }
             .onChange(of: vm.displayMessages.count) { _ in
-                if let last = vm.displayMessages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                let count = vm.displayMessages.count
+                if count > 0 {
+                    withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
                 }
             }
         }
     }
-
-    // MARK: - Input bar
 
     private var inputBar: some View {
         HStack(spacing: 8) {
@@ -99,6 +145,7 @@ struct MessageBubble: View {
                 .background(isUser ? Color.accentColor : Color(.secondarySystemBackground))
                 .foregroundColor(isUser ? .white : .primary)
                 .cornerRadius(18)
+                .textSelection(.enabled)
                 .frame(maxWidth: UIScreen.main.bounds.width * 0.75,
                        alignment: isUser ? .trailing : .leading)
 
@@ -130,10 +177,10 @@ struct TypingIndicator: View {
     }
 }
 
-// MARK: - Error sheet (copyable)
+// MARK: - Error sheet
 
 struct ErrorSheet: View {
-    let message: String
+    let message:   String
     let onDismiss: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var copied = false
@@ -143,8 +190,7 @@ struct ErrorSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Label("Error", systemImage: "exclamationmark.triangle.fill")
-                        .font(.headline)
-                        .foregroundColor(.red)
+                        .font(.headline).foregroundColor(.red)
 
                     Text(message)
                         .font(.system(.footnote, design: .monospaced))
@@ -161,11 +207,9 @@ struct ErrorSheet: View {
                     } label: {
                         Label(copied ? "Copied!" : "Copy error",
                               systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .frame(maxWidth: .infinity)
-                            .padding()
+                            .frame(maxWidth: .infinity).padding()
                             .background(Color.accentColor)
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
+                            .foregroundColor(.white).cornerRadius(10)
                     }
                 }
                 .padding()
@@ -175,6 +219,120 @@ struct ErrorSheet: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { onDismiss(); dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Chat list sidebar
+
+struct ChatListSheet: View {
+    @ObservedObject var store: ConversationStore
+    @Binding var isPresented: Bool
+    @State private var renamingId: UUID?
+    @State private var renameText: String = ""
+
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(store.conversations) { c in
+                    Button {
+                        store.selectedId = c.id
+                        isPresented = false
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(c.title).foregroundColor(.primary).lineLimit(1)
+                                Text(c.updatedAt, style: .relative)
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            if c.id == store.selectedId {
+                                Image(systemName: "checkmark").foregroundColor(.accentColor)
+                            }
+                        }
+                    }
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) { store.delete(c.id) } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        Button {
+                            renamingId = c.id
+                            renameText = c.title
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }.tint(.blue)
+                    }
+                }
+            }
+            .navigationTitle("Chats")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        store.newConversation()
+                        isPresented = false
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") { isPresented = false }
+                }
+            }
+            .alert("Rename chat", isPresented: Binding(
+                get: { renamingId != nil },
+                set: { if !$0 { renamingId = nil } }
+            )) {
+                TextField("Title", text: $renameText)
+                Button("Cancel", role: .cancel) { renamingId = nil }
+                Button("Save") {
+                    if let id = renamingId { store.rename(id, to: renameText) }
+                    renamingId = nil
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsSheet: View {
+    @ObservedObject var settings: SettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    ForEach(ModelOption.all) { opt in
+                        Button {
+                            settings.selectedModel = opt.id
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(opt.displayName).foregroundColor(.primary)
+                                    Text(opt.subtitle).font(.caption).foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                if settings.selectedModel == opt.id {
+                                    Image(systemName: "checkmark").foregroundColor(.accentColor)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Model")
+                } footer: {
+                    Text("Model used for new messages. Existing chats continue with the model that generated them.")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
                 }
             }
         }

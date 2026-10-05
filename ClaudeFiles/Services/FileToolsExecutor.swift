@@ -22,16 +22,19 @@ final class FileToolsExecutor {
 
     private func readFile(path: String) -> String {
         guard !path.isEmpty else { return "Error: path required" }
-        if let text = try? String(contentsOfFile: path, encoding: .utf8) {
+        do {
+            let text = try String(contentsOfFile: path, encoding: .utf8)
             return text.count > 20_000
                 ? String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
                 : text
+        } catch {
+            // Try binary fallback
+            if let data = FileManager.default.contents(atPath: path) {
+                return "Binary (\(data.count) bytes). Hex: " +
+                    data.prefix(128).map { String(format: "%02x", $0) }.joined(separator: " ")
+            }
+            return "Error reading \(path): \(describe(error, at: path))"
         }
-        if let data = FileManager.default.contents(atPath: path) {
-            return "Binary (\(data.count) bytes). Hex: " +
-                data.prefix(128).map { String(format: "%02x", $0) }.joined(separator: " ")
-        }
-        return "Error: cannot read \(path)"
     }
 
     private func writeFile(path: String, content: String) -> String {
@@ -54,8 +57,11 @@ final class FileToolsExecutor {
     private func listDir(path: String) -> String {
         guard !path.isEmpty else { return "Error: path required" }
         let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(atPath: path) else {
-            return "Error: cannot list \(path)"
+        let items: [String]
+        do {
+            items = try fm.contentsOfDirectory(atPath: path)
+        } catch {
+            return "Error listing \(path): \(describe(error, at: path))"
         }
         return items.sorted().map { name -> String in
             var isDir: ObjCBool = false
@@ -81,14 +87,57 @@ final class FileToolsExecutor {
 
     private func fileInfo(path: String) -> String {
         guard !path.isEmpty else { return "Error: path required" }
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else {
-            return "Error: cannot get info for \(path)"
+        let fm = FileManager.default
+        let attrs: [FileAttributeKey: Any]
+        do {
+            attrs = try fm.attributesOfItem(atPath: path)
+        } catch {
+            return "Error getting info for \(path): \(describe(error, at: path))"
         }
         var lines: [String] = []
         if let size = attrs[.size]             as? Int  { lines.append("Size: \(size) bytes") }
         if let mod  = attrs[.modificationDate]          { lines.append("Modified: \(mod)") }
         if let perm = attrs[.posixPermissions] as? Int  { lines.append(String(format: "Permissions: %o", perm)) }
         if let owner = attrs[.ownerAccountName]         { lines.append("Owner: \(owner)") }
+        if let type = attrs[.type] as? FileAttributeType { lines.append("Type: \(type.rawValue)") }
         return lines.joined(separator: "\n")
+    }
+
+    /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.
+    private func describe(_ error: Error, at path: String) -> String {
+        let ns = error as NSError
+        let fm = FileManager.default
+        var reason = ns.localizedDescription
+
+        // Add specific codes
+        if ns.domain == NSCocoaErrorDomain {
+            switch ns.code {
+            case 260: reason = "file does not exist"
+            case 257: reason = "permission denied (sandbox or Data Protection)"
+            case 513: reason = "permission denied (sandbox)"
+            case 640: reason = "file is in a directory marked no-read"
+            default:  break
+            }
+        }
+
+        // Hint about symlink alternatives
+        var hint = ""
+        if path.hasPrefix("/var/") {
+            let alt = "/private" + path
+            if fm.fileExists(atPath: alt) { hint = ". Try \(alt) instead" }
+        } else if path.hasPrefix("/tmp/") {
+            let alt = "/private" + path
+            if fm.fileExists(atPath: alt) { hint = ". Try \(alt) instead" }
+        } else if path.hasPrefix("/etc/") {
+            let alt = "/private" + path
+            if fm.fileExists(atPath: alt) { hint = ". Try \(alt) instead" }
+        }
+
+        // Does the path even exist?
+        if !fm.fileExists(atPath: path) && hint.isEmpty {
+            hint = " (path does not exist in current sandbox)"
+        }
+
+        return reason + hint
     }
 }

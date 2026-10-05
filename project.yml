@@ -40,6 +40,22 @@ targets:
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/src"
           - "$(SRCROOT)/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/external/ChOma/include"
+        # Xcode 16.4: SwiftUICore.tbd is a private framework that the linker
+        # picks up implicitly via SwiftUI; weak-link it to stop the "not an
+        # allowed client" linker error.
+        OTHER_LDFLAGS:
+          - "-Wl,-weak_framework,SwiftUICore"
+        # Suppress C warnings in third-party FilzaJailedDS code
+        # (unused vars, 64→32 truncation, deprecated syscall, etc.)
+        OTHER_CFLAGS:
+          - "-Wno-unused-variable"
+          - "-Wno-shorten-64-to-32"
+          - "-Wno-deprecated-declarations"
+          - "-Wno-unused-function"
+          - "-Wno-format"
+          - "-Wno-comma"
+          - "-Wno-incompatible-pointer-types-discards-qualifiers"
+          - "-Wno-strict-prototypes"
         # App icon from asset catalog
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

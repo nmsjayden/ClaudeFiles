@@ -14,7 +14,7 @@ Build settings from command line:
     ONLY_ACTIVE_ARCH = NO
     SKIP_INSTALL = NO
 
-2026-10-05 23:30:33.962 xcodebuild[3490:12481] Writing error result bundle to /var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/ResultBundle_2026-05-10_23-30-0033.xcresult
+2026-10-05 23:32:12.989 xcodebuild[15185:42053] Writing error result bundle to /var/folders/s6/5hzmn6lx4dz5nxs7k_0slzph0000gn/T/ResultBundle_2026-05-10_23-32-0012.xcresult
 xcodebuild: error: Unable to read project 'ClaudeFiles.xcodeproj'.
 	Reason: The project ‘ClaudeFiles’ cannot be opened because it is in a future Xcode project file format (77). Adjust the project format using a compatible version of Xcode to allow it to be opened by this version of Xcode.
 

@@ -41,7 +41,6 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             ONLY_ACTIVE_ARCH=NO \
             SKIP_INSTALL=NO \
-            OTHER_LDFLAGS='$(inherited) -Wl,-weak_framework,SwiftUICore' \
             2>&1 | tee /tmp/build.log || {
               SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
                 "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \

@@ -33,17 +33,22 @@ private struct ChatViewContent: View {
         self._vm = StateObject(wrappedValue: ChatViewModel(store: store))
     }
 
+    @FocusState private var inputFocused: Bool
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
                 if vm.displayMessages.isEmpty && vm.streamingText.isEmpty {
                     emptyState
+                        .contentShape(Rectangle())
+                        .onTapGesture { inputFocused = false }
                 } else {
                     messageList
                 }
                 Divider()
                 inputBar
             }
+            .animation(.easeInOut(duration: 0.2), value: vm.isSending)
             .navigationTitle(store.selected?.title ?? "Chat")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -164,6 +169,8 @@ private struct ChatViewContent: View {
             .onChange(of: vm.isSending) { newValue in
                 if newValue { scrollToBottom(proxy) }
             }
+            .scrollDismissesKeyboard(.interactively)
+            .onTapGesture { inputFocused = false }
         }
     }
 
@@ -183,71 +190,65 @@ private struct ChatViewContent: View {
     // MARK: - Input bar
 
     private var inputBar: some View {
-        VStack(spacing: 0) {
-            if vm.isSending {
-                stopButton
-            }
-            HStack(alignment: .bottom, spacing: 8) {
-                ZStack(alignment: .leading) {
-                    if vm.inputText.isEmpty {
-                        Text("Message Claude…")
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                    }
-                    TextField("", text: $vm.inputText, axis: .vertical)
-                        .lineLimit(1...6)
+        HStack(alignment: .bottom, spacing: 8) {
+            ZStack(alignment: .leading) {
+                if vm.inputText.isEmpty {
+                    Text("Message Claude…")
+                        .foregroundColor(.secondary)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
+                        .allowsHitTesting(false)
                 }
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 22))
-
-                sendOrStopButton
+                TextField("", text: $vm.inputText, axis: .vertical)
+                    .lineLimit(1...6)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .focused($inputFocused)
+                    .submitLabel(.send)
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 8)
-            .padding(.bottom, 10)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 22))
+
+            sendOrStopButton
         }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
         .background(Color(.systemBackground))
     }
 
-    private var stopButton: some View {
-        HStack {
-            Spacer()
+    @ViewBuilder
+    private var sendOrStopButton: some View {
+        if vm.isSending {
             Button {
                 haptic(.medium)
                 vm.stopGenerating()
             } label: {
-                Label("Stop generating", systemImage: "stop.fill")
-                    .font(.caption.weight(.medium))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 14).padding(.vertical, 6)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(Capsule())
-                    .overlay(Capsule().stroke(Color(.separator), lineWidth: 0.5))
+                ZStack {
+                    Circle().fill(Color.primary).frame(width: 36, height: 36)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color(.systemBackground))
+                        .frame(width: 12, height: 12)
+                }
             }
-            Spacer()
-        }
-        .padding(.top, 6)
-    }
-
-    private var sendOrStopButton: some View {
-        Button {
-            haptic(.light)
-            vm.send()
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(vm.inputText.isEmpty ? Color(.systemGray4) : Color.accentColor)
-                    .frame(width: 36, height: 36)
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundColor(.white)
+            .transition(.scale.combined(with: .opacity))
+        } else {
+            Button {
+                haptic(.light)
+                vm.send()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(vm.inputText.isEmpty ? Color(.systemGray4) : Color.accentColor)
+                        .frame(width: 36, height: 36)
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+                }
             }
+            .disabled(vm.inputText.isEmpty)
+            .transition(.scale.combined(with: .opacity))
         }
-        .disabled(vm.inputText.isEmpty || vm.isSending)
-        .animation(.easeInOut(duration: 0.15), value: vm.inputText.isEmpty)
     }
 
     private func haptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {

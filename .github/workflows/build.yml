@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -23,8 +26,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
       - name: Build archive (unsigned)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -o pipefail
           xcodebuild archive \
             -scheme ClaudeFiles \
             -configuration Release \
@@ -32,16 +36,29 @@ jobs:
             -destination "generic/platform=iOS" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log || {
-              # Commit the last 300 lines of errors so Claude can read them
-              tail -300 /tmp/build.log > build-errors.txt
-              git config user.email "actions@github.com"
-              git config user.name "GitHub Actions"
-              git add build-errors.txt
-              git commit -m "ci: build error log"
-              git push
-              exit 1
-            }
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/build.log
+          
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            # Get current file SHA if it exists (needed for update)
+            SHA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
+              | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('sha',''))" 2>/dev/null || echo "")
+            
+            CONTENT=$(grep -E "error:|warning:|note:" /tmp/build.log | tail -150 | base64 | tr -d '\n')
+            
+            if [ -z "$SHA" ]; then
+              curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
+                -d "{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\"}"
+            else
+              curl -s -X PUT -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/build-errors.txt" \
+                -d "{\"message\":\"ci: build errors\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
+            fi
+            exit 1
+          fi
 
       - name: Package IPA
         run: |

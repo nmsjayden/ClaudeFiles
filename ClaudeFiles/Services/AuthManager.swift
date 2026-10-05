@@ -10,17 +10,18 @@ final class AuthManager: NSObject, ObservableObject {
     @Published var isAuthenticated = false
     @Published var isLoading       = false
     @Published var errorMessage:   String?
+    @Published var awaitingCode    = false   // show paste field after Safari closes
 
     private let clientId     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private let authorizeURL = "https://claude.ai/oauth/authorize"
     private let tokenURL     = "https://console.anthropic.com/v1/oauth/token"
     private let scopes       = "org:create_api_key user:profile user:inference"
-    private let redirectURI  = "claudefiles://oauth/callback"
+    // Claude Code's registered callback — the page displays the code for the user to paste.
+    private let redirectURI  = "https://console.anthropic.com/oauth/code/callback"
 
     private var pendingVerifier: String?
     private var pendingState:    String?
     private var authSession:     ASWebAuthenticationSession?
-    // Kept alive for the duration of the session (presentationContextProvider is weak)
     private var anchorProvider:  AnchorProvider?
 
     private override init() {
@@ -28,11 +29,12 @@ final class AuthManager: NSObject, ObservableObject {
         isAuthenticated = (keychainLoad("access_token") != nil)
     }
 
-    // MARK: - Login
+    // MARK: - Start login (opens Safari to Claude.ai → shows code on page)
 
     func startLogin(anchor: ASPresentationAnchor) {
         isLoading    = true
         errorMessage = nil
+        awaitingCode = false
 
         let verifier  = randomBase64(32)
         let challenge = pkceChallenge(verifier)
@@ -52,16 +54,18 @@ final class AuthManager: NSObject, ObservableObject {
         ]
         guard let url = c.url else { isLoading = false; return }
 
-        // Store provider as a property so it isn't deallocated while session runs
         let provider = AnchorProvider(anchor: anchor)
         anchorProvider = provider
 
+        // Using "https" callback scheme so we DON'T intercept — user copies the code from page.
+        // Session will stay open; the user closes it after copying the code.
         let session = ASWebAuthenticationSession(
             url: url,
-            callbackURLScheme: "claudefiles"
-        ) { [weak self] cb, err in
+            callbackURLScheme: nil
+        ) { [weak self] _, _ in
             Task { @MainActor [weak self] in
-                self?.handleCallback(url: cb, error: err)
+                self?.isLoading = false
+                self?.awaitingCode = true   // show paste UI
             }
         }
         session.presentationContextProvider = provider
@@ -70,25 +74,30 @@ final class AuthManager: NSObject, ObservableObject {
         authSession = session
     }
 
-    // MARK: - Callback
+    // MARK: - User pastes the code
 
-    func handleCallback(url: URL?, error: Error? = nil) {
-        anchorProvider = nil   // safe to release now
-        defer { isLoading = false }
+    func submitCode(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { errorMessage = "Code is empty"; return }
 
-        if let e = error as? ASWebAuthenticationSessionError, e.code == .canceledLogin { return }
-        if let e = error { errorMessage = e.localizedDescription; return }
+        // Claude Code's callback page shows the code as "<code>#<state>" sometimes
+        let parts = trimmed.split(separator: "#", maxSplits: 1).map(String.init)
+        let code  = parts[0]
 
-        guard
-            let url      = url,
-            let comps    = URLComponents(url: url, resolvingAgainstBaseURL: false),
-            let code     = comps.queryItems?.first(where: { $0.name == "code" })?.value,
-            let retState = comps.queryItems?.first(where: { $0.name == "state" })?.value,
-            retState     == pendingState,
-            let verifier = pendingVerifier
-        else { errorMessage = "OAuth callback invalid"; return }
+        guard let verifier = pendingVerifier else {
+            errorMessage = "No pending login. Try again."
+            return
+        }
 
+        isLoading    = true
+        awaitingCode = false
         Task { await exchange(code: code, verifier: verifier) }
+    }
+
+    func cancelCodeEntry() {
+        awaitingCode = false
+        pendingVerifier = nil
+        pendingState = nil
     }
 
     // MARK: - Token exchange
@@ -98,13 +107,24 @@ final class AuthManager: NSObject, ObservableObject {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONEncoder().encode([
-            "grant_type": "authorization_code", "client_id": clientId,
-            "code": code, "redirect_uri": redirectURI, "code_verifier": verifier,
+            "grant_type":    "authorization_code",
+            "client_id":     clientId,
+            "code":          code,
+            "redirect_uri":  redirectURI,
+            "code_verifier": verifier,
+            "state":         pendingState ?? "",
         ])
+
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                let msg = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+                errorMessage = "Token exchange failed: \(msg.prefix(200))"
+                isLoading = false
+                return
+            }
             let tok = try JSONDecoder().decode(TokenResponse.self, from: data)
-            keychainSave("access_token",  tok.accessToken)
+            keychainSave("access_token", tok.accessToken)
             if let r = tok.refreshToken { keychainSave("refresh_token", r) }
             isAuthenticated = true
         } catch {
@@ -113,13 +133,7 @@ final class AuthManager: NSObject, ObservableObject {
         isLoading = false
     }
 
-    // MARK: - Token access
-
-    func accessToken() async -> String? {
-        keychainLoad("access_token")
-    }
-
-    // MARK: - Logout
+    func accessToken() async -> String? { keychainLoad("access_token") }
 
     func logout() {
         for k in ["access_token", "refresh_token"] { keychainDelete(k) }
@@ -133,19 +147,17 @@ final class AuthManager: NSObject, ObservableObject {
                                 kSecAttrService: "ClaudeFiles",
                                 kSecAttrAccount: key] as CFDictionary
         SecItemDelete(q)
-        var add = [kSecClass: kSecClassGenericPassword,
-                   kSecAttrService: "ClaudeFiles",
-                   kSecAttrAccount: key,
-                   kSecValueData: Data(val.utf8)] as CFDictionary
-        SecItemAdd(add, nil)
+        SecItemAdd([kSecClass: kSecClassGenericPassword,
+                    kSecAttrService: "ClaudeFiles",
+                    kSecAttrAccount: key,
+                    kSecValueData: Data(val.utf8)] as CFDictionary, nil)
     }
     private func keychainLoad(_ key: String) -> String? {
-        let q: CFDictionary = [kSecClass: kSecClassGenericPassword,
-                                kSecAttrService: "ClaudeFiles",
-                                kSecAttrAccount: key,
-                                kSecReturnData: true] as CFDictionary
         var r: AnyObject?
-        SecItemCopyMatching(q, &r)
+        SecItemCopyMatching([kSecClass: kSecClassGenericPassword,
+                             kSecAttrService: "ClaudeFiles",
+                             kSecAttrAccount: key,
+                             kSecReturnData: true] as CFDictionary, &r)
         guard let d = r as? Data else { return nil }
         return String(data: d, encoding: .utf8)
     }
@@ -157,8 +169,8 @@ final class AuthManager: NSObject, ObservableObject {
 
     // MARK: - PKCE
 
-    private func pkceChallenge(_ verifier: String) -> String {
-        Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncoded()
+    private func pkceChallenge(_ v: String) -> String {
+        Data(SHA256.hash(data: Data(v.utf8))).base64URLEncoded()
     }
     private func randomBase64(_ n: Int) -> String {
         var b = [UInt8](repeating: 0, count: n)
@@ -167,21 +179,18 @@ final class AuthManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Anchor provider (stored as property to stay alive)
-
 private final class AnchorProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
     let anchor: ASPresentationAnchor
     init(anchor: ASPresentationAnchor) { self.anchor = anchor }
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor { anchor }
 }
 
-// MARK: - Helpers
-
 private struct TokenResponse: Decodable {
     let accessToken:  String
     let refreshToken: String?
     enum CodingKeys: String, CodingKey {
-        case accessToken = "access_token"; case refreshToken = "refresh_token"
+        case accessToken  = "access_token"
+        case refreshToken = "refresh_token"
     }
 }
 

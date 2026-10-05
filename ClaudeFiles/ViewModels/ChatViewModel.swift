@@ -145,8 +145,8 @@ final class ChatViewModel: ObservableObject {
 
                 // Build the assistant turn to persist and send back
                 var apiBlocks: [StoredBlock] = []
-                let maxIndex = max(textBlocks.keys.max() ?? -1, toolBlocks.keys.max() ?? -1)
-                for i in 0...max(0, maxIndex) {
+                let allIndices = Set(textBlocks.keys).union(toolBlocks.keys).sorted()
+                for i in allIndices {
                     if let text = textBlocks[i], !text.isEmpty {
                         apiBlocks.append(StoredBlock(type: "text", text: text, id: nil, name: nil, input: nil))
                     } else if let tool = toolBlocks[i] {
@@ -156,11 +156,20 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
+                // Combine all text blocks (preserving order)
+                let combinedText = allIndices.compactMap { textBlocks[$0] }.joined(separator: "\n")
+
+                // If we got absolutely nothing back, that's an error
+                if apiBlocks.isEmpty && combinedText.isEmpty {
+                    error = "Received empty response from server. Try again?"
+                    return
+                }
+
                 if var conv = store.selected {
                     conv.messages.append(StoredMessage(
                         role: "assistant",
-                        text: textBlocks.values.joined(separator: "\n"),
-                        apiBlocks: apiBlocks,
+                        text: combinedText,
+                        apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
                         toolUseId: nil, toolResult: nil
                     ))
                     store.update(conv)
@@ -168,8 +177,12 @@ final class ChatViewModel: ObservableObject {
 
                 streamingText = ""
 
-                // If no tools, we're done
-                if finalStopReason != "tool_use" { return }
+                // Only continue the loop if we actually got tool_use
+                // Any other stop reason (end_turn, max_tokens, nil) → we're done
+                let hasTools = !toolBlocks.isEmpty
+                if finalStopReason != "tool_use" && !hasTools { return }
+                if finalStopReason == "end_turn" || finalStopReason == "max_tokens" { return }
+                if !hasTools { return }
 
                 // Execute every tool call
                 for (_, tool) in toolBlocks.sorted(by: { $0.key < $1.key }) {

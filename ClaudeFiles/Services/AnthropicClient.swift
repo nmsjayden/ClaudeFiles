@@ -47,10 +47,15 @@ final class AnthropicClient {
         req.setValue(UUID().uuidString.lowercased(),      forHTTPHeaderField: "x-client-request-id")
         req.setValue(sessionId,                           forHTTPHeaderField: "x-claude-code-session-id")
 
-        // Prepend Claude Code's required system identifier
-        let claudeCodeSystem = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + system
+        // System prompt must be an array of blocks.
+        // The first block must be EXACTLY the Claude Code identifier so the server
+        // strips it as an attribution block. Our custom instructions go in a second block.
+        let systemBlocks: [SystemBlock] = [
+            SystemBlock(type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude."),
+            SystemBlock(type: "text", text: system),
+        ]
 
-        let body = RequestBody(model: model, maxTokens: 4096, system: claudeCodeSystem,
+        let body = RequestBody(model: model, maxTokens: 4096, system: systemBlocks,
                                messages: messages, tools: FileToolDefinitions.all)
         req.httpBody = try JSONEncoder().encode(body)
 
@@ -81,13 +86,18 @@ final class AnthropicClient {
 private struct RequestBody: Encodable {
     let model: String
     let maxTokens: Int
-    let system: String
+    let system: [SystemBlock]
     let messages: [ChatMessage]
     let tools: [ToolDef]
     enum CodingKeys: String, CodingKey {
         case model, system, messages, tools
         case maxTokens = "max_tokens"
     }
+}
+
+struct SystemBlock: Encodable {
+    let type: String
+    let text: String
 }
 
 // MARK: - Response

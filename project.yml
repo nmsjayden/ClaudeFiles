@@ -15,6 +15,8 @@ targets:
           - FilzaJailedDS-SSV-Bypass/Tweak.m
           # Uses #import <substrate.h> (Cydia Substrate), won't compile in a normal app
           - FilzaJailedDS-SSV-Bypass/FilzaPadlockBypass.m
+          # Backup/research file referencing missing ../research/sandbox_research.h
+          - FilzaJailedDS-SSV-Bypass/kexploit/sandbox_backup.m
     settings:
       base:
         SWIFT_VERSION: "5.9"

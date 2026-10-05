@@ -2,12 +2,14 @@ import SwiftUI
 
 @main
 struct ClaudeFilesApp: App {
-    @StateObject private var auth = AuthManager.shared
+    @StateObject private var auth  = AuthManager.shared
+    @StateObject private var store = ConversationStore()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(auth)
+                .environmentObject(store)
         }
     }
 }

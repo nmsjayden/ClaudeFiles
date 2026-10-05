@@ -1,4 +1,4 @@
 /Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/Services/AuthManager.swift:179:9: warning: result of call to 'SecRandomCopyBytes' is unused
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:134:36: error: cannot find type 'ToolUseBlock' in scope
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:69:42: error: value of type 'AnthropicClient' has no member 'send'
-/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/ViewModels/ChatViewModel.swift:100:42: error: value of type 'AnthropicClient' has no member 'send'
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/XPF/src/xpf.c:1:10: error: 'choma/Fat.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox_backup.m:16:9: error: '../research/sandbox_research.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')
+/Users/runner/work/ClaudeFiles/ClaudeFiles/ClaudeFiles/FilzaJailedDS-SSV-Bypass/kexploit/sandbox.m:19:9: error: '../research/sandbox_research.h' file not found (in target 'ClaudeFiles' from project 'ClaudeFiles')

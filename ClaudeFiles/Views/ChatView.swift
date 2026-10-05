@@ -230,55 +230,76 @@ struct ErrorSheet: View {
 struct ChatListSheet: View {
     @ObservedObject var store: ConversationStore
     @Binding var isPresented: Bool
-    @State private var renamingId: UUID?
-    @State private var renameText: String = ""
+    @State private var renamingId:   UUID?
+    @State private var renameText:   String = ""
+    @State private var deletingId:   UUID?
 
     var body: some View {
         NavigationView {
             List {
                 ForEach(store.conversations) { c in
-                    Button {
-                        store.selectedId = c.id
-                        isPresented = false
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(c.title).foregroundColor(.primary).lineLimit(1)
-                                Text(c.updatedAt, style: .relative)
-                                    .font(.caption).foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            if c.id == store.selectedId {
-                                Image(systemName: "checkmark").foregroundColor(.accentColor)
-                            }
-                        }
-                    }
-                    .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) { store.delete(c.id) } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
+                    HStack(spacing: 10) {
                         Button {
-                            renamingId = c.id
-                            renameText = c.title
+                            store.selectedId = c.id
+                            isPresented = false
                         } label: {
-                            Label("Rename", systemImage: "pencil")
-                        }.tint(.blue)
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(c.title)
+                                        .foregroundColor(.primary)
+                                        .lineLimit(1)
+                                    Text(c.updatedAt, style: .relative)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                if c.id == store.selectedId {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.accentColor)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        Menu {
+                            Button {
+                                renamingId = c.id
+                                renameText = c.title
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                            Button(role: .destructive) {
+                                deletingId = c.id
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.title3)
+                                .foregroundColor(.secondary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Rectangle())
+                        }
                     }
+                    .padding(.vertical, 4)
                 }
             }
+            .listStyle(.plain)
             .navigationTitle("Chats")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") { isPresented = false }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         store.newConversation()
                         isPresented = false
                     } label: {
-                        Image(systemName: "square.and.pencil")
+                        Label("New", systemImage: "square.and.pencil")
+                            .font(.body.weight(.medium))
                     }
-                }
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Done") { isPresented = false }
                 }
             }
             .alert("Rename chat", isPresented: Binding(
@@ -288,9 +309,23 @@ struct ChatListSheet: View {
                 TextField("Title", text: $renameText)
                 Button("Cancel", role: .cancel) { renamingId = nil }
                 Button("Save") {
-                    if let id = renamingId { store.rename(id, to: renameText) }
+                    if let id = renamingId {
+                        store.rename(id, to: renameText.isEmpty ? "Untitled" : renameText)
+                    }
                     renamingId = nil
                 }
+            }
+            .alert("Delete chat?", isPresented: Binding(
+                get: { deletingId != nil },
+                set: { if !$0 { deletingId = nil } }
+            )) {
+                Button("Cancel", role: .cancel) { deletingId = nil }
+                Button("Delete", role: .destructive) {
+                    if let id = deletingId { store.delete(id) }
+                    deletingId = nil
+                }
+            } message: {
+                Text("This cannot be undone.")
             }
         }
     }
@@ -305,27 +340,34 @@ struct SettingsSheet: View {
     var body: some View {
         NavigationView {
             Form {
-                Section {
-                    ForEach(ModelOption.all) { opt in
-                        Button {
-                            settings.selectedModel = opt.id
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(opt.displayName).foregroundColor(.primary)
-                                    Text(opt.subtitle).font(.caption).foregroundColor(.secondary)
+                ForEach(ModelOption.grouped(), id: \.0) { family, models in
+                    Section(family.rawValue) {
+                        ForEach(models) { opt in
+                            Button {
+                                settings.selectedModel = opt.id
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(opt.displayName).foregroundColor(.primary)
+                                        Text(opt.subtitle)
+                                            .font(.caption).foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if settings.selectedModel == opt.id {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                    }
                                 }
-                                Spacer()
-                                if settings.selectedModel == opt.id {
-                                    Image(systemName: "checkmark").foregroundColor(.accentColor)
-                                }
+                                .contentShape(Rectangle())
                             }
                         }
                     }
-                } header: {
-                    Text("Model")
+                }
+
+                Section {
+                    EmptyView()
                 } footer: {
-                    Text("Model used for new messages. Existing chats continue with the model that generated them.")
+                    Text("Model is used for new messages. Existing chats continue with the model that generated them.")
                 }
             }
             .navigationTitle("Settings")

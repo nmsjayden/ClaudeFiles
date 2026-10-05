@@ -67,5 +67,6 @@ struct DisplayMessage: Identifiable {
     let id       = UUID()
     let role     : ChatMessage.Role
     var text     : String
+    var toolCalls: [ToolCallInfo] = []
     var isLoading: Bool = false
 }

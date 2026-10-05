@@ -3,33 +3,29 @@ import SwiftUI
 
 @MainActor
 final class ChatViewModel: ObservableObject {
-    @Published var messages: [Message] = []
-    @Published var inputText: String = ""
-    @Published var isSending: Bool = false
-    @Published var error: String?
+    @Published var displayMessages: [DisplayMessage] = []
+    @Published var inputText:       String = ""
+    @Published var isSending:       Bool   = false
+    @Published var error:           String?
+    @Published var pendingWrite:    PendingWrite?
 
-    // Write-approval state
-    @Published var pendingWrite: PendingWrite?
-
+    private var history:   [ChatMessage]      = []
     private let api      = AnthropicClient()
     private let executor = FileToolsExecutor()
+    private let authMgr  = AuthManager.shared
 
-    private let systemPrompt = """
-    You are a helpful AI assistant with full read/write access to this iPhone's filesystem via DarkSword.
-    You can read and write any file the user asks about.
-    The user is currently debugging a camera issue — the back camera shows a black screen in the Camera \
-    app but works in other apps like Roblox.
-    Relevant paths to investigate:
-    - /var/mobile/Library/Preferences/com.apple.camera.plist
-    - /var/mobile/Library/Preferences/com.apple.avfoundation.plist
-    - /var/mobile/Library/Logs/CrashReporter/
-    - /var/mobile/Library/Caches/com.apple.camera/
-    - /tmp/ (FilzaJailedDS logs are here)
-    Always back up files before writing. Ask for confirmation before modifying anything.
-    For writes, the app will prompt the user for approval automatically — you do not need to ask again.
+    private let system = """
+    You are Claude, a helpful AI assistant running inside a custom iOS app with full filesystem \
+    read/write access via the DarkSword kernel exploit. You have five file tools: read_file, \
+    write_file, list_directory, search_files, get_file_info. Use them freely to help the user. \
+    The user is debugging a black screen on the back camera in the iOS Camera app (works in \
+    Roblox and other apps). Key paths: \
+    /var/mobile/Library/Preferences/com.apple.camera.plist, \
+    /var/mobile/Library/Logs/CrashReporter/, /tmp/. \
+    Always back up files before writing. Confirm before any write.
     """
 
-    // MARK: - Send message
+    // MARK: - Send
 
     func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -38,8 +34,8 @@ final class ChatViewModel: ObservableObject {
         isSending = true
         error = nil
 
-        let userMessage = Message(role: .user, content: .text(text))
-        messages.append(userMessage)
+        displayMessages.append(DisplayMessage(role: .user, text: text))
+        history.append(ChatMessage(role: .user, content: .text(text)))
 
         Task { await runTurn() }
     }
@@ -49,42 +45,48 @@ final class ChatViewModel: ObservableObject {
     private func runTurn() async {
         defer { isSending = false }
 
-        // Build conversation for API
-        var apiMessages = messages.filter { msg in
-            if case .assistantBlocks(let b) = msg.content { return !b.isEmpty }
-            return true
+        guard let token = await authMgr.accessToken() else {
+            error = "Not logged in"; return
         }
 
         do {
-            var response = try await api.send(messages: apiMessages, system: systemPrompt)
+            var response = try await api.send(messages: history, system: system, accessToken: token)
 
             while response.stopReason == "tool_use" {
-                // Add assistant turn with the tool-use blocks
-                let assistantMsg = Message(role: .assistant, content: .assistantBlocks(response.content))
-                messages.append(assistantMsg)
-                apiMessages.append(assistantMsg)
-
-                // Execute each tool call
-                var toolResults: [Message] = []
-                for tu in response.toolUses {
-                    let result = await executeToolCall(tu)
-                    let resultMsg = Message(
-                        role: .user,
-                        content: .toolResult(toolUseId: tu.id, result: result)
-                    )
-                    toolResults.append(resultMsg)
-                    apiMessages.append(resultMsg)
+                // Build assistant blocks for history
+                let blocks: [APIBlock] = response.content.map { block in
+                    switch block {
+                    case .text(let t):
+                        return APIBlock(type: "text", text: t, id: nil, name: nil, input: nil)
+                    case .toolUse(let tu):
+                        return APIBlock(type: "tool_use", text: nil, id: tu.id, name: tu.name, input: tu.input)
+                    case .unknown:
+                        return APIBlock(type: "text", text: "", id: nil, name: nil, input: nil)
+                    }
                 }
-                // We don't append the tool-result messages to the visible list —
-                // the next assistant text turn gives the user the summary.
+                history.append(ChatMessage(role: .assistant, content: .blocks(blocks)))
 
-                response = try await api.send(messages: apiMessages, system: systemPrompt)
+                // Show text portion if any
+                let txt = response.text
+                if !txt.isEmpty {
+                    displayMessages.append(DisplayMessage(role: .assistant, text: txt))
+                }
+
+                // Execute tools
+                for tu in response.toolUses {
+                    let result = await executeTool(tu)
+                    history.append(ChatMessage(role: .user,
+                                               content: .toolResult(toolUseId: tu.id, result: result)))
+                }
+
+                response = try await api.send(messages: history, system: system, accessToken: token)
             }
 
-            // Final text response
-            let finalText = response.textContent
+            // Final reply
+            let finalText = response.text
             if !finalText.isEmpty {
-                messages.append(Message(role: .assistant, content: .text(finalText)))
+                displayMessages.append(DisplayMessage(role: .assistant, text: finalText))
+                history.append(ChatMessage(role: .assistant, content: .text(finalText)))
             }
 
         } catch {
@@ -94,49 +96,49 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Tool execution
 
-    private func executeToolCall(_ tu: ToolUseBlock) async -> String {
-        // Writes need user approval
+    private func executeTool(_ tu: ToolUseBlock) async -> String {
         if tu.name == "write_file",
-           let path    = tu.input["path"]?.stringValue,
-           let content = tu.input["content"]?.stringValue {
-            return await requestWriteApproval(path: path, content: content, toolUseId: tu.id)
+           let path    = tu.input["path"]?.string,
+           let content = tu.input["content"]?.string {
+            return await requestWriteApproval(path: path, content: content)
         }
-        return await executor.execute(toolName: tu.name, input: tu.input)
+        return await executor.execute(name: tu.name, input: tu.input)
     }
 
-    // MARK: - Write approval
-
-    func requestWriteApproval(path: String, content: String, toolUseId: String) async -> String {
-        return await withCheckedContinuation { continuation in
+    private func requestWriteApproval(path: String, content: String) async -> String {
+        await withCheckedContinuation { cont in
             pendingWrite = PendingWrite(
-                path: path,
-                preview: String(content.prefix(500)),
-                onApprove: {
-                    Task {
-                        let result = await self.executor.execute(
-                            toolName: "write_file",
+                path:    path,
+                preview: String(content.prefix(600)),
+                onApprove: { [weak self] in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        let r = await self.executor.execute(
+                            name: "write_file",
                             input: ["path": .string(path), "content": .string(content)]
                         )
                         self.pendingWrite = nil
-                        continuation.resume(returning: result)
+                        cont.resume(returning: r)
                     }
                 },
-                onDeny: {
-                    self.pendingWrite = nil
-                    continuation.resume(returning: "User denied the write to \(path)")
+                onDeny: { [weak self] in
+                    self?.pendingWrite = nil
+                    cont.resume(returning: "User denied write to \(path)")
                 }
             )
         }
     }
 
     func clearHistory() {
-        messages = []
+        displayMessages = []
+        history = []
     }
 }
 
-// MARK: - Pending write model
+// MARK: - PendingWrite
 
-struct PendingWrite {
+struct PendingWrite: Identifiable {
+    let id       = UUID()
     let path:      String
     let preview:   String
     let onApprove: () -> Void

@@ -1,0 +1,42 @@
+name: ClaudeFiles
+options:
+  bundleIdPrefix: com.claudefiles
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15"
+
+targets:
+  ClaudeFiles:
+    type: application
+    platform: iOS
+    sources:
+      - path: ClaudeFiles
+        excludes:
+          - "**/*.md"
+    info:
+      path: ClaudeFiles/Info.plist
+      properties:
+        CFBundleDisplayName: "Claude Files"
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - claudefiles
+            CFBundleURLName: com.claudefiles.oauth
+        NSFaceIDUsageDescription: "Used for secure authentication"
+        UIUserInterfaceStyle: Automatic
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        ENABLE_BITCODE: "NO"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"

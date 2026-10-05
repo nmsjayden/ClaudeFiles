@@ -96,6 +96,25 @@ final class ConversationStore: ObservableObject {
         save()
     }
 
+    /// Mutate a specific conversation by id. Used during streaming so updates land
+    /// on the right conversation even if the user has switched to a different one.
+    @discardableResult
+    func mutateById(_ id: UUID, _ change: (inout Conversation) -> Void) -> Bool {
+        guard let i = conversations.firstIndex(where: { $0.id == id }) else { return false }
+        var c = conversations[i]
+        change(&c)
+        c.updatedAt = Date()
+        conversations[i] = c
+        conversations.sort { $0.updatedAt > $1.updatedAt }
+        save()
+        return true
+    }
+
+    /// Append a single message to a specific conversation.
+    func appendMessage(to id: UUID, _ message: StoredMessage) {
+        mutateById(id) { $0.messages.append(message) }
+    }
+
     // MARK: - Persistence
 
     private func load() {

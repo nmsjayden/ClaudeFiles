@@ -8,9 +8,10 @@ final class ChatViewModel: ObservableObject {
     @Published var error:        String?
     @Published var pendingWrite: PendingWrite?
 
-    // Live streaming state — keyed by block index so updates are applied in-place
-    @Published var streamingText:      String = ""
-    @Published var streamingToolCalls: [Int: ToolCallInfo] = [:]  // key = block index
+    // Live streaming state — keyed by block index so updates apply in-place
+    @Published var streamingText:         String = ""
+    @Published var streamingToolCalls:    [Int: ToolCallInfo] = [:]
+    @Published var activeStreamingConvId: UUID?  // which conv the stream belongs to
 
     private let api      = AnthropicClient()
     private let executor = FileToolsExecutor()
@@ -40,7 +41,7 @@ final class ChatViewModel: ObservableObject {
     code blocks with language tags, bold for emphasis. Confirm before writing files.
     """
 
-    // MARK: - Computed display messages
+    // MARK: - Display
 
     var displayMessages: [DisplayMessage] {
         guard let c = store.selected else { return [] }
@@ -69,6 +70,13 @@ final class ChatViewModel: ObservableObject {
         return out
     }
 
+    /// Only show the streaming bubble if the active stream belongs to the currently selected conv.
+    var streamingBelongsToCurrentChat: Bool {
+        guard let active = activeStreamingConvId, let selected = store.selectedId
+        else { return false }
+        return active == selected
+    }
+
     private func findResult(for toolUseId: String, in messages: [StoredMessage]) -> String? {
         messages.first(where: { $0.toolUseId == toolUseId })?.toolResult
     }
@@ -78,51 +86,60 @@ final class ChatViewModel: ObservableObject {
     func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending else { return }
-        guard var conv = store.selected else { return }
+        guard let convId = store.selectedId else { return }
+
         inputText = ""
         isSending = true
         error = nil
         streamingText = ""
         streamingToolCalls = [:]
+        activeStreamingConvId = convId
 
-        conv.messages.append(StoredMessage(role: "user", text: text,
-                                           apiBlocks: nil, toolUseId: nil, toolResult: nil))
-        if conv.title == "New chat" { conv.title = String(text.prefix(50)) }
-        store.update(conv)
+        // Append user message + maybe set title
+        store.mutateById(convId) { conv in
+            conv.messages.append(StoredMessage(role: "user", text: text,
+                                               apiBlocks: nil, toolUseId: nil, toolResult: nil))
+            if conv.title == "New chat" { conv.title = String(text.prefix(50)) }
+        }
 
-        currentTask = Task { await runTurn() }
+        currentTask = Task { await runTurn(convId: convId) }
     }
 
     func stopGenerating() {
         currentTask?.cancel()
         currentTask = nil
-        if !streamingText.isEmpty, var conv = store.selected {
-            conv.messages.append(StoredMessage(
+        if !streamingText.isEmpty, let convId = activeStreamingConvId {
+            store.appendMessage(to: convId, StoredMessage(
                 role: "assistant",
                 text: streamingText + "\n\n_[Stopped]_",
                 apiBlocks: nil, toolUseId: nil, toolResult: nil
             ))
-            store.update(conv)
         }
+        resetStreaming()
+    }
+
+    private func resetStreaming() {
         streamingText = ""
         streamingToolCalls = [:]
+        activeStreamingConvId = nil
         isSending = false
     }
 
-    // MARK: - Agentic streaming loop
+    // MARK: - Streaming loop
 
-    private func runTurn() async {
-        defer { isSending = false; streamingText = ""; streamingToolCalls = [:] }
+    private func runTurn(convId: UUID) async {
+        defer { resetStreaming() }
         guard let token = await authMgr.accessToken() else { error = "Not logged in"; return }
 
         do {
-            var history = buildAPIHistory()
+            var history = buildAPIHistory(convId: convId)
+
             while true {
                 if Task.isCancelled { return }
 
                 var currentText = ""
-                var toolBlocks: [Int: StreamingTool] = [:]
-                var textBlocks: [Int: String] = [:]
+                var toolBlocks:  [Int: StreamingTool] = [:]
+                var textBlocks:  [Int: String]        = [:]
                 var finalStopReason: String?
 
                 try await api.sendStreaming(messages: history, system: systemPrompt,
@@ -137,18 +154,15 @@ final class ChatViewModel: ObservableObject {
                         self.streamingText = currentText
                     case .toolUseStart(let idx, let id, let name):
                         toolBlocks[idx] = StreamingTool(id: id, name: name, partialJSON: "")
-                        // Keyed by block index so updates land on the same card
                         self.streamingToolCalls[idx] = ToolCallInfo(
                             id: id, name: name, input: [:], result: nil, isComplete: false)
                     case .toolInputDelta(let idx, let partial):
                         toolBlocks[idx]?.partialJSON += partial
-                        // Update the streaming card's input as JSON accumulates
                         if let raw = toolBlocks[idx]?.partialJSON,
                            let parsed = self.parseJSON(raw) {
                             self.streamingToolCalls[idx]?.input = parsed
                         }
                     case .blockStop(let idx):
-                        // Mark tool card complete so the spinner disappears
                         if toolBlocks[idx] != nil {
                             self.streamingToolCalls[idx]?.isComplete = true
                         }
@@ -162,7 +176,8 @@ final class ChatViewModel: ObservableObject {
                 let allIndices = Set(textBlocks.keys).union(toolBlocks.keys).sorted()
                 for i in allIndices {
                     if let text = textBlocks[i], !text.isEmpty {
-                        apiBlocks.append(StoredBlock(type: "text", text: text, id: nil, name: nil, input: nil))
+                        apiBlocks.append(StoredBlock(type: "text", text: text,
+                                                     id: nil, name: nil, input: nil))
                     } else if let tool = toolBlocks[i] {
                         let input = parseJSON(tool.partialJSON) ?? [:]
                         apiBlocks.append(StoredBlock(type: "tool_use", text: nil,
@@ -174,14 +189,11 @@ final class ChatViewModel: ObservableObject {
                 DebugLog.log("Turn: text=\(combinedText.count)c blocks=\(apiBlocks.count) stop=\(finalStopReason ?? "nil")")
 
                 if !apiBlocks.isEmpty || !combinedText.isEmpty {
-                    if var conv = store.selected {
-                        conv.messages.append(StoredMessage(
-                            role: "assistant", text: combinedText,
-                            apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
-                            toolUseId: nil, toolResult: nil
-                        ))
-                        store.update(conv)
-                    }
+                    store.appendMessage(to: convId, StoredMessage(
+                        role: "assistant", text: combinedText,
+                        apiBlocks: apiBlocks.isEmpty ? nil : apiBlocks,
+                        toolUseId: nil, toolResult: nil
+                    ))
                 }
                 streamingText = ""
 
@@ -192,19 +204,16 @@ final class ChatViewModel: ObservableObject {
                 // Execute tools sequentially
                 for (_, tool) in toolBlocks.sorted(by: { $0.key < $1.key }) {
                     if Task.isCancelled { return }
-                    let input = parseJSON(tool.partialJSON) ?? [:]
+                    let input  = parseJSON(tool.partialJSON) ?? [:]
                     let result = await executeTool(id: tool.id, name: tool.name, input: input)
-                    if var conv = store.selected {
-                        conv.messages.append(StoredMessage(
-                            role: "user", text: "",
-                            apiBlocks: nil, toolUseId: tool.id, toolResult: result
-                        ))
-                        store.update(conv)
-                    }
+                    store.appendMessage(to: convId, StoredMessage(
+                        role: "user", text: "",
+                        apiBlocks: nil, toolUseId: tool.id, toolResult: result
+                    ))
                 }
 
                 streamingToolCalls = [:]
-                history = buildAPIHistory()
+                history = buildAPIHistory(convId: convId)
             }
         } catch is CancellationError {
             // handled by stopGenerating
@@ -219,15 +228,19 @@ final class ChatViewModel: ObservableObject {
         return obj
     }
 
-    private func buildAPIHistory() -> [ChatMessage] {
-        guard let c = store.selected else { return [] }
+    private func buildAPIHistory(convId: UUID) -> [ChatMessage] {
+        guard let c = store.conversations.first(where: { $0.id == convId }) else { return [] }
         return c.messages.compactMap { m -> ChatMessage? in
             if let toolId = m.toolUseId, let result = m.toolResult {
                 return ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: result))
             }
-            if m.role == "user" { return ChatMessage(role: .user, content: .text(m.text)) }
+            if m.role == "user" {
+                return ChatMessage(role: .user, content: .text(m.text))
+            }
             if let blocks = m.apiBlocks, !blocks.isEmpty {
-                let apiBlocks = blocks.map { APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input) }
+                let apiBlocks = blocks.map {
+                    APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
+                }
                 return ChatMessage(role: .assistant, content: .blocks(apiBlocks))
             }
             return ChatMessage(role: .assistant, content: .text(m.text))
@@ -248,8 +261,7 @@ final class ChatViewModel: ObservableObject {
     private func requestWriteApproval(path: String, content: String) async -> String {
         await withCheckedContinuation { cont in
             pendingWrite = PendingWrite(
-                path:    path,
-                preview: String(content.prefix(1200)),
+                path: path, preview: String(content.prefix(1200)),
                 onApprove: { [weak self] in
                     guard let self else { return }
                     Task { @MainActor in
@@ -270,14 +282,16 @@ final class ChatViewModel: ObservableObject {
     }
 
     func regenerateLast() {
-        guard var conv = store.selected else { return }
-        while let last = conv.messages.last,
-              last.role == "assistant" || last.toolUseId != nil {
-            conv.messages.removeLast()
+        guard let convId = store.selectedId else { return }
+        store.mutateById(convId) { conv in
+            while let last = conv.messages.last,
+                  last.role == "assistant" || last.toolUseId != nil {
+                conv.messages.removeLast()
+            }
         }
-        store.update(conv)
         isSending = true
-        currentTask = Task { await runTurn() }
+        activeStreamingConvId = convId
+        currentTask = Task { await runTurn(convId: convId) }
     }
 }
 

@@ -1,6 +1,8 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Entry point
+
 struct ChatView: View {
     @EnvironmentObject var auth:    AuthManager
     @EnvironmentObject var store:   ConversationStore
@@ -8,16 +10,20 @@ struct ChatView: View {
     @StateObject private var settings = SettingsStore.shared
     @State private var showingSidebar  = false
     @State private var showingSettings = false
+    @State private var showingModels   = false
 
     var body: some View {
-        ChatContent(store: store, settings: settings, sandbox: sandbox,
-                    showingSidebar: $showingSidebar,
-                    showingSettings: $showingSettings)
-            .environmentObject(auth)
+        ChatContent(
+            store: store, settings: settings, sandbox: sandbox,
+            showingSidebar:  $showingSidebar,
+            showingSettings: $showingSettings,
+            showingModels:   $showingModels
+        )
+        .environmentObject(auth)
     }
 }
 
-// MARK: - Main chat screen
+// MARK: - Main screen
 
 private struct ChatContent: View {
     @ObservedObject var store:    ConversationStore
@@ -25,41 +31,57 @@ private struct ChatContent: View {
     @ObservedObject var sandbox:  SandboxManager
     @Binding var showingSidebar:  Bool
     @Binding var showingSettings: Bool
+    @Binding var showingModels:   Bool
     @EnvironmentObject var auth: AuthManager
     @StateObject private var vm: ChatViewModel
     @FocusState private var inputFocused: Bool
 
     init(store: ConversationStore, settings: SettingsStore, sandbox: SandboxManager,
-         showingSidebar: Binding<Bool>, showingSettings: Binding<Bool>) {
+         showingSidebar: Binding<Bool>, showingSettings: Binding<Bool>,
+         showingModels: Binding<Bool>) {
         self.store    = store
         self.settings = settings
         self.sandbox  = sandbox
         _showingSidebar  = showingSidebar
         _showingSettings = showingSettings
+        _showingModels   = showingModels
         _vm = StateObject(wrappedValue: ChatViewModel(store: store))
     }
 
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                if vm.displayMessages.isEmpty && vm.streamingText.isEmpty && !vm.isSending {
-                    emptyState
-                        .contentShape(Rectangle())
-                        .onTapGesture { inputFocused = false }
-                } else {
-                    messageList
-                }
+                mainBody
                 Divider().opacity(0.4)
-                inputBar
+                InputBar(vm: vm, inputFocused: _inputFocused)
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
         }
         .sheet(isPresented: $showingSidebar)  { ChatListSheet(store: store, isPresented: $showingSidebar) }
         .sheet(isPresented: $showingSettings) { SettingsSheet(settings: settings, sandbox: sandbox) }
+        .sheet(isPresented: $showingModels)   { ModelPickerSheet(settings: settings) }
         .sheet(item: $vm.pendingWrite)        { WriteApprovalSheet(write: $0) }
-        .sheet(isPresented: Binding(get: { vm.error != nil }, set: { if !$0 { vm.error = nil } })) {
+        .sheet(isPresented: errorBinding) {
             ErrorSheet(message: vm.error ?? "", onDismiss: { vm.error = nil })
+        }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { vm.error != nil }, set: { if !$0 { vm.error = nil } })
+    }
+
+    @ViewBuilder
+    private var mainBody: some View {
+        if vm.displayMessages.isEmpty && !vm.isSending {
+            EmptyStateView(sandbox: sandbox) { suggestion in
+                vm.inputText = suggestion
+                inputFocused = true
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { inputFocused = false }
+        } else {
+            MessageList(vm: vm, inputFocused: _inputFocused)
         }
     }
 
@@ -68,37 +90,36 @@ private struct ChatContent: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .navigationBarLeading) {
-            Button { haptic(.light); showingSidebar = true } label: {
+            Button {
+                haptic(.light); showingSidebar = true
+            } label: {
                 Image(systemName: "line.3.horizontal").font(.body.weight(.medium))
             }
         }
         ToolbarItem(placement: .principal) {
-            VStack(spacing: 2) {
-                Text(store.selected?.title ?? "Chat")
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                HStack(spacing: 4) {
-                    // Sandbox status dot
-                    Circle()
-                        .fill(sandboxDotColor)
-                        .frame(width: 5, height: 5)
-                    Text(modelShortName)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+            Button { haptic(.light); showingModels = true } label: {
+                TitleStack(
+                    title: store.selected?.title ?? "Chat",
+                    model: settings.current,
+                    sandboxColor: sandboxDotColor
+                )
             }
+            .buttonStyle(.plain)
         }
         ToolbarItem(placement: .navigationBarTrailing) {
             Menu {
                 Button { haptic(.light); store.newConversation() } label: {
                     Label("New chat", systemImage: "square.and.pencil")
                 }
-                if !vm.displayMessages.isEmpty {
+                if !vm.displayMessages.isEmpty && !vm.isSending {
                     Button { vm.regenerateLast() } label: {
                         Label("Regenerate", systemImage: "arrow.clockwise")
                     }
                 }
                 Divider()
+                Button { showingModels = true } label: {
+                    Label("Change model", systemImage: "cpu")
+                }
                 Button { showingSettings = true } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -121,234 +142,110 @@ private struct ChatContent: View {
         }
     }
 
-    private var modelShortName: String {
-        let full = ModelOption.all.first(where: { $0.id == settings.selectedModel })?.displayName
-                   ?? settings.selectedModel
-        // Trim "Claude " prefix for brevity
-        return full.replacingOccurrences(of: "Claude ", with: "")
-    }
-
-    // MARK: - Empty state
-
-    private var emptyState: some View {
-        ScrollView {
-            VStack(spacing: 0) {
-                Spacer().frame(height: 60)
-
-                // App icon silhouette
-                ZStack {
-                    Circle()
-                        .fill(LinearGradient(
-                            colors: [Color.accentColor.opacity(0.18), Color.purple.opacity(0.10)],
-                            startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 80, height: 80)
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 34, weight: .semibold))
-                        .foregroundStyle(
-                            LinearGradient(colors: [.accentColor, .purple],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing)
-                        )
-                }
-
-                Spacer().frame(height: 20)
-
-                Text("What can I help with?")
-                    .font(.title2.bold())
-
-                Text("Filesystem access is \(sandboxStatusLabel).")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 6)
-
-                Spacer().frame(height: 36)
-
-                // Suggestion chips
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                    ForEach(suggestions, id: \.0) { suggestion in
-                        SuggestionChip(icon: suggestion.0, text: suggestion.1) {
-                            vm.inputText = suggestion.2
-                            inputFocused = true
-                        }
-                    }
-                }
-                .padding(.horizontal, 20)
-
-                Spacer().frame(height: 40)
-            }
-        }
-    }
-
-    private var sandboxStatusLabel: String {
-        switch sandbox.status {
-        case .escaped:    return "active ✓"
-        case .exploiting: return "initialising…"
-        case .failed(let m): return "unavailable (\(m))"
-        case .idle:       return "pending"
-        }
-    }
-
-    private var suggestions: [(String, String, String)] {[
-        ("folder.badge.questionmark", "List /var/mobile",  "List the contents of /var/mobile"),
-        ("doc.text.magnifyingglass",  "Search for .plist", "Search /var/mobile for files matching .plist"),
-        ("info.circle",               "System info",       "List /System and tell me about key directories"),
-        ("apps.iphone",               "Installed apps",    "List apps installed at /var/containers/Bundle/Application"),
-    ]}
-
-    // MARK: - Message list
-
-    @State private var followBottom: Bool = true
-    @State private var showJumpButton: Bool = false
-
-    private var messageList: some View {
-        ScrollViewReader { proxy in
-            GeometryReader { outerGeo in
-                ZStack(alignment: .bottom) {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 18) {
-                            ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
-                                MessageBubble(message: msg).id(idx)
-                            }
-
-                            // Live streaming bubble
-                            if vm.isSending {
-                                let liveTools = vm.streamingToolCalls.sorted(by: { $0.key < $1.key })
-                                                   .map(\.value)
-                                if !vm.streamingText.isEmpty || !liveTools.isEmpty {
-                                    StreamingBubble(text: vm.streamingText, toolCalls: liveTools)
-                                        .id("streaming")
-                                } else {
-                                    TypingIndicator().id("typing")
-                                }
-                            }
-
-                            Color.clear.frame(height: 1).id("bottom")
-                                .background(GeometryReader { geo in
-                                    Color.clear.preference(
-                                        key: BottomDistKey.self,
-                                        value: geo.frame(in: .named("scroll")).minY - outerGeo.size.height
-                                    )
-                                })
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 18)
-                    }
-                    .coordinateSpace(name: "scroll")
-                    .onPreferenceChange(BottomDistKey.self) { dist in
-                        let near = dist < 80
-                        if followBottom != near { followBottom = near }
-                        let show = !near && vm.isSending
-                        if show != showJumpButton {
-                            withAnimation(.easeOut(duration: 0.2)) { showJumpButton = show }
-                        }
-                    }
-                    .onChange(of: vm.displayMessages.count)    { _ in scrollIfFollowing(proxy) }
-                    .onChange(of: vm.streamingText)            { _ in scrollIfFollowing(proxy) }
-                    .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfFollowing(proxy) }
-                    .onChange(of: vm.isSending) { sending in
-                        if sending { followBottom = true; showJumpButton = false; scrollToBottom(proxy) }
-                    }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onTapGesture { inputFocused = false }
-
-                    if showJumpButton {
-                        jumpButton(proxy)
-                            .padding(.bottom, 10)
-                            .transition(.scale.combined(with: .opacity))
-                    }
-                }
-            }
-        }
-    }
-
-    private func jumpButton(_ proxy: ScrollViewProxy) -> some View {
-        Button {
-            haptic(.light); followBottom = true; showJumpButton = false
-            withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
-        } label: {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(.primary)
-                .frame(width: 36, height: 36)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(Circle())
-                .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
-        }
-    }
-
-    private func scrollIfFollowing(_ proxy: ScrollViewProxy) {
-        guard followBottom else { return }
-        scrollToBottom(proxy)
-    }
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
-        }
-    }
-
-    // MARK: - Input bar
-
-    private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            ZStack(alignment: .leading) {
-                if vm.inputText.isEmpty {
-                    Text("Message Claude…")
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 11)
-                        .allowsHitTesting(false)
-                }
-                TextField("", text: $vm.inputText, axis: .vertical)
-                    .lineLimit(1...6)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 11)
-                    .focused($inputFocused)
-            }
-            .background(Color(.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 22))
-
-            sendOrStopButton
-        }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
-        .padding(.bottom, 12)
-        .background(Color(.systemBackground))
-    }
-
-    @ViewBuilder
-    private var sendOrStopButton: some View {
-        if vm.isSending {
-            Button { haptic(.medium); vm.stopGenerating() } label: {
-                ZStack {
-                    Circle().fill(Color.primary).frame(width: 36, height: 36)
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color(.systemBackground))
-                        .frame(width: 12, height: 12)
-                }
-            }
-            .transition(.scale.combined(with: .opacity))
-        } else {
-            Button { haptic(.light); vm.send() } label: {
-                ZStack {
-                    Circle()
-                        .fill(vm.inputText.isEmpty ? Color(.systemGray4) : Color.accentColor)
-                        .frame(width: 36, height: 36)
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-            }
-            .disabled(vm.inputText.isEmpty)
-            .transition(.scale.combined(with: .opacity))
-        }
-    }
-
     private func haptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
         UIImpactFeedbackGenerator(style: style).impactOccurred()
     }
 }
 
-// MARK: - Suggestion chip
+// MARK: - Toolbar title
+
+private struct TitleStack: View {
+    let title: String
+    let model: ModelOption
+    let sandboxColor: Color
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            HStack(spacing: 4) {
+                Circle().fill(sandboxColor).frame(width: 5, height: 5)
+                Text(model.shortName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: 220)
+    }
+}
+
+// MARK: - Empty state
+
+private struct EmptyStateView: View {
+    let sandbox: SandboxManager
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                Spacer().frame(height: 60)
+                heroIcon
+                Spacer().frame(height: 20)
+                Text("What can I help with?").font(.title2.bold())
+                sandboxLine.padding(.top, 6)
+                Spacer().frame(height: 36)
+                suggestionGrid
+                Spacer().frame(height: 40)
+            }
+        }
+    }
+
+    private var heroIcon: some View {
+        ZStack {
+            Circle()
+                .fill(LinearGradient(
+                    colors: [Color.accentColor.opacity(0.18), Color.purple.opacity(0.10)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing))
+                .frame(width: 80, height: 80)
+            Image(systemName: "sparkles")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(LinearGradient(
+                    colors: [Color.accentColor, Color.purple],
+                    startPoint: .topLeading, endPoint: .bottomTrailing))
+        }
+    }
+
+    private var sandboxLine: some View {
+        let (text, color): (String, Color) = {
+            switch sandbox.status {
+            case .escaped:       return ("Full filesystem access active", .green)
+            case .exploiting:    return ("Initialising filesystem access…", .orange)
+            case .failed(let m): return ("Sandbox escape failed · \(m)", .red)
+            case .idle:          return ("Filesystem access pending", .gray)
+            }
+        }()
+        return HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text).font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    private var suggestionGrid: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            ForEach(Self.suggestions, id: \.text) { s in
+                SuggestionChip(icon: s.icon, text: s.text) { onSelect(s.prompt) }
+            }
+        }
+        .padding(.horizontal, 20)
+    }
+
+    private struct Suggestion { let icon, text, prompt: String }
+    private static let suggestions: [Suggestion] = [
+        .init(icon: "folder.badge.questionmark", text: "Explore /var/mobile",
+              prompt: "List the contents of /var/mobile and tell me what's there"),
+        .init(icon: "doc.text.magnifyingglass",  text: "Search for .plist files",
+              prompt: "Search /var/mobile for .plist files, limit to the 20 most interesting"),
+        .init(icon: "apps.iphone",               text: "Installed apps",
+              prompt: "List everything in /var/containers/Bundle/Application and summarise what apps are installed"),
+        .init(icon: "info.circle",               text: "System overview",
+              prompt: "List /System and briefly describe what each top-level folder contains"),
+    ]
+}
 
 private struct SuggestionChip: View {
     let icon:   String
@@ -378,51 +275,240 @@ private struct SuggestionChip: View {
     }
 }
 
-// MARK: - Message bubble
+// MARK: - Message list
+
+private struct MessageList: View {
+    @ObservedObject var vm: ChatViewModel
+    @FocusState var inputFocused: Bool
+    @State private var followBottom: Bool = true
+    @State private var showJumpButton: Bool = false
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            GeometryReader { outerGeo in
+                ZStack(alignment: .bottom) {
+                    scroll(proxy: proxy, outerGeo: outerGeo)
+                    jumpButton(proxy)
+                        .padding(.bottom, 10)
+                        .opacity(showJumpButton ? 1 : 0)
+                        .animation(.easeOut(duration: 0.2), value: showJumpButton)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func scroll(proxy: ScrollViewProxy, outerGeo: GeometryProxy) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
+                    MessageBubble(message: msg).id(idx)
+                }
+
+                if vm.isSending && vm.streamingBelongsToCurrentChat {
+                    streamingContent
+                }
+
+                bottomAnchor(in: outerGeo)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 18)
+        }
+        .coordinateSpace(name: "scroll")
+        .onPreferenceChange(BottomDistKey.self) { dist in
+            let near = dist < 80
+            if followBottom != near { followBottom = near }
+            let show = !near && vm.isSending
+            if show != showJumpButton { showJumpButton = show }
+        }
+        .onChange(of: vm.displayMessages.count)    { _ in scrollIfFollowing(proxy) }
+        .onChange(of: vm.streamingText)            { _ in scrollIfFollowing(proxy) }
+        .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfFollowing(proxy) }
+        .onChange(of: vm.isSending) { sending in
+            if sending {
+                followBottom = true; showJumpButton = false
+                scrollToBottom(proxy)
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .onTapGesture { inputFocused = false }
+    }
+
+    @ViewBuilder
+    private var streamingContent: some View {
+        let liveTools = vm.streamingToolCalls.sorted(by: { $0.key < $1.key }).map(\.value)
+        if !vm.streamingText.isEmpty || !liveTools.isEmpty {
+            StreamingBubble(text: vm.streamingText, toolCalls: liveTools).id("streaming")
+        } else {
+            TypingBubble().id("typing")
+        }
+    }
+
+    private func bottomAnchor(in outerGeo: GeometryProxy) -> some View {
+        Color.clear
+            .frame(height: 1)
+            .id("bottom")
+            .background(GeometryReader { geo in
+                Color.clear.preference(
+                    key: BottomDistKey.self,
+                    value: geo.frame(in: .named("scroll")).minY - outerGeo.size.height)
+            })
+    }
+
+    private func jumpButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            followBottom = true
+            showJumpButton = false
+            withAnimation(.easeOut(duration: 0.25)) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        } label: {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(.primary)
+                .frame(width: 36, height: 36)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+        }
+    }
+
+    private func scrollIfFollowing(_ proxy: ScrollViewProxy) {
+        guard followBottom else { return }
+        scrollToBottom(proxy)
+    }
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            withAnimation(.easeOut(duration: 0.15)) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
+    }
+}
+
+// MARK: - Input bar
+
+private struct InputBar: View {
+    @ObservedObject var vm: ChatViewModel
+    @FocusState var inputFocused: Bool
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            textField
+            actionButton
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 12)
+        .background(Color(.systemBackground))
+    }
+
+    private var textField: some View {
+        ZStack(alignment: .leading) {
+            if vm.inputText.isEmpty {
+                Text("Message Claude…")
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .allowsHitTesting(false)
+            }
+            TextField("", text: $vm.inputText, axis: .vertical)
+                .lineLimit(1...6)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
+                .focused($inputFocused)
+        }
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 22))
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if vm.isSending {
+            Button {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                vm.stopGenerating()
+            } label: {
+                ZStack {
+                    Circle().fill(Color.primary).frame(width: 36, height: 36)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color(.systemBackground))
+                        .frame(width: 12, height: 12)
+                }
+            }
+        } else {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                vm.send()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(vm.inputText.isEmpty ? Color(.systemGray4) : Color.accentColor)
+                        .frame(width: 36, height: 36)
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .disabled(vm.inputText.isEmpty)
+        }
+    }
+}
+
+// MARK: - Bubbles
 
 struct MessageBubble: View {
     let message: DisplayMessage
 
     var body: some View {
         if message.role == .user {
-            HStack {
-                Spacer(minLength: 48)
-                Text(message.text)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-                    .background(Color.accentColor)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    .textSelection(.enabled)
-            }
+            userBubble
         } else {
-            HStack(alignment: .top, spacing: 10) {
-                assistantAvatar
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(message.toolCalls) { ToolCallCard(tool: $0) }
-                    if !message.text.isEmpty {
-                        MarkdownView(message.text)
-                            .textSelection(.enabled)
-                    }
-                }
-                Spacer(minLength: 0)
-            }
+            assistantBubble
         }
     }
 
-    private var assistantAvatar: some View {
+    private var userBubble: some View {
+        HStack {
+            Spacer(minLength: 48)
+            Text(message.text)
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(Color.accentColor)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .textSelection(.enabled)
+        }
+    }
+
+    private var assistantBubble: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AssistantAvatar()
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(message.toolCalls) { ToolCallCard(tool: $0) }
+                if !message.text.isEmpty {
+                    MarkdownView(message.text).textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct AssistantAvatar: View {
+    var body: some View {
         Circle()
-            .fill(LinearGradient(colors: [.accentColor, .purple],
-                                  startPoint: .topLeading, endPoint: .bottomTrailing))
+            .fill(LinearGradient(
+                colors: [Color.accentColor, Color.purple],
+                startPoint: .topLeading, endPoint: .bottomTrailing))
             .frame(width: 28, height: 28)
             .overlay(
                 Image(systemName: "sparkles")
                     .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.white)
-            )
+                    .foregroundStyle(.white))
     }
 }
-
-// MARK: - Streaming bubble
 
 struct StreamingBubble: View {
     let text:      String
@@ -430,18 +516,23 @@ struct StreamingBubble: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(LinearGradient(colors: [.accentColor, .purple],
-                                      startPoint: .topLeading, endPoint: .bottomTrailing))
-                .frame(width: 28, height: 28)
-                .overlay(Image(systemName: "sparkles").font(.system(size: 12, weight: .bold)).foregroundStyle(.white))
-
+            AssistantAvatar()
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(toolCalls) { ToolCallCard(tool: $0) }
                 if !text.isEmpty { MarkdownView(text) }
                 if text.isEmpty && toolCalls.isEmpty { TypingIndicator() }
             }
             Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct TypingBubble: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AssistantAvatar()
+            TypingIndicator()
+            Spacer()
         }
     }
 }
@@ -454,86 +545,97 @@ struct ToolCallCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header row
-            Button {
-                guard tool.isComplete else { return }
-                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: iconName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(tool.isComplete ? Color.accentColor : Color.orange)
-                        .frame(width: 16)
-
-                    Text(humanName)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-
-                    if let p = pathArg {
-                        Text(p)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Spacer(minLength: 0)
-
-                    if !tool.isComplete {
-                        ProgressView().controlSize(.mini).tint(.orange)
-                    } else {
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            // Expanded detail
+            headerButton
             if expanded, tool.isComplete {
                 Divider()
-                VStack(alignment: .leading, spacing: 10) {
-                    if !tool.input.isEmpty {
-                        ToolSection(title: "INPUT") {
-                            ForEach(tool.input.keys.sorted(), id: \.self) { key in
-                                HStack(alignment: .top, spacing: 4) {
-                                    Text("\(key):")
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                    Text(valueStr(tool.input[key]))
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(.primary)
-                                        .textSelection(.enabled)
-                                    Spacer(minLength: 0)
-                                }
-                            }
-                        }
-                    }
-                    ToolSection(title: "RESULT") {
-                        if let result = tool.result, !result.isEmpty {
-                            ScrollView {
-                                Text(result)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 260)
-                        } else {
-                            Text("(no output)")
-                                .font(.caption).foregroundStyle(.secondary).italic()
-                        }
-                    }
-                }
-                .padding(12)
-                .background(Color(.tertiarySystemBackground))
+                expandedDetail
             }
         }
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(.separator), lineWidth: 0.5))
+    }
+
+    private var headerButton: some View {
+        Button {
+            guard tool.isComplete else { return }
+            withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: iconName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tool.isComplete ? Color.accentColor : Color.orange)
+                    .frame(width: 16)
+                Text(humanName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                if let p = pathArg {
+                    Text(p)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 0)
+                if !tool.isComplete {
+                    ProgressView().controlSize(.mini).tint(.orange)
+                } else {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var expandedDetail: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !tool.input.isEmpty { inputSection }
+            resultSection
+        }
+        .padding(12)
+        .background(Color(.tertiarySystemBackground))
+    }
+
+    private var inputSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionLabel("INPUT")
+            ForEach(tool.input.keys.sorted(), id: \.self) { key in
+                HStack(alignment: .top, spacing: 4) {
+                    Text("\(key):")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(valueStr(tool.input[key]))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resultSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionLabel("RESULT")
+            if let r = tool.result, !r.isEmpty {
+                ScrollView {
+                    Text(r)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+            } else {
+                Text("(no output)")
+                    .font(.caption).foregroundStyle(.secondary).italic()
+            }
+        }
     }
 
     private var iconName: String {
@@ -573,18 +675,14 @@ struct ToolCallCard: View {
     }
 }
 
-private struct ToolSection<Content: View>: View {
-    let title:   String
-    @ViewBuilder let content: () -> Content
-
+private struct SectionLabel: View {
+    let text: String
+    init(_ t: String) { text = t }
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(.tertiary)
-                .tracking(1)
-            content()
-        }
+        Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.tertiary)
+            .tracking(1)
     }
 }
 
@@ -599,11 +697,149 @@ struct TypingIndicator: View {
                     .fill(Color.secondary.opacity(0.5))
                     .frame(width: 7, height: 7)
                     .scaleEffect(on ? 1 : 0.5)
-                    .animation(.easeInOut(duration: 0.55).repeatForever().delay(Double(i) * 0.15), value: on)
+                    .animation(
+                        .easeInOut(duration: 0.55).repeatForever().delay(Double(i) * 0.15),
+                        value: on)
             }
         }
         .padding(.vertical, 4)
         .onAppear { on = true }
+    }
+}
+
+// MARK: - Model picker sheet
+
+struct ModelPickerSheet: View {
+    @ObservedObject var settings: SettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 20) {
+                    ForEach(ModelOption.grouped(), id: \.0) { family, models in
+                        ModelFamilySection(
+                            family: family,
+                            models: models,
+                            selectedId: settings.selectedModel,
+                            onSelect: { opt in
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                settings.select(opt)
+                                dismiss()
+                            })
+                    }
+                }
+                .padding(16)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Choose model")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ModelFamilySection: View {
+    let family:     ModelOption.Family
+    let models:     [ModelOption]
+    let selectedId: String
+    let onSelect:   (ModelOption) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            header
+            VStack(spacing: 8) {
+                ForEach(models) { m in
+                    ModelCard(model: m, isSelected: m.id == selectedId) { onSelect(m) }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: family.systemImage)
+                .foregroundStyle(family.tint)
+            Text(family.rawValue)
+                .font(.headline)
+            Spacer()
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+private struct ModelCard: View {
+    let model:      ModelOption
+    let isSelected: Bool
+    let action:     () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 12) {
+                leading
+                VStack(alignment: .leading, spacing: 3) {
+                    nameRow
+                    Text(model.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: 0)
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                        .font(.title3)
+                }
+            }
+            .padding(14)
+            .background(cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(borderColor, lineWidth: isSelected ? 1.5 : 0.5))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var leading: some View {
+        ZStack {
+            Circle()
+                .fill(model.family.tint.opacity(0.15))
+                .frame(width: 32, height: 32)
+            Image(systemName: model.family.systemImage)
+                .foregroundStyle(model.family.tint)
+                .font(.system(size: 14, weight: .semibold))
+        }
+    }
+
+    private var nameRow: some View {
+        HStack(spacing: 6) {
+            Text(model.displayName).font(.body.weight(.semibold)).foregroundStyle(.primary)
+            if model.isRecommended {
+                badge("DEFAULT", color: Color.accentColor)
+            } else if model.isNewest {
+                badge("NEW", color: .green)
+            }
+        }
+    }
+
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 8, weight: .heavy))
+            .tracking(0.5)
+            .foregroundStyle(color)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(color.opacity(0.15))
+            .clipShape(Capsule())
+    }
+
+    private var cardBackground: Color {
+        isSelected ? Color.accentColor.opacity(0.08) : Color(.secondarySystemBackground)
+    }
+    private var borderColor: Color {
+        isSelected ? Color.accentColor : Color(.separator)
     }
 }
 
@@ -617,47 +853,52 @@ struct ErrorSheet: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                        Text("Something went wrong").font(.headline)
-                        Spacer()
-                    }
-                    Text(message)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background(Color(.secondarySystemBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                    Button {
-                        UIPasteboard.general.string = message
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                    } label: {
-                        Label(copied ? "Copied!" : "Copy error",
-                              systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .frame(maxWidth: .infinity).padding()
-                            .background(Color.accentColor)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+            ScrollView { content.padding() }
+                .navigationTitle("Error")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { onDismiss(); dismiss() }
                     }
                 }
-                .padding()
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                Text("Something went wrong").font(.headline)
+                Spacer()
             }
-            .navigationTitle("Error")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { onDismiss(); dismiss() }
-                }
-            }
+            Text(message)
+                .font(.system(.footnote, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            copyButton
+        }
+    }
+
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+        } label: {
+            Label(copied ? "Copied!" : "Copy error",
+                  systemImage: copied ? "checkmark" : "doc.on.doc")
+                .frame(maxWidth: .infinity).padding()
+                .background(Color.accentColor)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
         }
     }
 }
 
-// MARK: - Chat list sidebar
+// MARK: - Chat list sheet
 
 struct ChatListSheet: View {
     @ObservedObject var store: ConversationStore
@@ -685,11 +926,10 @@ struct ChatListSheet: View {
             ForEach(store.conversations) { c in
                 ChatListRow(
                     conversation: c,
-                    isSelected: c.id == store.selectedId,
-                    onSelect: { store.selectedId = c.id; isPresented = false },
-                    onRename: { renamingId = c.id; renameText = c.title },
-                    onDelete: { deletingId = c.id }
-                )
+                    isSelected:   c.id == store.selectedId,
+                    onSelect:     { store.selectedId = c.id; isPresented = false },
+                    onRename:     { renamingId = c.id; renameText = c.title },
+                    onDelete:     { deletingId = c.id })
             }
         }
     }
@@ -742,33 +982,36 @@ private struct ChatListRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Button(action: onSelect) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(conversation.title).foregroundStyle(.primary).lineLimit(1)
-                        Text(conversation.updatedAt, style: .relative)
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Color.accentColor)
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            Menu {
-                Button(action: onRename) { Label("Rename", systemImage: "pencil") }
-                Button(role: .destructive, action: onDelete) { Label("Delete", systemImage: "trash") }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.title3).foregroundStyle(.secondary)
-                    .frame(width: 32, height: 32).contentShape(Rectangle())
-            }
+            Button(action: onSelect) { rowContent }.buttonStyle(.plain)
+            menu
         }
         .padding(.vertical, 4)
+    }
+
+    private var rowContent: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(conversation.title).foregroundStyle(.primary).lineLimit(1)
+                Text(conversation.updatedAt, style: .relative)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var menu: some View {
+        Menu {
+            Button(action: onRename) { Label("Rename", systemImage: "pencil") }
+            Button(role: .destructive, action: onDelete) { Label("Delete", systemImage: "trash") }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3).foregroundStyle(.secondary)
+                .frame(width: 32, height: 32).contentShape(Rectangle())
+        }
     }
 }
 
@@ -778,21 +1021,46 @@ struct SettingsSheet: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var sandbox:  SandboxManager
     @Environment(\.dismiss) private var dismiss
-    @State private var showDebugLog = false
+    @State private var showDebugLog   = false
+    @State private var showModelPicker = false
 
     var body: some View {
         NavigationView {
             Form {
+                modelSection
                 sandboxSection
+                aboutSection
                 debugSection
-                modelSections
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
-            .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
+            .sheet(isPresented: $showDebugLog)    { DebugLogSheet() }
+            .sheet(isPresented: $showModelPicker) { ModelPickerSheet(settings: settings) }
+        }
+    }
+
+    private var modelSection: some View {
+        Section("Model") {
+            Button { showModelPicker = true } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle().fill(settings.current.family.tint.opacity(0.15))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: settings.current.family.systemImage)
+                            .foregroundStyle(settings.current.family.tint)
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(settings.current.displayName).foregroundStyle(.primary)
+                        Text(settings.current.subtitle).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                }
+            }
         }
     }
 
@@ -809,6 +1077,24 @@ struct SettingsSheet: View {
         }
     }
 
+    private var aboutSection: some View {
+        Section("About") {
+            HStack {
+                Text("Version")
+                Spacer()
+                Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
+                    .foregroundStyle(.secondary)
+            }
+            Link(destination: URL(string: "https://github.com/nmsjayden/ClaudeFiles")!) {
+                HStack {
+                    Label("Source on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square").foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
     private var debugSection: some View {
         Section("Debug") {
             Button { showDebugLog = true } label: {
@@ -816,19 +1102,6 @@ struct SettingsSheet: View {
             }
             Button(role: .destructive) { DebugLog.clear() } label: {
                 Label("Clear debug log", systemImage: "trash")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var modelSections: some View {
-        ForEach(ModelOption.grouped(), id: \.0) { family, models in
-            Section(family.rawValue) {
-                ForEach(models) { opt in
-                    ModelRow(opt: opt, isSelected: settings.selectedModel == opt.id) {
-                        settings.selectedModel = opt.id
-                    }
-                }
             }
         }
     }
@@ -847,30 +1120,6 @@ struct SettingsSheet: View {
         case .exploiting: return .orange
         case .failed:     return .red
         case .idle:       return .gray
-        }
-    }
-}
-
-// MARK: - Model picker row (extracted to help type-checker)
-
-private struct ModelRow: View {
-    let opt:        ModelOption
-    let isSelected: Bool
-    let onSelect:   () -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(opt.displayName).foregroundStyle(.primary)
-                    Text(opt.subtitle).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if isSelected {
-                    Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
-                }
-            }
-            .contentShape(Rectangle())
         }
     }
 }
@@ -918,45 +1167,58 @@ struct WriteApprovalSheet: View {
 
     var body: some View {
         NavigationView {
+            ScrollView { content.padding() }
+                .navigationTitle("Write file")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { approvalToolbar }
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            InfoBlock(label: "PATH", value: write.path, mono: true)
+            previewBlock
+            Label("A `.claudebackup` copy is saved before writing.",
+                  systemImage: "checkmark.shield.fill")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "pencil.circle.fill")
+                .font(.title3).foregroundStyle(Color.accentColor)
+            Text("Approve file write?").font(.headline)
+            Spacer()
+        }
+    }
+
+    private var previewBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionLabel("CONTENT PREVIEW")
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "pencil.circle.fill")
-                            .font(.title3).foregroundStyle(Color.accentColor)
-                        Text("Approve file write?").font(.headline)
-                        Spacer()
-                    }
-                    InfoBlock(label: "PATH", value: write.path, mono: true)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("CONTENT PREVIEW")
-                            .font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
-                        ScrollView {
-                            Text(write.preview)
-                                .font(.system(.footnote, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                        }
-                        .frame(maxHeight: 300)
-                        .background(Color(.secondarySystemBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    Label("A `.claudebackup` copy is saved before writing.", systemImage: "checkmark.shield.fill")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                .padding()
+                Text(write.preview)
+                    .font(.system(.footnote, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
             }
-            .navigationTitle("Write file")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Deny", role: .destructive) { write.onDeny(); dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Approve") {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        write.onApprove(); dismiss()
-                    }.bold()
-                }
-            }
+            .frame(maxHeight: 300)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var approvalToolbar: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("Deny", role: .destructive) { write.onDeny(); dismiss() }
+        }
+        ToolbarItem(placement: .confirmationAction) {
+            Button("Approve") {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                write.onApprove(); dismiss()
+            }.bold()
         }
     }
 }
@@ -967,7 +1229,7 @@ private struct InfoBlock: View {
     var mono  = false
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label).font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+            SectionLabel(label)
             Text(value)
                 .font(mono ? .system(.footnote, design: .monospaced) : .footnote)
                 .padding(10)

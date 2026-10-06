@@ -175,12 +175,16 @@ struct MarkdownView: View {
 
         case .quote(let s):
             HStack(alignment: .top, spacing: 0) {
-                Rectangle().fill(Color.accentColor.opacity(0.5)).frame(width: 3)
+                // Use a capsule that sizes to the text, not a Rectangle that fills the parent
+                Color.accentColor.opacity(0.5)
+                    .frame(width: 3)
+                    .clipShape(Capsule())
                 Text(inline(s))
                     .foregroundStyle(.secondary)
                     .padding(.leading, 10)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            .fixedSize(horizontal: false, vertical: true)
 
         case .rule:
             Divider().padding(.vertical, 4)
@@ -228,7 +232,6 @@ private struct TableBlockView: View {
                     ForEach(0..<columnCount, id: \.self) { col in
                         Text(col < headers.count ? headers[col] : "")
                             .font(.footnote.bold())
-                            .lineLimit(2)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .frame(width: colWidths[col], alignment: .leading)
@@ -244,7 +247,6 @@ private struct TableBlockView: View {
                         ForEach(0..<columnCount, id: \.self) { col in
                             Text(col < row.count ? row[col] : "")
                                 .font(.footnote)
-                                .lineLimit(3)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .frame(width: colWidths[col], alignment: .leading)
@@ -262,7 +264,7 @@ private struct TableBlockView: View {
     /// so columns align perfectly across all rows.
     private func computeColumnWidths() -> [CGFloat] {
         let minWidth: CGFloat = 60
-        let maxWidth: CGFloat = 220
+        let maxWidth: CGFloat = 300
         let hPad: CGFloat = 20  // 10 on each side
         let charWidth: CGFloat = 7.5  // approximate for .footnote monospaced
 

@@ -28,14 +28,18 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 5 tools: read_file, write_file, \
-    list_directory, search_files, get_file_info.
+    the FilzaJailedDS kernel exploit (opa334). You have 9 tools:
+    - read_file, write_file, list_directory, search_files, get_file_info
+    - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
+    - grep_search: search file contents for a pattern
+    - head_file, tail_file: read first/last N lines of a file
 
     FILESYSTEM NOTES:
     - /var is a symlink to /private/var, /tmp → /private/tmp, /etc → /private/etc
     - If a /var path fails, ALWAYS try the /private/var equivalent
     - User-data paths like /var/mobile/* may need /private/var/mobile/*
     - When a tool errors, use the exact error message to decide your next move
+    - Use bash_exec for complex operations like piped commands, process listing, etc.
 
     Always try paths before concluding you lack access. Use markdown in responses: \
     code blocks with language tags, bold for emphasis. Confirm before writing files.
@@ -170,6 +174,8 @@ final class ChatViewModel: ObservableObject {
                         }
                     case .messageStop(let reason):
                         finalStopReason = reason
+                    case .statusMessage(let msg):
+                        self.streamingText = "⏳ \(msg)"
                     }
                 }
 
@@ -198,6 +204,18 @@ final class ChatViewModel: ObservableObject {
                     ))
                 }
                 streamingText = ""
+
+                // Handle refusal
+                if finalStopReason == "refusal" {
+                    if combinedText.isEmpty {
+                        store.appendMessage(to: convId, StoredMessage(
+                            role: "assistant",
+                            text: "_Claude declined this request._",
+                            apiBlocks: nil, toolUseId: nil, toolResult: nil
+                        ))
+                    }
+                    return
+                }
 
                 let hasTools = !toolBlocks.isEmpty
                 if !hasTools { return }
@@ -232,7 +250,79 @@ final class ChatViewModel: ObservableObject {
 
     private func buildAPIHistory(convId: UUID) -> [ChatMessage] {
         guard let c = store.conversations.first(where: { $0.id == convId }) else { return [] }
-        return c.messages.compactMap { m -> ChatMessage? in
+        let all = c.messages
+
+        // Estimate tokens (~4 chars/token). If over threshold, compact older messages.
+        let maxEstimatedTokens = 24_000   // keep ~24k tokens, leaves room for response
+        let keepRecentTurns    = 6        // always keep last N messages verbatim
+
+        let totalChars = all.reduce(0) { $0 + estimateChars($1) }
+        let estimatedTokens = totalChars / 4
+
+        if estimatedTokens > maxEstimatedTokens && all.count > keepRecentTurns + 2 {
+            return compactedHistory(messages: all, keepRecent: keepRecentTurns)
+        }
+
+        return messagesToAPI(all)
+    }
+
+    /// Rough character count for a stored message
+    private func estimateChars(_ m: StoredMessage) -> Int {
+        var count = m.text.count
+        if let blocks = m.apiBlocks {
+            for b in blocks {
+                count += (b.text?.count ?? 0) + 80 // tool calls add overhead
+                if let input = b.input {
+                    for (_, v) in input {
+                        if case .string(let s) = v { count += s.count }
+                    }
+                }
+            }
+        }
+        count += m.toolResult?.count ?? 0
+        return count
+    }
+
+    /// Build compacted history: summarize older turns, keep recent ones verbatim
+    private func compactedHistory(messages: [StoredMessage], keepRecent: Int) -> [ChatMessage] {
+        let splitAt = max(0, messages.count - keepRecent)
+        let older  = Array(messages[..<splitAt])
+        let recent = Array(messages[splitAt...])
+
+        // Build a text summary of older messages
+        var summaryParts: [String] = []
+        for m in older {
+            if m.toolUseId != nil { continue } // skip raw tool results
+            let role = m.role == "user" ? "User" : "Assistant"
+            if !m.text.isEmpty {
+                let truncated = m.text.count > 200 ? String(m.text.prefix(200)) + "…" : m.text
+                summaryParts.append("\(role): \(truncated)")
+            }
+            if let blocks = m.apiBlocks {
+                for b in blocks where b.type == "tool_use" {
+                    if let name = b.name, let path = b.input?["path"]?.string {
+                        summaryParts.append("  [Tool: \(name) → \(path)]")
+                    } else if let name = b.name {
+                        summaryParts.append("  [Tool: \(name)]")
+                    }
+                }
+            }
+        }
+
+        let summary = "[Context compacted — earlier conversation summary]\n" +
+            summaryParts.joined(separator: "\n")
+
+        DebugLog.log("Compacted: \(older.count) older messages → summary (\(summary.count)c), keeping \(recent.count) recent")
+
+        var result: [ChatMessage] = []
+        result.append(ChatMessage(role: .user, content: .text(summary)))
+        result.append(ChatMessage(role: .assistant, content: .text("Understood, I have the context from our earlier conversation.")))
+        result += messagesToAPI(Array(recent))
+        return result
+    }
+
+    private func messagesToAPI(_ msgs: [StoredMessage]) -> [ChatMessage] {
+        msgs.compactMap { m -> ChatMessage? in
             if let toolId = m.toolUseId, let result = m.toolResult {
                 return ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: result))
             }
@@ -255,6 +345,9 @@ final class ChatViewModel: ObservableObject {
         if name == "write_file",
            let path    = input["path"]?.string,
            let content = input["content"]?.string {
+            if SettingsStore.shared.autoApproveWrites {
+                return await executor.execute(name: name, input: input)
+            }
             return await requestWriteApproval(path: path, content: content)
         }
         return await executor.execute(name: name, input: input)

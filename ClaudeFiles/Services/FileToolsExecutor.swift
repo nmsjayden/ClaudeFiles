@@ -10,12 +10,19 @@ final class FileToolsExecutor {
         let directory = input["directory"]?.string ?? ""
         let pattern   = input["pattern"]?.string   ?? ""
 
+        let command   = input["command"]?.string   ?? ""
+        let text      = input["text"]?.string     ?? ""
+
         switch name {
         case "read_file":      return readFile(path: path)
         case "write_file":     return writeFile(path: path, content: content)
         case "list_directory": return listDir(path: path)
         case "search_files":   return search(dir: directory, pattern: pattern)
         case "get_file_info":  return fileInfo(path: path)
+        case "bash_exec":      return await bashExec(command: command)
+        case "grep_search":    return grepSearch(pattern: pattern, directory: directory.isEmpty ? "/" : directory)
+        case "head_file":      return headFile(path: path, lines: input["lines"]?.intValue ?? 50)
+        case "tail_file":      return tailFile(path: path, lines: input["lines"]?.intValue ?? 50)
         default:               return "Unknown tool: \(name)"
         }
     }
@@ -182,6 +189,129 @@ final class FileToolsExecutor {
         if let owner = attrs[.ownerAccountName]         { lines.append("Owner: \(owner)") }
         if let type = attrs[.type] as? FileAttributeType { lines.append("Type: \(type.rawValue)") }
         return lines.joined(separator: "\n")
+    }
+
+    // MARK: - bash_exec
+
+    private func bashExec(command: String) async -> String {
+        guard !command.isEmpty else { return "Error: command required" }
+
+        // Block dangerous commands
+        let blocked = ["rm -rf /", "mkfs", "dd if=", ":(){ :", "fork bomb"]
+        for b in blocked where command.contains(b) {
+            return "Error: blocked dangerous command"
+        }
+
+        DebugLog.log("bashExec: \(command.prefix(100))")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError  = stderr
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let outStr  = String(data: outData, encoding: .utf8) ?? ""
+            let errStr  = String(data: errData, encoding: .utf8) ?? ""
+
+            let status = process.terminationStatus
+            var result = ""
+            if !outStr.isEmpty { result += outStr }
+            if !errStr.isEmpty { result += (result.isEmpty ? "" : "\n") + "stderr: \(errStr)" }
+            if status != 0 { result += "\n[exit code: \(status)]" }
+            if result.isEmpty { result = "(no output, exit code \(status))" }
+
+            // Truncate
+            if result.count > 20_000 {
+                result = String(result.prefix(20_000)) + "\n[truncated — \(result.count) total chars]"
+            }
+            DebugLog.log("  → bash exit=\(status), output=\(result.count)c")
+            return result
+        } catch {
+            DebugLog.log("  → bash failed: \(error.localizedDescription)")
+            return "Error running command: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - grep
+
+    private func grepSearch(pattern: String, directory: String) -> String {
+        guard !pattern.isEmpty else { return "Error: pattern required" }
+        DebugLog.log("grepSearch: pattern=\(pattern) dir=\(directory)")
+
+        guard let enumerator = FileManager.default.enumerator(atPath: directory) else {
+            return "Cannot enumerate \(directory)"
+        }
+
+        var results: [String] = []
+        let maxResults = 100
+        let maxFileSize = 500_000 // skip large files
+
+        for case let name as String in enumerator {
+            if results.count >= maxResults { break }
+
+            let fullPath = (directory as NSString).appendingPathComponent(name)
+            // Skip directories and large/binary files
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDir)
+            if isDir.boolValue { continue }
+
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: fullPath),
+                  let size = attrs[.size] as? Int,
+                  size < maxFileSize else { continue }
+
+            guard let data = FileManager.default.contents(atPath: fullPath),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+
+            let lines = text.components(separatedBy: "\n")
+            for (lineNum, line) in lines.enumerated() {
+                if line.localizedCaseInsensitiveContains(pattern) {
+                    results.append("\(fullPath):\(lineNum + 1): \(String(line.prefix(200)))")
+                    if results.count >= maxResults {
+                        results.append("... (limited to \(maxResults) results)")
+                        break
+                    }
+                }
+            }
+        }
+
+        DebugLog.log("  → grep found \(results.count) matches")
+        return results.isEmpty
+            ? "No matches for '\(pattern)' in \(directory)"
+            : results.joined(separator: "\n")
+    }
+
+    // MARK: - head / tail
+
+    private func headFile(path: String, lines count: Int) -> String {
+        guard !path.isEmpty else { return "Error: path required" }
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else {
+            return readFile(path: path) // fallback to full read with POSIX
+        }
+        let lines = text.components(separatedBy: "\n")
+        let taken = lines.prefix(count)
+        return taken.enumerated().map { "\($0.offset + 1): \($0.element)" }.joined(separator: "\n")
+    }
+
+    private func tailFile(path: String, lines count: Int) -> String {
+        guard !path.isEmpty else { return "Error: path required" }
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else {
+            return readFile(path: path)
+        }
+        let lines = text.components(separatedBy: "\n")
+        let start = max(0, lines.count - count)
+        let taken = lines[start...]
+        return taken.enumerated().map { "\(start + $0.offset + 1): \($0.element)" }.joined(separator: "\n")
     }
 
     /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.

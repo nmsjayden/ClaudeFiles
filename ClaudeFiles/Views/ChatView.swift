@@ -11,13 +11,15 @@ struct ChatView: View {
     @State private var showingSidebar  = false
     @State private var showingSettings = false
     @State private var showingModels   = false
+    @State private var showingBrowser  = false
 
     var body: some View {
         ChatContent(
             store: store, settings: settings, sandbox: sandbox,
             showingSidebar:  $showingSidebar,
             showingSettings: $showingSettings,
-            showingModels:   $showingModels
+            showingModels:   $showingModels,
+            showingBrowser:  $showingBrowser
         )
         .environmentObject(auth)
     }
@@ -32,19 +34,21 @@ private struct ChatContent: View {
     @Binding var showingSidebar:  Bool
     @Binding var showingSettings: Bool
     @Binding var showingModels:   Bool
+    @Binding var showingBrowser:  Bool
     @EnvironmentObject var auth: AuthManager
     @StateObject private var vm: ChatViewModel
     @FocusState private var inputFocused: Bool
 
     init(store: ConversationStore, settings: SettingsStore, sandbox: SandboxManager,
          showingSidebar: Binding<Bool>, showingSettings: Binding<Bool>,
-         showingModels: Binding<Bool>) {
+         showingModels: Binding<Bool>, showingBrowser: Binding<Bool>) {
         self.store    = store
         self.settings = settings
         self.sandbox  = sandbox
         _showingSidebar  = showingSidebar
         _showingSettings = showingSettings
         _showingModels   = showingModels
+        _showingBrowser  = showingBrowser
         _vm = StateObject(wrappedValue: ChatViewModel(store: store))
     }
 
@@ -61,6 +65,7 @@ private struct ChatContent: View {
         .sheet(isPresented: $showingSidebar)  { ChatListSheet(store: store, isPresented: $showingSidebar) }
         .sheet(isPresented: $showingSettings) { SettingsSheet(settings: settings, sandbox: sandbox) }
         .sheet(isPresented: $showingModels)   { ModelPickerSheet(settings: settings) }
+        .sheet(isPresented: $showingBrowser)  { FileBrowserView() }
         .sheet(item: $vm.pendingWrite)        { WriteApprovalSheet(write: $0) }
         .sheet(isPresented: errorBinding) {
             ErrorSheet(message: vm.error ?? "", onDismiss: { vm.error = nil })
@@ -117,6 +122,9 @@ private struct ChatContent: View {
                     }
                 }
                 Divider()
+                Button { showingBrowser = true } label: {
+                    Label("File browser", systemImage: "folder.badge.gearshape")
+                }
                 Button { showingModels = true } label: {
                     Label("Change model", systemImage: "cpu")
                 }
@@ -665,6 +673,10 @@ struct ToolCallCard: View {
         case "list_directory": return "folder"
         case "search_files":   return "magnifyingglass"
         case "get_file_info":  return "info.circle"
+        case "bash_exec":      return "terminal"
+        case "grep_search":    return "text.magnifyingglass"
+        case "head_file":      return "text.line.first.and.arrowtriangle.forward"
+        case "tail_file":      return "text.line.last.and.arrowtriangle.forward"
         default:               return "wrench.and.screwdriver"
         }
     }
@@ -675,11 +687,15 @@ struct ToolCallCard: View {
         case "list_directory": return "List"
         case "search_files":   return "Search"
         case "get_file_info":  return "Info"
+        case "bash_exec":      return "Shell"
+        case "grep_search":    return "Grep"
+        case "head_file":      return "Head"
+        case "tail_file":      return "Tail"
         default:               return tool.name
         }
     }
     private var pathArg: String? {
-        tool.input["path"]?.string ?? tool.input["directory"]?.string
+        tool.input["path"]?.string ?? tool.input["directory"]?.string ?? tool.input["command"]?.string
     }
     private func valueStr(_ v: AnyJSON?) -> String {
         guard let v else { return "" }
@@ -1053,6 +1069,8 @@ struct SettingsSheet: View {
         NavigationView {
             Form {
                 modelSection
+                permissionsSection
+                appearanceSection
                 sandboxSection
                 aboutSection
                 debugSection
@@ -1085,6 +1103,36 @@ struct SettingsSheet: View {
                     Spacer()
                     Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                 }
+            }
+        }
+    }
+
+    private var permissionsSection: some View {
+        Section {
+            Toggle("Auto-approve file writes", isOn: $settings.autoApproveWrites)
+            if settings.autoApproveWrites {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption)
+                    Text("Claude will write files without asking. Backups are still created.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Permissions")
+        } footer: {
+            Text("When enabled, file writes are executed immediately without the approval dialog.")
+        }
+    }
+
+    private var appearanceSection: some View {
+        Section("Appearance") {
+            Picker("Theme", selection: $settings.appTheme) {
+                Text("System").tag("system")
+                Text("Dark").tag("dark")
+                Text("Light").tag("light")
             }
         }
     }

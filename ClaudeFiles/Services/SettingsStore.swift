@@ -6,6 +6,9 @@ final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
     @AppStorage("selectedModel") var selectedModel: String = ModelOption.sonnet55.id
+    @AppStorage("autoApproveWrites") var autoApproveWrites: Bool = false
+    @AppStorage("appTheme") var appTheme: String = "system"  // "system", "dark", "light"
+    @AppStorage("appVersion") var appVersion: String = "1.2.0"
 
     private init() {}
 

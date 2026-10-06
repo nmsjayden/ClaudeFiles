@@ -24,12 +24,24 @@ struct ClaudeFilesApp: App {
 
 struct ContentView: View {
     @EnvironmentObject var auth: AuthManager
+    @ObservedObject private var settings = SettingsStore.shared
 
     var body: some View {
-        if auth.isAuthenticated {
-            ChatView()
-        } else {
-            LoginView()
+        Group {
+            if auth.isAuthenticated {
+                ChatView()
+            } else {
+                LoginView()
+            }
+        }
+        .preferredColorScheme(colorScheme)
+    }
+
+    private var colorScheme: ColorScheme? {
+        switch settings.appTheme {
+        case "dark":  return .dark
+        case "light": return .light
+        default:      return nil  // system
         }
     }
 }

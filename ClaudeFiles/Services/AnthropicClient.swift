@@ -11,20 +11,39 @@ final class AnthropicClient {
         accessToken: String,
         onEvent: @escaping (StreamEvent) -> Void
     ) async throws {
-        // Try with current token; on 401, refresh and retry once.
-        do {
-            try await _sendStreaming(messages: messages, system: system,
-                                     accessToken: accessToken, onEvent: onEvent)
-        } catch let err as APIError {
-            if case .authExpired = err {
-                DebugLog.log("[API] 401 — attempting token refresh")
-                guard let newToken = await AuthManager.shared.refreshAccessToken() else {
-                    throw APIError.serverError("Session expired. Please sign out and sign back in.")
-                }
+        var token = accessToken
+        var rateLimitRetries = 0
+        let maxRateLimitRetries = 2
+
+        while true {
+            do {
                 try await _sendStreaming(messages: messages, system: system,
-                                         accessToken: newToken, onEvent: onEvent)
-            } else {
-                throw err
+                                         accessToken: token, onEvent: onEvent)
+                return
+            } catch let err as APIError {
+                switch err {
+                case .authExpired:
+                    DebugLog.log("[API] 401 — attempting token refresh")
+                    guard let newToken = await AuthManager.shared.refreshAccessToken() else {
+                        throw APIError.serverError("Session expired. Please sign out and sign back in.")
+                    }
+                    token = newToken
+                    continue
+
+                case .rateLimited(let retryAfter):
+                    rateLimitRetries += 1
+                    if rateLimitRetries > maxRateLimitRetries {
+                        throw APIError.serverError("Rate limited after \(maxRateLimitRetries) retries. Please wait a moment.")
+                    }
+                    let delay = min(retryAfter, 60)
+                    DebugLog.log("[API] 429 — waiting \(delay)s (retry \(rateLimitRetries)/\(maxRateLimitRetries))")
+                    onEvent(.statusMessage("Rate limited — retrying in \(Int(delay))s…"))
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+
+                default:
+                    throw err
+                }
             }
         }
     }
@@ -89,6 +108,23 @@ final class AnthropicClient {
             let raw = String(data: buf, encoding: .utf8) ?? "<non-utf8>"
             DebugLog.log("Auth expired: \(raw.prefix(500))")
             throw APIError.authExpired
+        }
+
+        if http.statusCode == 429 {
+            var buf = Data()
+            for try await byte in bytes { buf.append(byte) }
+            let raw = String(data: buf, encoding: .utf8) ?? "<non-utf8>"
+            DebugLog.log("Rate limited: \(raw.prefix(500))")
+            // Check if it's a credits_required error vs a normal rate limit
+            if raw.contains("credits_required") {
+                // Parse model name from error if possible
+                let modelName = Self.extractField(from: raw, field: "model_display_name") ?? "This model"
+                throw APIError.creditsRequired(modelName)
+            }
+            // Normal rate limit — throw retryable error with retry-after
+            let retryAfter = http.value(forHTTPHeaderField: "retry-after")
+                .flatMap(Double.init) ?? 30
+            throw APIError.rateLimited(retryAfterSeconds: retryAfter)
         }
 
         if http.statusCode != 200 {
@@ -211,6 +247,7 @@ enum StreamEvent {
     case toolInputDelta(index: Int, partialJSON: String)
     case blockStop(index: Int)
     case messageStop(stopReason: String)
+    case statusMessage(String)  // transient status (e.g. "retrying…")
 }
 
 // MARK: - Request
@@ -303,6 +340,25 @@ enum FileToolDefinitions {
         ToolDef(name: "get_file_info",
                 description: "Get file metadata.",
                 inputSchema: Schema(properties: ["path": Prop(description: "Absolute path")], required: ["path"])),
+        ToolDef(name: "bash_exec",
+                description: "Execute a shell command and return stdout/stderr. Use for any command-line operation.",
+                inputSchema: Schema(properties: ["command": Prop(description: "Shell command to execute")],
+                                    required: ["command"])),
+        ToolDef(name: "grep_search",
+                description: "Search file contents for a text pattern. Returns matching lines with file paths and line numbers.",
+                inputSchema: Schema(properties: ["pattern": Prop(description: "Text pattern to search for (case-insensitive)"),
+                                                 "directory": Prop(description: "Root directory to search in")],
+                                    required: ["pattern", "directory"])),
+        ToolDef(name: "head_file",
+                description: "Read the first N lines of a file with line numbers.",
+                inputSchema: Schema(properties: ["path": Prop(description: "Absolute path"),
+                                                 "lines": Prop(description: "Number of lines to read (default 50)")],
+                                    required: ["path"])),
+        ToolDef(name: "tail_file",
+                description: "Read the last N lines of a file with line numbers.",
+                inputSchema: Schema(properties: ["path": Prop(description: "Absolute path"),
+                                                 "lines": Prop(description: "Number of lines to read (default 50)")],
+                                    required: ["path"])),
     ]
 }
 
@@ -333,18 +389,44 @@ enum AnyJSON: Codable {
         }
     }
     var string: String? { if case .string(let s) = self { return s } else { return nil } }
+    var intValue: Int? { if case .number(let n) = self { return Int(n) } else { return nil } }
 }
 
 // MARK: - Errors
 
 enum APIError: LocalizedError {
     case invalidResponse, serverError(String), cancelled, authExpired
+    case rateLimited(retryAfterSeconds: Double)
+    case creditsRequired(String)  // model display name
+
     var errorDescription: String? {
         switch self {
-        case .invalidResponse:   return "Invalid response"
-        case .serverError(let m):return m
-        case .cancelled:         return "Cancelled"
-        case .authExpired:       return "Session expired — refreshing…"
+        case .invalidResponse:          return "Invalid response"
+        case .serverError(let m):       return m
+        case .cancelled:                return "Cancelled"
+        case .authExpired:              return "Session expired — refreshing…"
+        case .rateLimited:              return "Rate limited — please wait"
+        case .creditsRequired(let m):   return "\(m) requires usage credits. Switch to a different model or purchase credits at claude.ai."
         }
+    }
+}
+
+// MARK: - JSON field extraction
+
+extension AnthropicClient {
+    static func extractField(from json: String, field: String) -> String? {
+        // Simple extraction without full JSON parsing
+        guard let range = json.range(of: "\"\(field)\"") else { return nil }
+        let after = json[range.upperBound...]
+        guard let colonIdx = after.firstIndex(of: ":") else { return nil }
+        let valueArea = after[after.index(after: colonIdx)...]
+            .trimmingCharacters(in: .whitespaces)
+        if valueArea.hasPrefix("\"") {
+            let inner = valueArea.dropFirst()
+            if let end = inner.firstIndex(of: "\"") {
+                return String(inner[..<end])
+            }
+        }
+        return nil
     }
 }

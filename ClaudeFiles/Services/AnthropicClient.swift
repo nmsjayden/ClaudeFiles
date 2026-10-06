@@ -11,6 +11,31 @@ final class AnthropicClient {
         accessToken: String,
         onEvent: @escaping (StreamEvent) -> Void
     ) async throws {
+        // Try with current token; on 401, refresh and retry once.
+        do {
+            try await _sendStreaming(messages: messages, system: system,
+                                     accessToken: accessToken, onEvent: onEvent)
+        } catch let err as APIError {
+            if case .authExpired = err {
+                DebugLog.log("[API] 401 — attempting token refresh")
+                guard let newToken = await AuthManager.shared.refreshAccessToken() else {
+                    throw APIError.serverError("Session expired. Please sign out and sign back in.")
+                }
+                try await _sendStreaming(messages: messages, system: system,
+                                         accessToken: newToken, onEvent: onEvent)
+            } else {
+                throw err
+            }
+        }
+    }
+
+    @MainActor
+    private func _sendStreaming(
+        messages: [ChatMessage],
+        system: String,
+        accessToken: String,
+        onEvent: @escaping (StreamEvent) -> Void
+    ) async throws {
         let model = SettingsStore.shared.selectedModel
 
         var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
@@ -57,6 +82,14 @@ final class AnthropicClient {
         }
 
         DebugLog.log("HTTP status: \(http.statusCode)")
+
+        if http.statusCode == 401 {
+            var buf = Data()
+            for try await byte in bytes { buf.append(byte) }
+            let raw = String(data: buf, encoding: .utf8) ?? "<non-utf8>"
+            DebugLog.log("Auth expired: \(raw.prefix(500))")
+            throw APIError.authExpired
+        }
 
         if http.statusCode != 200 {
             var buf = Data()
@@ -305,12 +338,13 @@ enum AnyJSON: Codable {
 // MARK: - Errors
 
 enum APIError: LocalizedError {
-    case invalidResponse, serverError(String), cancelled
+    case invalidResponse, serverError(String), cancelled, authExpired
     var errorDescription: String? {
         switch self {
         case .invalidResponse:   return "Invalid response"
         case .serverError(let m):return m
         case .cancelled:         return "Cancelled"
+        case .authExpired:       return "Session expired — refreshing…"
         }
     }
 }

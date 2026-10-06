@@ -137,6 +137,44 @@ final class AuthManager: NSObject, ObservableObject {
 
     func accessToken() async -> String? { keychainLoad("access_token") }
 
+    /// Attempt to refresh the access token using the stored refresh token.
+    /// Returns the new access token on success, nil on failure (user must re-login).
+    func refreshAccessToken() async -> String? {
+        guard let refreshToken = keychainLoad("refresh_token") else {
+            DebugLog.log("[Auth] No refresh token stored — user must re-login")
+            return nil
+        }
+
+        DebugLog.log("[Auth] Refreshing access token…")
+        var req = URLRequest(url: URL(string: tokenURL)!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONEncoder().encode([
+            "grant_type":    "refresh_token",
+            "client_id":     clientId,
+            "refresh_token": refreshToken,
+        ])
+
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                let msg = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+                DebugLog.log("[Auth] Refresh failed: \(msg.prefix(300))")
+                // Refresh token is also expired/invalid — force re-login
+                isAuthenticated = false
+                return nil
+            }
+            let tok = try JSONDecoder().decode(TokenResponse.self, from: data)
+            keychainSave("access_token", tok.accessToken)
+            if let r = tok.refreshToken { keychainSave("refresh_token", r) }
+            DebugLog.log("[Auth] Token refreshed successfully")
+            return tok.accessToken
+        } catch {
+            DebugLog.log("[Auth] Refresh error: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     func logout() {
         for k in ["access_token", "refresh_token"] { keychainDelete(k) }
         isAuthenticated = false

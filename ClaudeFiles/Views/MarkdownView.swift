@@ -26,6 +26,7 @@ struct MarkdownView: View {
         case numberList([String])
         case quote(String)
         case rule
+        case table(headers: [String], rows: [[String]])
     }
 
     private var blocks: [Block] {
@@ -82,6 +83,30 @@ struct MarkdownView: View {
                 var quote: [String] = []
                 while i < lines.count && lines[i].hasPrefix("> ") { quote.append(String(lines[i].dropFirst(2))); i += 1 }
                 result.append(.quote(quote.joined(separator: "\n"))); continue
+            }
+
+            // Table: detect "|" rows followed by a separator row like |---|---|
+            if line.contains("|") && i + 1 < lines.count {
+                let nextLine = lines[i + 1].trimmingCharacters(in: .whitespaces)
+                let isSep = nextLine.contains("|") && nextLine.contains("-")
+                    && nextLine.replacingOccurrences(of: "|", with: "")
+                        .replacingOccurrences(of: "-", with: "")
+                        .replacingOccurrences(of: ":", with: "")
+                        .replacingOccurrences(of: " ", with: "")
+                        .isEmpty
+                if isSep {
+                    let headers = Self.parseTableRow(line)
+                    i += 2 // skip header + separator
+                    var rows: [[String]] = []
+                    while i < lines.count && lines[i].contains("|") {
+                        let cells = Self.parseTableRow(lines[i])
+                        if cells.isEmpty { break }
+                        rows.append(cells)
+                        i += 1
+                    }
+                    result.append(.table(headers: headers, rows: rows))
+                    continue
+                }
             }
 
             // Blank line → skip
@@ -148,7 +173,19 @@ struct MarkdownView: View {
 
         case .rule:
             Divider().padding(.vertical, 4)
+
+        case .table(let headers, let rows):
+            TableBlockView(headers: headers, rows: rows)
         }
+    }
+
+    // MARK: - Table helpers
+
+    private static func parseTableRow(_ line: String) -> [String] {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        let stripped = trimmed.hasPrefix("|") ? String(trimmed.dropFirst()) : trimmed
+        let cleaned = stripped.hasSuffix("|") ? String(stripped.dropLast()) : stripped
+        return cleaned.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     // MARK: - Inline formatting via AttributedString markdown
@@ -159,6 +196,59 @@ struct MarkdownView: View {
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) { return attr }
         return AttributedString(s)
+    }
+}
+
+// MARK: - Table block
+
+private struct TableBlockView: View {
+    let headers: [String]
+    let rows: [[String]]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Header row
+                HStack(spacing: 0) {
+                    ForEach(Array(headers.enumerated()), id: \.offset) { idx, header in
+                        Text(header)
+                            .font(.footnote.bold())
+                            .lineLimit(2)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(minWidth: 80, alignment: .leading)
+                        if idx < headers.count - 1 {
+                            Divider()
+                        }
+                    }
+                }
+                .background(Color(.tertiarySystemBackground))
+
+                Divider()
+
+                // Data rows
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
+                    HStack(spacing: 0) {
+                        ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
+                            Text(cell)
+                                .font(.footnote)
+                                .lineLimit(3)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .frame(minWidth: 80, alignment: .leading)
+                            if colIdx < row.count - 1 {
+                                Divider()
+                            }
+                        }
+                    }
+                    if rowIdx < rows.count - 1 {
+                        Divider()
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(.separator), lineWidth: 0.5))
     }
 }
 

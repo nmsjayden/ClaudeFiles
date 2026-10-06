@@ -287,7 +287,27 @@ final class ChatViewModel: ObservableObject {
     private func compactedHistory(messages: [StoredMessage], keepRecent: Int) -> [ChatMessage] {
         let splitAt = max(0, messages.count - keepRecent)
         let older  = Array(messages[..<splitAt])
-        let recent = Array(messages[splitAt...])
+        var recent = Array(messages[splitAt...])
+
+        // Collect tool_use IDs that exist in the recent slice (from assistant blocks)
+        var recentToolUseIds = Set<String>()
+        for m in recent {
+            if let blocks = m.apiBlocks {
+                for b in blocks where b.type == "tool_use" {
+                    if let id = b.id { recentToolUseIds.insert(id) }
+                }
+            }
+        }
+
+        // Strip orphaned tool_result messages at the start of recent slice —
+        // these reference tool_use IDs that were in the compacted (dropped) portion.
+        // The API requires every tool_result to have a matching tool_use in the
+        // previous assistant message, so orphans cause HTTP 400.
+        while let first = recent.first,
+              let toolId = first.toolUseId,
+              !recentToolUseIds.contains(toolId) {
+            recent.removeFirst()
+        }
 
         // Build a text summary of older messages
         var summaryParts: [String] = []

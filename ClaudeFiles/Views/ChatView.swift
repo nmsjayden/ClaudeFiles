@@ -331,7 +331,8 @@ private struct MessageList: View {
         .onPreferenceChange(BottomDistKey.self) { dist in
             let near = dist < 80
             if followBottom != near { followBottom = near }
-            let show = !near && vm.isSending
+            // Show jump button whenever scrolled up and there's content below
+            let show = !near
             if show != showJumpButton { showJumpButton = show }
         }
         .onChange(of: vm.displayMessages.count)    { _ in scrollIfFollowing(proxy) }

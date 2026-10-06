@@ -294,7 +294,7 @@ private struct MessageList: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
     @State private var autoScroll: Bool = true
-    @State private var bottomVisible: Bool = true
+    @State private var bottomVisible: Bool = false
 
     var body: some View {
         ScrollViewReader { proxy in

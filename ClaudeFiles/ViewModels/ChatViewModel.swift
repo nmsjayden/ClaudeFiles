@@ -338,16 +338,35 @@ final class ChatViewModel: ObservableObject {
         result.append(ChatMessage(role: .user, content: .text(summary)))
         result.append(ChatMessage(role: .assistant, content: .text("Understood, I have the context from our earlier conversation.")))
 
-        let recentAPI = messagesToAPI(Array(recent))
-
-        // If recentAPI starts with an assistant message, we'd have consecutive
-        // assistant messages (the summary ack + the first recent). Skip leading
-        // assistant messages from the recent slice to keep alternation valid.
-        var startIdx = 0
-        for msg in recentAPI {
-            if msg.role == .assistant { startIdx += 1 } else { break }
+        // If recent starts with an assistant message, we'd have consecutive
+        // assistant messages (the summary ack + the first recent). Strip leading
+        // assistant messages AND their associated tool_result messages from the
+        // StoredMessage array BEFORE converting, so messagesToAPI never sees
+        // orphaned tool_results referencing tool_use IDs from skipped assistants.
+        while !recent.isEmpty {
+            let first = recent.first!
+            if first.role == "assistant" {
+                // Collect tool_use IDs from this assistant's blocks
+                var toolUseIds = Set<String>()
+                if let blocks = first.apiBlocks {
+                    for b in blocks where b.type == "tool_use" {
+                        if let id = b.id { toolUseIds.insert(id) }
+                    }
+                }
+                recent.removeFirst()
+                // Also remove any following tool_result messages that reference these IDs
+                while let next = recent.first,
+                      let toolId = next.toolUseId,
+                      toolUseIds.contains(toolId) {
+                    recent.removeFirst()
+                }
+            } else {
+                break
+            }
         }
-        result += Array(recentAPI[startIdx...])
+
+        let recentAPI = messagesToAPI(Array(recent))
+        result += recentAPI
         return result
     }
 

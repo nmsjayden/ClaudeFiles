@@ -17,3 +17,6 @@
 
 // Global exploit state flags (set_exploit_done, set_patching_done)
 #import "FilzaJailedDS-SSV-Bypass/exploit_globals.h"
+
+// Shell command execution (bypasses Swift's iOS popen restriction)
+#import "FilzaJailedDS-SSV-Bypass/shell_exec.h"

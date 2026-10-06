@@ -191,7 +191,7 @@ final class FileToolsExecutor {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - bash_exec (uses popen — works on jailbroken iOS)
+    // MARK: - bash_exec (uses C bridge to bypass Swift's iOS popen restriction)
 
     private func bashExec(command: String) async -> String {
         guard !command.isEmpty else { return "Error: command required" }
@@ -204,28 +204,14 @@ final class FileToolsExecutor {
 
         DebugLog.log("bashExec: \(command.prefix(100))")
 
-        // Redirect stderr to stdout so we capture both
-        let fullCmd = command + " 2>&1"
-
-        guard let fp = popen(fullCmd, "r") else {
-            DebugLog.log("  → popen failed, errno=\(errno)")
-            return "Error: popen failed (errno \(errno): \(String(cString: strerror(errno))))"
+        var exitCode: Int32 = -1
+        guard let cResult = shell_exec(command, &exitCode) else {
+            DebugLog.log("  → shell_exec returned NULL")
+            return "Error: shell_exec failed (command may not be available on this device)"
         }
+        defer { free(cResult) }
 
-        var output = Data()
-        var buf = [UInt8](repeating: 0, count: 8192)
-        while true {
-            let n = fread(&buf, 1, buf.count, fp)
-            if n == 0 { break }
-            output.append(buf, count: n)
-            if output.count > 500_000 { break } // safety cap
-        }
-
-        let status = pclose(fp)
-        // Extract exit code: WEXITSTATUS is (status >> 8) & 0xFF on Darwin
-        let exitCode = Int((status >> 8) & 0xFF)
-
-        var result = String(data: output, encoding: .utf8) ?? "(binary output, \(output.count) bytes)"
+        var result = String(cString: cResult)
         if exitCode != 0 { result += "\n[exit code: \(exitCode)]" }
         if result.isEmpty { result = "(no output, exit code \(exitCode))" }
 

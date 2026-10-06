@@ -144,8 +144,9 @@ final class ChatViewModel: ObservableObject {
                 guard let token = await authMgr.accessToken() else { error = "Not logged in"; return }
 
                 var currentText = ""
-                var toolBlocks:  [Int: StreamingTool] = [:]
-                var textBlocks:  [Int: String]        = [:]
+                var toolBlocks:       [Int: StreamingTool] = [:]
+                var textBlocks:       [Int: String]        = [:]
+                var compactionBlocks: [Int: String]        = [:]
                 var finalStopReason: String?
 
                 try await api.sendStreaming(messages: history, system: systemPrompt,
@@ -168,6 +169,11 @@ final class ChatViewModel: ObservableObject {
                            let parsed = self.parseJSON(raw) {
                             self.streamingToolCalls[idx]?.input = parsed
                         }
+                    case .compactionStart(let idx):
+                        compactionBlocks[idx] = ""
+                        DebugLog.log("Server-side compaction triggered")
+                    case .compactionDelta(let idx, let content):
+                        compactionBlocks[idx, default: ""] += content
                     case .blockStop(let idx):
                         if toolBlocks[idx] != nil {
                             self.streamingToolCalls[idx]?.isComplete = true
@@ -181,9 +187,13 @@ final class ChatViewModel: ObservableObject {
 
                 // Build persistent blocks
                 var apiBlocks: [StoredBlock] = []
-                let allIndices = Set(textBlocks.keys).union(toolBlocks.keys).sorted()
+                let allIndices = Set(textBlocks.keys).union(toolBlocks.keys).union(compactionBlocks.keys).sorted()
                 for i in allIndices {
-                    if let text = textBlocks[i], !text.isEmpty {
+                    if let content = compactionBlocks[i], !content.isEmpty {
+                        // Compaction block — stored so it's passed back to the API
+                        apiBlocks.append(StoredBlock(type: "compaction", text: content,
+                                                     id: nil, name: nil, input: nil))
+                    } else if let text = textBlocks[i], !text.isEmpty {
                         apiBlocks.append(StoredBlock(type: "text", text: text,
                                                      id: nil, name: nil, input: nil))
                     } else if let tool = toolBlocks[i] {
@@ -250,124 +260,11 @@ final class ChatViewModel: ObservableObject {
 
     private func buildAPIHistory(convId: UUID) -> [ChatMessage] {
         guard let c = store.conversations.first(where: { $0.id == convId }) else { return [] }
-        let all = c.messages
-
-        // Estimate tokens (~4 chars/token). If over threshold, compact older messages.
-        let maxEstimatedTokens = 24_000   // keep ~24k tokens, leaves room for response
-        let keepRecentTurns    = 6        // always keep last N messages verbatim
-
-        let totalChars = all.reduce(0) { $0 + estimateChars($1) }
-        let estimatedTokens = totalChars / 4
-
-        if estimatedTokens > maxEstimatedTokens && all.count > keepRecentTurns + 2 {
-            return compactedHistory(messages: all, keepRecent: keepRecentTurns)
-        }
-
-        return messagesToAPI(all)
-    }
-
-    /// Rough character count for a stored message
-    private func estimateChars(_ m: StoredMessage) -> Int {
-        var count = m.text.count
-        if let blocks = m.apiBlocks {
-            for b in blocks {
-                count += (b.text?.count ?? 0) + 80 // tool calls add overhead
-                if let input = b.input {
-                    for (_, v) in input {
-                        if case .string(let s) = v { count += s.count }
-                    }
-                }
-            }
-        }
-        count += m.toolResult?.count ?? 0
-        return count
-    }
-
-    /// Build compacted history: summarize older turns, keep recent ones verbatim
-    private func compactedHistory(messages: [StoredMessage], keepRecent: Int) -> [ChatMessage] {
-        let splitAt = max(0, messages.count - keepRecent)
-        let older  = Array(messages[..<splitAt])
-        var recent = Array(messages[splitAt...])
-
-        // Collect tool_use IDs that exist in the recent slice (from assistant blocks)
-        var recentToolUseIds = Set<String>()
-        for m in recent {
-            if let blocks = m.apiBlocks {
-                for b in blocks where b.type == "tool_use" {
-                    if let id = b.id { recentToolUseIds.insert(id) }
-                }
-            }
-        }
-
-        // Strip orphaned tool_result messages at the start of recent slice —
-        // these reference tool_use IDs that were in the compacted (dropped) portion.
-        // The API requires every tool_result to have a matching tool_use in the
-        // previous assistant message, so orphans cause HTTP 400.
-        while let first = recent.first,
-              let toolId = first.toolUseId,
-              !recentToolUseIds.contains(toolId) {
-            recent.removeFirst()
-        }
-
-        // Build a text summary of older messages
-        var summaryParts: [String] = []
-        for m in older {
-            if m.toolUseId != nil { continue } // skip raw tool results
-            let role = m.role == "user" ? "User" : "Assistant"
-            if !m.text.isEmpty {
-                let truncated = m.text.count > 200 ? String(m.text.prefix(200)) + "…" : m.text
-                summaryParts.append("\(role): \(truncated)")
-            }
-            if let blocks = m.apiBlocks {
-                for b in blocks where b.type == "tool_use" {
-                    if let name = b.name, let path = b.input?["path"]?.string {
-                        summaryParts.append("  [Tool: \(name) → \(path)]")
-                    } else if let name = b.name {
-                        summaryParts.append("  [Tool: \(name)]")
-                    }
-                }
-            }
-        }
-
-        let summary = "[Context compacted — earlier conversation summary]\n" +
-            summaryParts.joined(separator: "\n")
-
-        DebugLog.log("Compacted: \(older.count) older messages → summary (\(summary.count)c), keeping \(recent.count) recent")
-
-        var result: [ChatMessage] = []
-        result.append(ChatMessage(role: .user, content: .text(summary)))
-        result.append(ChatMessage(role: .assistant, content: .text("Understood, I have the context from our earlier conversation.")))
-
-        // If recent starts with an assistant message, we'd have consecutive
-        // assistant messages (the summary ack + the first recent). Strip leading
-        // assistant messages AND their associated tool_result messages from the
-        // StoredMessage array BEFORE converting, so messagesToAPI never sees
-        // orphaned tool_results referencing tool_use IDs from skipped assistants.
-        while !recent.isEmpty {
-            let first = recent.first!
-            if first.role == "assistant" {
-                // Collect tool_use IDs from this assistant's blocks
-                var toolUseIds = Set<String>()
-                if let blocks = first.apiBlocks {
-                    for b in blocks where b.type == "tool_use" {
-                        if let id = b.id { toolUseIds.insert(id) }
-                    }
-                }
-                recent.removeFirst()
-                // Also remove any following tool_result messages that reference these IDs
-                while let next = recent.first,
-                      let toolId = next.toolUseId,
-                      toolUseIds.contains(toolId) {
-                    recent.removeFirst()
-                }
-            } else {
-                break
-            }
-        }
-
-        let recentAPI = messagesToAPI(Array(recent))
-        result += recentAPI
-        return result
+        // Server-side compaction handles context management automatically.
+        // The API compacts older messages when input tokens exceed the threshold
+        // set in context_management. Compaction blocks in stored messages are
+        // passed back and the API drops everything before them.
+        return messagesToAPI(c.messages)
     }
 
     private func messagesToAPI(_ msgs: [StoredMessage]) -> [ChatMessage] {

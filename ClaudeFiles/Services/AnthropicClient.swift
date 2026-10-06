@@ -66,7 +66,7 @@ final class AnthropicClient {
         req.setValue("application/json",                 forHTTPHeaderField: "Content-Type")
         req.setValue("text/event-stream",                forHTTPHeaderField: "Accept")
         req.setValue("2023-06-01",                       forHTTPHeaderField: "anthropic-version")
-        req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
+        req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,compact-2026-01-12,prompt-caching-scope-2026-01-05",
                      forHTTPHeaderField: "anthropic-beta")
         req.setValue("true",                             forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
         req.setValue("claude-cli/2.1.291 (external, cli)", forHTTPHeaderField: "User-Agent")
@@ -87,9 +87,15 @@ final class AnthropicClient {
             SystemBlock(type: "text", text: system),
         ]
 
+        let contextMgmt = ContextManagement(edits: [
+            CompactEdit(type: "compact_20260112",
+                        trigger: CompactTrigger(type: "input_tokens", value: 100_000))
+        ])
+
         let body = RequestBody(model: model, maxTokens: 8192, stream: true,
                                system: systemBlocks, messages: messages,
-                               tools: FileToolDefinitions.all)
+                               tools: FileToolDefinitions.all,
+                               contextManagement: contextMgmt)
         req.httpBody = try JSONEncoder().encode(body)
 
         DebugLog.log("API send: model=\(model), messages=\(messages.count)")
@@ -213,6 +219,8 @@ final class AnthropicClient {
                                           name: p.content_block.name ?? ""))
                 } else if p.content_block.type == "text" {
                     onEvent(.textStart(index: p.index))
+                } else if p.content_block.type == "compaction" {
+                    onEvent(.compactionStart(index: p.index))
                 }
             }
         case "content_block_delta":
@@ -221,6 +229,8 @@ final class AnthropicClient {
                     onEvent(.textDelta(index: p.index, text: text))
                 } else if p.delta.type == "input_json_delta", let json = p.delta.partial_json {
                     onEvent(.toolInputDelta(index: p.index, partialJSON: json))
+                } else if p.delta.type == "compaction_delta", let content = p.delta.content {
+                    onEvent(.compactionDelta(index: p.index, content: content))
                 }
             }
         case "content_block_stop":
@@ -245,6 +255,8 @@ enum StreamEvent {
     case textDelta(index: Int, text: String)
     case toolUseStart(index: Int, id: String, name: String)
     case toolInputDelta(index: Int, partialJSON: String)
+    case compactionStart(index: Int)
+    case compactionDelta(index: Int, content: String)
     case blockStop(index: Int)
     case messageStop(stopReason: String)
     case statusMessage(String)  // transient status (e.g. "retrying…")
@@ -259,10 +271,28 @@ private struct RequestBody: Encodable {
     let system: [SystemBlock]
     let messages: [ChatMessage]
     let tools: [ToolDef]
+    let contextManagement: ContextManagement?
     enum CodingKeys: String, CodingKey {
         case model, stream, system, messages, tools
         case maxTokens = "max_tokens"
+        case contextManagement = "context_management"
     }
+}
+
+// MARK: - Server-side compaction (context management)
+
+struct ContextManagement: Encodable {
+    let edits: [CompactEdit]
+}
+
+struct CompactEdit: Encodable {
+    let type: String           // "compact_20260112"
+    let trigger: CompactTrigger
+}
+
+struct CompactTrigger: Encodable {
+    let type: String           // "input_tokens"
+    let value: Int             // token threshold
 }
 
 struct SystemBlock: Encodable {
@@ -288,6 +318,7 @@ private struct ContentBlockDeltaEvent: Decodable {
         let type: String
         let text: String?
         let partial_json: String?
+        let content: String?
     }
 }
 private struct ContentBlockStopEvent: Decodable {

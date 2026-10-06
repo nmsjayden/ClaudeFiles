@@ -119,6 +119,17 @@ struct MarkdownView: View {
                 if l.isEmpty || l.hasPrefix("#") || l.hasPrefix("```")
                     || l.hasPrefix("- ") || l.hasPrefix("* ") || l.hasPrefix("> ") { break }
                 if l.range(of: #"^\d+\.\s"#, options: .regularExpression) != nil { break }
+                // Don't absorb pipe-delimited table rows into paragraphs
+                if l.contains("|") && i + 1 < lines.count {
+                    let next = lines[i + 1].trimmingCharacters(in: .whitespaces)
+                    let looksLikeSep = next.contains("|") && next.contains("-")
+                        && next.replacingOccurrences(of: "|", with: "")
+                            .replacingOccurrences(of: "-", with: "")
+                            .replacingOccurrences(of: ":", with: "")
+                            .replacingOccurrences(of: " ", with: "")
+                            .isEmpty
+                    if looksLikeSep { break }
+                }
                 para.append(l); i += 1
             }
             result.append(.paragraph(para.joined(separator: " ")))
@@ -205,50 +216,73 @@ private struct TableBlockView: View {
     let headers: [String]
     let rows: [[String]]
 
+    private var columnCount: Int { headers.count }
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
+            let colWidths = computeColumnWidths()
+
             VStack(alignment: .leading, spacing: 0) {
                 // Header row
                 HStack(spacing: 0) {
-                    ForEach(Array(headers.enumerated()), id: \.offset) { idx, header in
-                        Text(header)
+                    ForEach(0..<columnCount, id: \.self) { col in
+                        Text(col < headers.count ? headers[col] : "")
                             .font(.footnote.bold())
                             .lineLimit(2)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
-                            .frame(minWidth: 80, alignment: .leading)
-                        if idx < headers.count - 1 {
-                            Divider()
-                        }
+                            .frame(width: colWidths[col], alignment: .leading)
                     }
                 }
                 .background(Color(.tertiarySystemBackground))
 
-                Divider()
+                Rectangle().fill(Color(.separator)).frame(height: 0.5)
 
                 // Data rows
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
                     HStack(spacing: 0) {
-                        ForEach(Array(row.enumerated()), id: \.offset) { colIdx, cell in
-                            Text(cell)
+                        ForEach(0..<columnCount, id: \.self) { col in
+                            Text(col < row.count ? row[col] : "")
                                 .font(.footnote)
                                 .lineLimit(3)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
-                                .frame(minWidth: 80, alignment: .leading)
-                            if colIdx < row.count - 1 {
-                                Divider()
-                            }
+                                .frame(width: colWidths[col], alignment: .leading)
                         }
                     }
-                    if rowIdx < rows.count - 1 {
-                        Divider()
-                    }
+                    .background(rowIdx % 2 == 1 ? Color(.systemFill).opacity(0.3) : Color.clear)
                 }
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(.separator), lineWidth: 0.5))
+    }
+
+    /// Measure the widest cell in each column and assign fixed widths
+    /// so columns align perfectly across all rows.
+    private func computeColumnWidths() -> [CGFloat] {
+        let minWidth: CGFloat = 60
+        let maxWidth: CGFloat = 220
+        let hPad: CGFloat = 20  // 10 on each side
+        let charWidth: CGFloat = 7.5  // approximate for .footnote monospaced
+
+        var widths = [CGFloat](repeating: minWidth, count: columnCount)
+        for col in 0..<columnCount {
+            // Check header
+            if col < headers.count {
+                let w = CGFloat(headers[col].count) * charWidth + hPad
+                widths[col] = max(widths[col], w)
+            }
+            // Check all data rows
+            for row in rows {
+                if col < row.count {
+                    let w = CGFloat(row[col].count) * charWidth + hPad
+                    widths[col] = max(widths[col], w)
+                }
+            }
+            widths[col] = min(widths[col], maxWidth)
+        }
+        return widths
     }
 }
 

@@ -255,7 +255,10 @@ private struct SuggestionChip: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
             HStack(spacing: 8) {
                 Image(systemName: icon)
                     .font(.caption.weight(.semibold))
@@ -481,6 +484,13 @@ struct MessageBubble: View {
                 .foregroundStyle(.white)
                 .clipShape(RoundedRectangle(cornerRadius: 20))
                 .textSelection(.enabled)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = message.text
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
         }
     }
 
@@ -490,7 +500,15 @@ struct MessageBubble: View {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(message.toolCalls) { ToolCallCard(tool: $0) }
                 if !message.text.isEmpty {
-                    MarkdownView(message.text).textSelection(.enabled)
+                    MarkdownView(message.text)
+                        .textSelection(.enabled)
+                        .contextMenu {
+                            Button {
+                                UIPasteboard.general.string = message.text
+                            } label: {
+                                Label("Copy text", systemImage: "doc.on.doc")
+                            }
+                        }
                 }
             }
             Spacer(minLength: 0)
@@ -932,6 +950,11 @@ struct ChatListSheet: View {
                     onSelect:     { store.selectedId = c.id; isPresented = false },
                     onRename:     { renamingId = c.id; renameText = c.title },
                     onDelete:     { deletingId = c.id })
+            }
+            .onDelete { offsets in
+                if let idx = offsets.first {
+                    deletingId = store.conversations[idx].id
+                }
             }
         }
     }

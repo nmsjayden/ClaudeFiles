@@ -50,10 +50,10 @@ final class AnthropicClient {
         req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
                      forHTTPHeaderField: "anthropic-beta")
         req.setValue("true",                             forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
-        req.setValue("claude-cli/2.1.92 (external, cli)", forHTTPHeaderField: "User-Agent")
+        req.setValue("claude-cli/2.1.291 (external, cli)", forHTTPHeaderField: "User-Agent")
         req.setValue("cli",                               forHTTPHeaderField: "x-app")
         req.setValue("js",                                forHTTPHeaderField: "x-stainless-lang")
-        req.setValue("0.74.0",                            forHTTPHeaderField: "x-stainless-package-version")
+        req.setValue("0.120.0",                             forHTTPHeaderField: "x-stainless-package-version")
         req.setValue("MacOS",                             forHTTPHeaderField: "x-stainless-os")
         req.setValue("arm64",                             forHTTPHeaderField: "x-stainless-arch")
         req.setValue("node",                              forHTTPHeaderField: "x-stainless-runtime")

@@ -129,13 +129,15 @@ final class ChatViewModel: ObservableObject {
 
     private func runTurn(convId: UUID) async {
         defer { resetStreaming() }
-        guard let token = await authMgr.accessToken() else { error = "Not logged in"; return }
 
         do {
             var history = buildAPIHistory(convId: convId)
 
             while true {
                 if Task.isCancelled { return }
+
+                // Re-fetch token each iteration so refreshed tokens are picked up
+                guard let token = await authMgr.accessToken() else { error = "Not logged in"; return }
 
                 var currentText = ""
                 var toolBlocks:  [Int: StreamingTool] = [:]

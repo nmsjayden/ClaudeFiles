@@ -337,26 +337,54 @@ final class ChatViewModel: ObservableObject {
         var result: [ChatMessage] = []
         result.append(ChatMessage(role: .user, content: .text(summary)))
         result.append(ChatMessage(role: .assistant, content: .text("Understood, I have the context from our earlier conversation.")))
-        result += messagesToAPI(Array(recent))
+
+        let recentAPI = messagesToAPI(Array(recent))
+
+        // If recentAPI starts with an assistant message, we'd have consecutive
+        // assistant messages (the summary ack + the first recent). Skip leading
+        // assistant messages from the recent slice to keep alternation valid.
+        var startIdx = 0
+        for msg in recentAPI {
+            if msg.role == .assistant { startIdx += 1 } else { break }
+        }
+        result += Array(recentAPI[startIdx...])
         return result
     }
 
     private func messagesToAPI(_ msgs: [StoredMessage]) -> [ChatMessage] {
-        msgs.compactMap { m -> ChatMessage? in
-            if let toolId = m.toolUseId, let result = m.toolResult {
-                return ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: result))
-            }
-            if m.role == "user" {
-                return ChatMessage(role: .user, content: .text(m.text))
-            }
-            if let blocks = m.apiBlocks, !blocks.isEmpty {
+        var result: [ChatMessage] = []
+        for m in msgs {
+            if let toolId = m.toolUseId, let toolResult = m.toolResult {
+                result.append(ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: toolResult)))
+            } else if m.role == "user" {
+                result.append(ChatMessage(role: .user, content: .text(m.text)))
+            } else if let blocks = m.apiBlocks, !blocks.isEmpty {
                 let apiBlocks = blocks.map {
                     APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
                 }
-                return ChatMessage(role: .assistant, content: .blocks(apiBlocks))
+                result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
+            } else {
+                result.append(ChatMessage(role: .assistant, content: .text(m.text)))
             }
-            return ChatMessage(role: .assistant, content: .text(m.text))
         }
+
+        // Ensure conversation ends with a user message (API requirement).
+        // If the last message is from the assistant, drop trailing assistant messages.
+        while let last = result.last {
+            switch last.content {
+            case .text(_), .blocks(_):
+                // Check if it's an assistant message
+                if last.role == .assistant {
+                    result.removeLast()
+                } else {
+                    return result
+                }
+            case .toolResult:
+                return result // tool_result is a user message, so we're fine
+            }
+        }
+
+        return result
     }
 
     // MARK: - Tool execution

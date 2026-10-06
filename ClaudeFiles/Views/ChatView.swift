@@ -293,59 +293,78 @@ private struct SuggestionChip: View {
 private struct MessageList: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
-    @State private var followBottom: Bool = true
-    @State private var showJumpButton: Bool = false
+    @State private var autoScroll: Bool = true
+    @State private var isNearBottom: Bool = true
 
     var body: some View {
         ScrollViewReader { proxy in
-            GeometryReader { outerGeo in
-                ZStack(alignment: .bottom) {
-                    scroll(proxy: proxy, outerGeo: outerGeo)
-                    jumpButton(proxy)
-                        .padding(.bottom, 10)
-                        .opacity(showJumpButton ? 1 : 0)
-                        .animation(.easeOut(duration: 0.2), value: showJumpButton)
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
+                            MessageBubble(message: msg).id(idx)
+                        }
+
+                        if vm.isSending && vm.streamingBelongsToCurrentChat {
+                            streamingContent
+                        }
+
+                        // Bottom anchor — also tracks scroll position
+                        GeometryReader { geo in
+                            Color.clear.preference(
+                                key: BottomVisibleKey.self,
+                                value: geo.frame(in: .global).minY)
+                        }
+                        .frame(height: 1)
+                        .id("bottom")
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 18)
+                }
+                .onPreferenceChange(BottomVisibleKey.self) { bottomY in
+                    // Screen height as rough container size
+                    let screenH = UIScreen.main.bounds.height
+                    let near = bottomY < screenH + 80
+                    if near != isNearBottom { isNearBottom = near }
+                    if near { autoScroll = true }
+                    if !near { autoScroll = false }
+                }
+                .onChange(of: vm.displayMessages.count)    { _ in scrollIfAuto(proxy) }
+                .onChange(of: vm.streamingText)            { _ in scrollIfAuto(proxy) }
+                .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfAuto(proxy) }
+                .onChange(of: vm.isSending) { sending in
+                    if sending {
+                        autoScroll = true
+                        scrollToBottom(proxy)
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { inputFocused = false }
+
+                // Jump-to-bottom button — visible when not near bottom
+                if !isNearBottom {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        autoScroll = true
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.primary)
+                            .frame(width: 36, height: 36)
+                            .background(Color(.secondarySystemBackground))
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
+                            .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+                    }
+                    .padding(.bottom, 10)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                    .animation(.easeOut(duration: 0.2), value: isNearBottom)
                 }
             }
         }
-    }
-
-    @ViewBuilder
-    private func scroll(proxy: ScrollViewProxy, outerGeo: GeometryProxy) -> some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
-                    MessageBubble(message: msg).id(idx)
-                }
-
-                if vm.isSending && vm.streamingBelongsToCurrentChat {
-                    streamingContent
-                }
-
-                bottomAnchor(in: outerGeo)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 18)
-        }
-        .coordinateSpace(name: "scroll")
-        .onPreferenceChange(BottomDistKey.self) { dist in
-            let near = dist < 80
-            if followBottom != near { followBottom = near }
-            // Show jump button whenever scrolled up and there's content below
-            let show = !near
-            if show != showJumpButton { showJumpButton = show }
-        }
-        .onChange(of: vm.displayMessages.count)    { _ in scrollIfFollowing(proxy) }
-        .onChange(of: vm.streamingText)            { _ in scrollIfFollowing(proxy) }
-        .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfFollowing(proxy) }
-        .onChange(of: vm.isSending) { sending in
-            if sending {
-                followBottom = true; showJumpButton = false
-                scrollToBottom(proxy)
-            }
-        }
-        .scrollDismissesKeyboard(.interactively)
-        .onTapGesture { inputFocused = false }
     }
 
     @ViewBuilder
@@ -358,39 +377,8 @@ private struct MessageList: View {
         }
     }
 
-    private func bottomAnchor(in outerGeo: GeometryProxy) -> some View {
-        Color.clear
-            .frame(height: 1)
-            .id("bottom")
-            .background(GeometryReader { geo in
-                Color.clear.preference(
-                    key: BottomDistKey.self,
-                    value: geo.frame(in: .named("scroll")).minY - outerGeo.size.height)
-            })
-    }
-
-    private func jumpButton(_ proxy: ScrollViewProxy) -> some View {
-        Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            followBottom = true
-            showJumpButton = false
-            withAnimation(.easeOut(duration: 0.25)) {
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
-        } label: {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(.primary)
-                .frame(width: 36, height: 36)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(Circle())
-                .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
-        }
-    }
-
-    private func scrollIfFollowing(_ proxy: ScrollViewProxy) {
-        guard followBottom else { return }
+    private func scrollIfAuto(_ proxy: ScrollViewProxy) {
+        guard autoScroll else { return }
         scrollToBottom(proxy)
     }
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -1318,9 +1306,9 @@ private struct InfoBlock: View {
 
 // MARK: - Preference key
 
-private struct BottomDistKey: PreferenceKey {
+private struct BottomVisibleKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+        value = nextValue()
     }
 }

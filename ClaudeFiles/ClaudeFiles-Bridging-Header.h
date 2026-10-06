@@ -14,3 +14,6 @@
 
 // Sandbox extension patching (enables SSV-protected area writes)
 #import "FilzaJailedDS-SSV-Bypass/kexploit/sandbox.h"
+
+// Global exploit state flags (set_exploit_done, set_patching_done)
+#import "FilzaJailedDS-SSV-Bypass/exploit_globals.h"

@@ -97,6 +97,11 @@ final class SandboxManager: ObservableObject {
             return .partial("sandbox_escape returned \(sret) — kernel exploit succeeded but sandbox not fully escaped")
         }
 
+        // Signal that the exploit + escape succeeded so patch_sandbox_ext
+        // knows kernel R/W is available (mirrors what Tweak.m did).
+        set_exploit_done()
+        DebugLog.log("[Sandbox] g_exploitDone set to true")
+
         // Step 4: patch sandbox extensions for SSV-protected writes
         DebugLog.log("[Sandbox] Calling patch_sandbox_ext…")
         progress("Patching sandbox extensions…")

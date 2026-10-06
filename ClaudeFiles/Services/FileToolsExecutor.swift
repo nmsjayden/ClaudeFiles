@@ -191,7 +191,7 @@ final class FileToolsExecutor {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - bash_exec
+    // MARK: - bash_exec (uses popen — works on jailbroken iOS)
 
     private func bashExec(command: String) async -> String {
         guard !command.isEmpty else { return "Error: command required" }
@@ -204,41 +204,36 @@ final class FileToolsExecutor {
 
         DebugLog.log("bashExec: \(command.prefix(100))")
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
+        // Redirect stderr to stdout so we capture both
+        let fullCmd = command + " 2>&1"
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError  = stderr
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-
-            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-            let outStr  = String(data: outData, encoding: .utf8) ?? ""
-            let errStr  = String(data: errData, encoding: .utf8) ?? ""
-
-            let status = process.terminationStatus
-            var result = ""
-            if !outStr.isEmpty { result += outStr }
-            if !errStr.isEmpty { result += (result.isEmpty ? "" : "\n") + "stderr: \(errStr)" }
-            if status != 0 { result += "\n[exit code: \(status)]" }
-            if result.isEmpty { result = "(no output, exit code \(status))" }
-
-            // Truncate
-            if result.count > 20_000 {
-                result = String(result.prefix(20_000)) + "\n[truncated — \(result.count) total chars]"
-            }
-            DebugLog.log("  → bash exit=\(status), output=\(result.count)c")
-            return result
-        } catch {
-            DebugLog.log("  → bash failed: \(error.localizedDescription)")
-            return "Error running command: \(error.localizedDescription)"
+        guard let fp = popen(fullCmd, "r") else {
+            DebugLog.log("  → popen failed, errno=\(errno)")
+            return "Error: popen failed (errno \(errno): \(String(cString: strerror(errno))))"
         }
+
+        var output = Data()
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = fread(&buf, 1, buf.count, fp)
+            if n == 0 { break }
+            output.append(buf, count: n)
+            if output.count > 500_000 { break } // safety cap
+        }
+
+        let status = pclose(fp)
+        // Extract exit code: WEXITSTATUS is (status >> 8) & 0xFF on Darwin
+        let exitCode = Int((status >> 8) & 0xFF)
+
+        var result = String(data: output, encoding: .utf8) ?? "(binary output, \(output.count) bytes)"
+        if exitCode != 0 { result += "\n[exit code: \(exitCode)]" }
+        if result.isEmpty { result = "(no output, exit code \(exitCode))" }
+
+        if result.count > 20_000 {
+            result = String(result.prefix(20_000)) + "\n[truncated — \(result.count) total chars]"
+        }
+        DebugLog.log("  → bash exit=\(exitCode), output=\(result.count)c")
+        return result
     }
 
     // MARK: - grep

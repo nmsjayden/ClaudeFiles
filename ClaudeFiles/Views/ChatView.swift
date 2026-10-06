@@ -294,7 +294,7 @@ private struct MessageList: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
     @State private var autoScroll: Bool = true
-    @State private var isNearBottom: Bool = true
+    @State private var bottomVisible: Bool = true
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -309,25 +309,15 @@ private struct MessageList: View {
                             streamingContent
                         }
 
-                        // Bottom anchor — also tracks scroll position
-                        GeometryReader { geo in
-                            Color.clear.preference(
-                                key: BottomVisibleKey.self,
-                                value: geo.frame(in: .global).minY)
-                        }
-                        .frame(height: 1)
-                        .id("bottom")
+                        // Bottom anchor — uses onAppear/onDisappear to track visibility
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottom")
+                            .onAppear { bottomVisible = true; autoScroll = true }
+                            .onDisappear { bottomVisible = false; autoScroll = false }
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 18)
-                }
-                .onPreferenceChange(BottomVisibleKey.self) { bottomY in
-                    // Screen height as rough container size
-                    let screenH = UIScreen.main.bounds.height
-                    let near = bottomY < screenH + 80
-                    if near != isNearBottom { isNearBottom = near }
-                    if near { autoScroll = true }
-                    if !near { autoScroll = false }
                 }
                 .onChange(of: vm.displayMessages.count)    { _ in scrollIfAuto(proxy) }
                 .onChange(of: vm.streamingText)            { _ in scrollIfAuto(proxy) }
@@ -341,8 +331,8 @@ private struct MessageList: View {
                 .scrollDismissesKeyboard(.interactively)
                 .onTapGesture { inputFocused = false }
 
-                // Jump-to-bottom button — visible when not near bottom
-                if !isNearBottom {
+                // Jump-to-bottom button — visible when bottom anchor is off-screen
+                if !bottomVisible {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         autoScroll = true
@@ -354,14 +344,14 @@ private struct MessageList: View {
                             .font(.system(size: 14, weight: .bold))
                             .foregroundStyle(.primary)
                             .frame(width: 36, height: 36)
-                            .background(Color(.secondarySystemBackground))
+                            .background(.ultraThinMaterial)
                             .clipShape(Circle())
                             .overlay(Circle().stroke(Color(.separator), lineWidth: 0.5))
-                            .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+                            .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
                     }
-                    .padding(.bottom, 10)
-                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
-                    .animation(.easeOut(duration: 0.2), value: isNearBottom)
+                    .padding(.bottom, 12)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    .animation(.spring(response: 0.3, dampingFraction: 0.7), value: bottomVisible)
                 }
             }
         }
@@ -1304,11 +1294,4 @@ private struct InfoBlock: View {
     }
 }
 
-// MARK: - Preference key
-
-private struct BottomVisibleKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
+// (Preference key removed — scroll tracking now uses onAppear/onDisappear)

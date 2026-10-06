@@ -21,6 +21,9 @@ struct ChatMessage: Encodable, Identifiable {
         case .toolResult(let id, let result):
             let block = ToolResultBlock(type: "tool_result", toolUseId: id, content: result)
             try c.encode([block], forKey: .content)
+        case .toolResults(let results):
+            let blocks = results.map { ToolResultBlock(type: "tool_result", toolUseId: $0.toolUseId, content: $0.result) }
+            try c.encode(blocks, forKey: .content)
         }
     }
 }
@@ -29,6 +32,7 @@ enum MessageContent {
     case text(String)
     case blocks([APIBlock])
     case toolResult(toolUseId: String, result: String)
+    case toolResults([(toolUseId: String, result: String)])
 }
 
 // Encodable block for API messages — omits nil fields explicitly

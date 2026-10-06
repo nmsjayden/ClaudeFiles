@@ -353,9 +353,29 @@ final class ChatViewModel: ObservableObject {
 
     private func messagesToAPI(_ msgs: [StoredMessage]) -> [ChatMessage] {
         var result: [ChatMessage] = []
-        for m in msgs {
+        var i = 0
+        while i < msgs.count {
+            let m = msgs[i]
+
             if let toolId = m.toolUseId, let toolResult = m.toolResult {
-                result.append(ChatMessage(role: .user, content: .toolResult(toolUseId: toolId, result: toolResult)))
+                // Collect ALL consecutive tool_result messages into one user message.
+                // The API requires all tool_results for a given assistant turn to be
+                // in a single user message, not separate ones.
+                var toolResults: [(toolUseId: String, result: String)] = [
+                    (toolUseId: toolId, result: toolResult)
+                ]
+                while i + 1 < msgs.count,
+                      let nextToolId = msgs[i + 1].toolUseId,
+                      let nextResult = msgs[i + 1].toolResult {
+                    toolResults.append((toolUseId: nextToolId, result: nextResult))
+                    i += 1
+                }
+                if toolResults.count == 1 {
+                    result.append(ChatMessage(role: .user, content: .toolResult(
+                        toolUseId: toolResults[0].toolUseId, result: toolResults[0].result)))
+                } else {
+                    result.append(ChatMessage(role: .user, content: .toolResults(toolResults)))
+                }
             } else if m.role == "user" {
                 result.append(ChatMessage(role: .user, content: .text(m.text)))
             } else if let blocks = m.apiBlocks, !blocks.isEmpty {
@@ -366,22 +386,12 @@ final class ChatViewModel: ObservableObject {
             } else {
                 result.append(ChatMessage(role: .assistant, content: .text(m.text)))
             }
+            i += 1
         }
 
         // Ensure conversation ends with a user message (API requirement).
-        // If the last message is from the assistant, drop trailing assistant messages.
-        while let last = result.last {
-            switch last.content {
-            case .text(_), .blocks(_):
-                // Check if it's an assistant message
-                if last.role == .assistant {
-                    result.removeLast()
-                } else {
-                    return result
-                }
-            case .toolResult:
-                return result // tool_result is a user message, so we're fine
-            }
+        while let last = result.last, last.role == .assistant {
+            result.removeLast()
         }
 
         return result

@@ -27,9 +27,9 @@
 //   sandbox.m accesses only the `extension_set` pointer field.
 // ---------------------------------------------------------------------------
 struct sandbox_label {
-    uint64_t              platform_profile;  // 0x00  (profile/policy pointer, unused here)
-    struct extension_set *extension_set;     // 0x08  ← accessed by sandbox.m
-    uint64_t              unk2;              // 0x10
+    uint64_t              platform_profile;  // 0x00  (profile/policy pointer)
+    uint64_t              unk1;              // 0x08  (unknown, often 0)
+    struct extension_set *extension_set;     // 0x10  ← confirmed by sandbox_escape.m
     uint64_t              unk3;              // 0x18
 };
 

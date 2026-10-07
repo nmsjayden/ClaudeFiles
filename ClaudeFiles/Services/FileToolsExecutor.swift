@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.2"
+    static let codeVersion = "2024-10-07.3"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -251,6 +251,7 @@ final class FileToolsExecutor {
     // MARK: - bash_exec (remote_call with safe MIG-bypass fallback)
 
     /// Track which execution method works so we don't retry failed ones.
+    private static var posixSpawnOk: Bool? = nil      // nil = untested
     private static var remoteNoMig: Bool? = nil       // nil = untested
     private static var remoteMig: Bool? = nil         // nil = untested
 
@@ -288,6 +289,25 @@ final class FileToolsExecutor {
         B("Sandbox: \(sandboxStatus.label)")
 
         // ════════════════════════════════════════════════════════
+        // TIER 0: posix_spawn via shell_exec() (C function)
+        // Uses posix_spawn("/bin/sh") directly from our process.
+        // Requires credential elevation (kernel r/w patches our
+        // ucred to root + CS_PLATFORM_BINARY). NO thread hijacking,
+        // so NO kernel panics from PAC on iOS 18+.
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.posixSpawnOk != false {
+            B("TIER0: trying posix_spawn via shell_exec()")
+            let result = await tryPosixSpawn(command: command, startTime: startTime)
+            if let output = result {
+                FileToolsExecutor.posixSpawnOk = true
+                return output
+            } else {
+                FileToolsExecutor.posixSpawnOk = false
+                B("TIER0 FAILED — falling through to remote_call tiers")
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
         // TIER 1: remote_call WITHOUT MIG filter bypass
         // The MIG bypass (mig_bypass_resume/pause) is what causes
         // kernel panics on iOS 18+. Try without it first.
@@ -323,9 +343,9 @@ final class FileToolsExecutor {
         B("ALL TIERS FAILED")
         return """
         Error: all execution methods failed.
+        • posix_spawn (TIER 0): \(FileToolsExecutor.posixSpawnOk == false ? "FAILED" : "untested")
         • remote_call (no MIG bypass): \(FileToolsExecutor.remoteNoMig == false ? "FAILED" : "untested")
         • remote_call (MIG bypass): \(FileToolsExecutor.remoteMig == false ? "FAILED/DANGEROUS" : "untested")
-        Note: iOS blocks popen/posix_spawn from apps. Shell execution requires remote_call into a system daemon.
         """
     }
 
@@ -418,6 +438,73 @@ final class FileToolsExecutor {
                 // Both targets failed
                 B("\(tier): all targets failed")
                 once.resume(nil)
+            }
+        }
+    }
+
+    // MARK: - TIER 0: posix_spawn execution via shell_exec()
+
+    /// Try executing command via posix_spawn (shell_exec C function).
+    /// This uses our own process with elevated credentials — no thread hijacking.
+    /// Returns output string or nil if posix_spawn completely fails.
+    private func tryPosixSpawn(command: String, startTime: CFAbsoluteTime) async -> String? {
+        let B = FileToolsExecutor.breadcrumb
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let once = OnceResumeOptional(cont)
+
+            // Timeout — 30s
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 30) {
+                B("TIER0: TIMEOUT 30s")
+                once.resume(nil)
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                B("TIER0: BEFORE elevate_process_credentials()")
+                let elevateRet = elevate_process_credentials()
+                B("TIER0: AFTER elevate_process_credentials() = \(elevateRet)")
+                // Continue even if elevation fails — shell_exec will retry elevation internally
+
+                B("TIER0: BEFORE shell_exec()")
+                var exitCode: Int32 = -1
+                guard let cResult = shell_exec(command, &exitCode) else {
+                    B("TIER0: shell_exec returned NULL")
+                    once.resume(nil)
+                    return
+                }
+                B("TIER0: AFTER shell_exec() exitCode=\(exitCode)")
+
+                var output = String(cString: cResult)
+                free(cResult)
+
+                // Check if shell_exec returned an error message (starts with "Error:" or "posix_spawn failed")
+                if output.hasPrefix("posix_spawn failed") || output.hasPrefix("Error:") {
+                    B("TIER0: shell_exec error: \(output.prefix(200))")
+                    // If it's a permission error, this tier won't work
+                    if output.contains("EPERM") || output.contains("Operation not permitted") ||
+                       output.contains("credential elevation also failed") {
+                        once.resume(nil)
+                        return
+                    }
+                    // Other errors — return as output (command ran but failed)
+                }
+
+                // Truncate if huge
+                if output.count > 20_000 {
+                    output = String(output.prefix(20_000)) + "\n[truncated]"
+                }
+
+                if !output.isEmpty && exitCode != 0 {
+                    output += "\n[exit code: \(exitCode)]"
+                }
+                if output.isEmpty {
+                    output = "(no output, exit code \(exitCode))"
+                }
+
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                B("TIER0 DONE: \(output.count)ch exit=\(exitCode) \(String(format: "%.2f", elapsed))s")
+                DebugLog.log("[bashExec] ✓ TIER0(posix_spawn) exit=\(exitCode) \(output.count)ch \(String(format: "%.2f", elapsed))s")
+                once.resume(output)
             }
         }
     }
@@ -783,9 +870,10 @@ final class FileToolsExecutor {
         lines.append("CodeVersion: \(FileToolsExecutor.codeVersion)")
 
         // Exec tier status
+        let spawnStatus = FileToolsExecutor.posixSpawnOk.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
         let noMigStatus = FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
         let migStatus = FileToolsExecutor.remoteMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        lines.append("Exec: remote(noMIG)=\(noMigStatus) remote(MIG)=\(migStatus)")
+        lines.append("Exec: posix_spawn=\(spawnStatus) remote(noMIG)=\(noMigStatus) remote(MIG)=\(migStatus)")
 
         // Crash breadcrumbs from previous run (survives kernel panics)
         let crumbs = FileToolsExecutor.readBreadcrumbs()

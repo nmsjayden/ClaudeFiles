@@ -224,35 +224,76 @@ final class FileToolsExecutor {
             return "Error: blocked dangerous command"
         }
 
-        // NSLog flushes immediately — DebugLog may not flush before a C-level crash
-        NSLog("[bashExec] START command: %@", String(command.prefix(100)))
-        DebugLog.log("bashExec: \(command.prefix(100))")
+        // ── DIAGNOSTIC DUMP ──
+        // NSLog flushes immediately to syslog — survives C-level crashes.
+        // DebugLog writes to Documents/debug.log — survives app restarts but may not flush before a crash.
+        let startTime = CFAbsoluteTimeGetCurrent()
+        NSLog("╔══════════════════════════════════════════════════════════════")
+        NSLog("║ [bashExec] START")
+        NSLog("║ Command : %@", String(command.prefix(200)))
+        NSLog("║ PID     : %d", ProcessInfo.processInfo.processIdentifier)
+        NSLog("║ Thread  : %@", Thread.current.description)
+        NSLog("╚══════════════════════════════════════════════════════════════")
 
-        // Check sandbox escape — required for remote_call
-        let escaped = await MainActor.run { SandboxManager.shared.status.isUsable }
+        DebugLog.log("[bashExec] ═══ START cmd=\(command.prefix(200)) pid=\(ProcessInfo.processInfo.processIdentifier)")
+
+        // ── SANDBOX STATE CHECK ──
+        let sandboxStatus = await MainActor.run { SandboxManager.shared.status }
+        let escaped = sandboxStatus.isUsable
+        NSLog("[bashExec] Sandbox status: %@ (isUsable=%d, isEscaped=%d, isPartial=%d)",
+              sandboxStatus.label, escaped ? 1 : 0,
+              sandboxStatus.isEscaped ? 1 : 0,
+              sandboxStatus.isPartial ? 1 : 0)
+        DebugLog.log("[bashExec] Sandbox: \(sandboxStatus.label) usable=\(escaped)")
+
         guard escaped else {
-            NSLog("[bashExec] ABORT: sandbox escape not active")
-            return "Error: sandbox escape required for bash_exec. Run the exploit first."
+            NSLog("[bashExec] ✘ ABORT: sandbox escape not active (status=%@)", sandboxStatus.label)
+            return "Error: sandbox escape required for bash_exec. Run the exploit first. Current status: \(sandboxStatus.label)"
         }
-        NSLog("[bashExec] Sandbox escape confirmed")
 
-        // Pre-flight: try to verify target process exists via sysctl.
-        // NOTE: sysctl(KERN_PROC_ALL) from a sandboxed app usually CANNOT see system
-        // daemons like mediaserverd — the sandbox restricts process visibility.
-        // So this is a soft check (log only). init_remote_call finds the process
-        // through kernel r/w which bypasses sysctl visibility restrictions.
+        // ── PROCESS VISIBILITY CHECK ──
+        // sysctl(KERN_PROC_ALL) from sandbox usually can't see system daemons.
+        // This is informational — init_remote_call uses kernel r/w to find them.
+        var visibleCount = 0
+        var visibleDaemons: [String] = []
+        let targetCandidates = ["mediaserverd", "backboardd", "SpringBoard", "launchd", "CommCenter"]
+        for name in targetCandidates {
+            if let pid = findPid(byName: name) {
+                visibleDaemons.append("\(name)(\(pid))")
+                visibleCount += 1
+            }
+        }
+        NSLog("[bashExec] Process visibility: %d/%d daemons visible via sysctl: [%@]",
+              visibleCount, targetCandidates.count, visibleDaemons.joined(separator: ", "))
+
+        // Also count total visible processes
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+        if sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0 {
+            let totalProcs = size / MemoryLayout<kinfo_proc>.stride
+            NSLog("[bashExec] Total processes visible via sysctl: %d", totalProcs)
+        }
+
         let targetProcess: String
-        if let pid = findPid(byName: "mediaserverd") {
+        if visibleDaemons.contains(where: { $0.hasPrefix("mediaserverd") }) {
             targetProcess = "mediaserverd"
-            NSLog("[bashExec] Pre-flight: mediaserverd found via sysctl (pid %d)", pid)
-        } else if let pid = findPid(byName: "backboardd") {
+        } else if visibleDaemons.contains(where: { $0.hasPrefix("backboardd") }) {
             targetProcess = "backboardd"
-            NSLog("[bashExec] Pre-flight: backboardd found via sysctl (pid %d)", pid)
         } else {
-            // Can't see them via sysctl — expected from sandbox. Proceed anyway;
-            // init_remote_call uses kernel r/w to find the process.
             targetProcess = "mediaserverd"
-            NSLog("[bashExec] Pre-flight: daemons not visible via sysctl (sandbox). Proceeding with mediaserverd via kernel r/w.")
+            NSLog("[bashExec] ⚠ Target daemons not visible via sysctl (expected in sandbox). Will use kernel r/w to find mediaserverd.")
+        }
+        NSLog("[bashExec] Target process: %@", targetProcess)
+
+        // ── KERNEL R/W QUICK TEST ──
+        // Try a harmless kread to verify kernel r/w is still working before init_remote_call
+        let selfProc = proc_self()
+        NSLog("[bashExec] Kernel r/w check: proc_self() = 0x%llx", selfProc)
+        DebugLog.log("[bashExec] proc_self=0x\(String(selfProc, radix: 16))")
+        if selfProc == 0 {
+            NSLog("[bashExec] ✘ proc_self() returned 0 — kernel r/w may be dead!")
+            DebugLog.log("[bashExec] ✘ ABORT: proc_self=0, kernel r/w dead")
+            return "Error: kernel read/write appears to be dead (proc_self returned NULL). The exploit may need to be re-run."
         }
 
         let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"
@@ -262,55 +303,80 @@ final class FileToolsExecutor {
 
             // Timeout — 30s to allow serial queue wait + execution
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 30) {
-                NSLog("[bashExec] TIMEOUT after 30s")
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                NSLog("[bashExec] ✘ TIMEOUT after 30s (wall time: %.1fs)", elapsed)
                 once.resume("Error: bash_exec timed out after 30s")
             }
 
             // Serialize all remote_call access — the C globals are NOT thread-safe
             FileToolsExecutor.remoteCallQueue.async { [self] in
-                NSLog("[bashExec] Acquired serial queue, attaching to %@…", targetProcess)
+                let queueWait = CFAbsoluteTimeGetCurrent() - startTime
+                NSLog("[bashExec] ▶ Acquired serial queue (waited %.2fs)", queueWait)
+                NSLog("[bashExec] ▶ Calling init_remote_call(\"%@\", useMigFilter=true)…", targetProcess)
 
+                let t0 = CFAbsoluteTimeGetCurrent()
                 let initRet = init_remote_call(targetProcess, true)
-                NSLog("[bashExec] init_remote_call(%@) returned: %d", targetProcess, initRet)
+                let t1 = CFAbsoluteTimeGetCurrent()
+
+                NSLog("[bashExec] ◀ init_remote_call(%@) returned %d in %.3fs", targetProcess, initRet, t1 - t0)
+                DebugLog.log("[bashExec] init_remote_call(\(targetProcess))=\(initRet) in \(String(format: "%.3f", t1 - t0))s")
 
                 guard initRet == 0 else {
                     // Try fallback only if primary was mediaserverd
                     if targetProcess == "mediaserverd" {
-                        NSLog("[bashExec] Trying backboardd as fallback…")
+                        NSLog("[bashExec] ▶ Primary failed, trying backboardd…")
+                        let t2 = CFAbsoluteTimeGetCurrent()
                         let initRet2 = init_remote_call("backboardd", true)
-                        NSLog("[bashExec] init_remote_call(backboardd) returned: %d", initRet2)
+                        let t3 = CFAbsoluteTimeGetCurrent()
+                        NSLog("[bashExec] ◀ init_remote_call(backboardd) returned %d in %.3fs", initRet2, t3 - t2)
+                        DebugLog.log("[bashExec] init_remote_call(backboardd)=\(initRet2) in \(String(format: "%.3f", t3 - t2))s")
+
                         guard initRet2 == 0 else {
+                            NSLog("[bashExec] ✘ Both daemons failed: mediaserverd=%d, backboardd=%d", initRet, initRet2)
                             once.resume("Error: could not attach to any system daemon (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
                             return
                         }
-                        defer { destroy_remote_call() }
+                        defer {
+                            NSLog("[bashExec] ▶ destroy_remote_call (backboardd)…")
+                            destroy_remote_call()
+                            NSLog("[bashExec] ◀ destroy_remote_call done")
+                        }
 
-                        // Verify trojan memory was allocated
                         let trojanAddr = g_RC_trojanMem
                         NSLog("[bashExec] g_RC_trojanMem (backboardd) = 0x%llx", trojanAddr)
                         guard trojanAddr != 0 else {
+                            NSLog("[bashExec] ✘ trojanMem is NULL after successful init!")
                             once.resume("Error: remote trojan memory not allocated (backboardd). init succeeded but shared memory is null.")
                             return
                         }
 
-                        self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
+                        self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once, startTime: startTime)
                         return
                     }
                     once.resume("Error: init_remote_call(\(targetProcess)) failed with code \(initRet). Is sandbox escape active?")
                     return
                 }
 
-                defer { destroy_remote_call() }
+                defer {
+                    NSLog("[bashExec] ▶ destroy_remote_call (%@)…", targetProcess)
+                    destroy_remote_call()
+                    NSLog("[bashExec] ◀ destroy_remote_call done")
+                }
 
                 // Verify trojan memory was actually allocated before writing to it
                 let trojanAddr = g_RC_trojanMem
-                NSLog("[bashExec] g_RC_trojanMem = 0x%llx", trojanAddr)
+                NSLog("[bashExec] g_RC_trojanMem = 0x%llx (page-aligned: %@)",
+                      trojanAddr, (trojanAddr & 0xFFF) == 0 ? "YES" : "NO")
+                DebugLog.log("[bashExec] trojanMem=0x\(String(trojanAddr, radix: 16))")
+
                 guard trojanAddr != 0 else {
+                    NSLog("[bashExec] ✘ trojanMem is NULL after successful init!")
                     once.resume("Error: remote trojan memory not allocated. init_remote_call succeeded but shared memory is null.")
                     return
                 }
 
-                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
+                NSLog("[bashExec] ✓ All checks passed, executing command…")
+                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once, startTime: startTime)
             }
         }
     }
@@ -333,35 +399,55 @@ final class FileToolsExecutor {
     /// Execute a command string via system() in the currently-attached remote process.
     /// Captures output by redirecting to a temp file, then reads it back.
     private func executeViaRemoteCall(command: String, tmpOut: String,
-                                       once: OnceResume) {
+                                       once: OnceResume, startTime: CFAbsoluteTime) {
         // Build the shell command that redirects output to our temp file
         let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
 
-        NSLog("[bashExec] Writing command to trojan mem at 0x%llx (%d bytes)…",
-              g_RC_trojanMem, wrappedCmd.utf8.count)
+        let trojanAddr = g_RC_trojanMem
+        let cmdLen = wrappedCmd.utf8.count
+        NSLog("[bashExec] ▶ remote_writeStr(0x%llx, %d bytes)…", trojanAddr, cmdLen)
+        NSLog("[bashExec]   Wrapped command: %@", String(wrappedCmd.prefix(300)))
 
-        // Write command string to trojan shared memory page
-        guard remote_writeStr(g_RC_trojanMem, wrappedCmd) else {
-            NSLog("[bashExec] remote_writeStr FAILED")
-            once.resume("Error: failed to write command to remote process memory")
+        // Safety: trojan memory page is 4096 bytes — don't overflow
+        guard cmdLen < 4096 else {
+            NSLog("[bashExec] ✘ Command too long for trojan page: %d bytes (max 4095)", cmdLen)
+            once.resume("Error: command too long (\(cmdLen) bytes). Max is ~4095 bytes for remote execution.")
             return
         }
 
-        NSLog("[bashExec] remote_writeStr succeeded, calling system() via do_remote_call_stable…")
+        // Write command string to trojan shared memory page
+        guard remote_writeStr(trojanAddr, wrappedCmd) else {
+            NSLog("[bashExec] ✘ remote_writeStr FAILED (trojan=0x%llx)", trojanAddr)
+            DebugLog.log("[bashExec] ✘ remote_writeStr failed at 0x\(String(trojanAddr, radix: 16))")
+            once.resume("Error: failed to write command to remote process memory at 0x\(String(trojanAddr, radix: 16))")
+            return
+        }
+        NSLog("[bashExec] ✓ remote_writeStr succeeded")
 
-        // Call system(g_RC_trojanMem) — system() is in libSystem and available everywhere
+        // ── CALL system() IN REMOTE PROCESS ──
+        NSLog("[bashExec] ▶ do_remote_call_stable(timeout=10000, \"system\", 0x%llx)…", trojanAddr)
+        let t0 = CFAbsoluteTimeGetCurrent()
         let result = do_remote_call_stable(10000, "system",
-                                            g_RC_trojanMem, 0, 0, 0, 0, 0, 0, 0)
+                                            trojanAddr, 0, 0, 0, 0, 0, 0, 0)
+        let t1 = CFAbsoluteTimeGetCurrent()
 
-        NSLog("[bashExec] system() returned: %llu", result)
-        DebugLog.log("[bashExec] system() returned: \(result)")
+        NSLog("[bashExec] ◀ system() returned: 0x%llx (%llu) in %.3fs", result, result, t1 - t0)
+        DebugLog.log("[bashExec] system()=0x\(String(result, radix: 16)) (\(result)) in \(String(format: "%.3f", t1 - t0))s")
 
         // Small delay to let output file finish writing
         usleep(100_000) // 100ms
 
-        // Read back the output file
-        if let data = FileManager.default.contents(atPath: tmpOut),
+        // ── READ OUTPUT FILE ──
+        NSLog("[bashExec] ▶ Reading output from %@…", tmpOut)
+
+        // Check if file exists first
+        let fileExists = FileManager.default.fileExists(atPath: tmpOut)
+        NSLog("[bashExec]   File exists: %@", fileExists ? "YES" : "NO")
+
+        if fileExists,
+           let data = FileManager.default.contents(atPath: tmpOut),
            let output = String(data: data, encoding: .utf8) {
+            NSLog("[bashExec]   Raw output: %d bytes", data.count)
             // Clean up temp file
             try? FileManager.default.removeItem(atPath: tmpOut)
 
@@ -386,13 +472,19 @@ final class FileToolsExecutor {
             if text.count > 20_000 {
                 text = String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
             }
-            DebugLog.log("[bashExec] Output: \(text.count) chars, exit=\(exitCode)")
+
+            let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+            NSLog("[bashExec] ✓ DONE: %d chars, exit=%@, total=%.2fs", text.count, exitCode, totalTime)
+            DebugLog.log("[bashExec] ✓ DONE: \(text.count) chars, exit=\(exitCode), total=\(String(format: "%.2f", totalTime))s")
+            DebugLog.log("[bashExec] Output preview: \(text.prefix(500))")
             once.resume(text)
         } else {
-            // Couldn't read output file — return the system() return value
-            DebugLog.log("[bashExec] Could not read output file \(tmpOut)")
-            // Try POSIX read as fallback
+            // Couldn't read output file — try POSIX read as fallback
+            NSLog("[bashExec] ⚠ FileManager couldn't read %@, trying POSIX open…", tmpOut)
+            DebugLog.log("[bashExec] ⚠ Could not read output file \(tmpOut), trying POSIX")
             let fd = open(tmpOut, O_RDONLY)
+            NSLog("[bashExec]   POSIX open() fd=%d (errno=%d: %s)", fd, errno,
+                  fd < 0 ? strerror(errno) : "ok")
             if fd >= 0 {
                 var buf = [UInt8](repeating: 0, count: 20_001)
                 let n = read(fd, &buf, 20_000)
@@ -400,10 +492,18 @@ final class FileToolsExecutor {
                 unlink(tmpOut)
                 if n > 0 {
                     let text = String(bytes: buf[0..<n], encoding: .utf8) ?? "(binary output, \(n) bytes)"
+                    let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+                    NSLog("[bashExec] ✓ POSIX read: %d bytes, total=%.2fs", n, totalTime)
                     once.resume(text)
                     return
                 }
+                NSLog("[bashExec]   POSIX read returned %d bytes", n)
             }
+
+            let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+            NSLog("[bashExec] ⚠ No output file. system() returned 0x%llx. total=%.2fs", result, totalTime)
+            NSLog("[bashExec]   Possible causes: /tmp not writable from target, command failed silently, or target process lacks shell")
+            DebugLog.log("[bashExec] ⚠ No output. system()=0x\(String(result, radix: 16)) total=\(String(format: "%.2f", totalTime))s")
             once.resume("Command executed (system() returned \(result)). Output file not readable — the command may not have produced output, or /tmp may not be writable from the target process.")
         }
     }

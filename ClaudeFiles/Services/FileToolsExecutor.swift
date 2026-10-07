@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.3"
+    static let codeVersion = "2024-10-07.4"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -460,10 +460,9 @@ final class FileToolsExecutor {
             }
 
             DispatchQueue.global(qos: .userInitiated).async {
-                B("TIER0: BEFORE elevate_process_credentials()")
-                let elevateRet = elevate_process_credentials()
-                B("TIER0: AFTER elevate_process_credentials() = \(elevateRet)")
-                // Continue even if elevation fails — shell_exec will retry elevation internally
+                // NOTE: Do NOT call elevate_process_credentials() here.
+                // On iOS 18.1, writing to ucred (PPL-protected zone) causes kernel panic.
+                // Try posix_spawn first without elevation — sandbox escape may be enough.
 
                 B("TIER0: BEFORE shell_exec()")
                 var exitCode: Int32 = -1

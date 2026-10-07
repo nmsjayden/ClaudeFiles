@@ -186,48 +186,11 @@ char *shell_exec(const char *command, int *exit_code) {
         fprintf(stderr, "[shell_exec] posix_spawn failed: %d (%s)\n", ret, strerror(ret));
         free(wrapped);
 
-        // If EPERM or similar, try elevating credentials and retry
-        if (!g_creds_elevated && (ret == EPERM || ret == EACCES || ret == 1)) {
-            fprintf(stderr, "[shell_exec] Trying credential elevation...\n");
-            if (elevate_process_credentials() == 0) {
-                fprintf(stderr, "[shell_exec] Retrying posix_spawn after elevation...\n");
-
-                posix_spawn_file_actions_t actions2;
-                posix_spawn_file_actions_init(&actions2);
-                posix_spawnattr_t attr2;
-                posix_spawnattr_init(&attr2);
-
-                // Rebuild wrapped since we freed it... actually let's re-malloc
-                wrapped = (char *)malloc(cmdlen);
-                snprintf(wrapped, cmdlen, "(%s) > %s 2>&1; echo $? >> %s", command, tmpfile, tmpfile);
-                char *argv2[] = { "/bin/sh", "-c", wrapped, NULL };
-
-                ret = posix_spawn(&pid, "/bin/sh", &actions2, &attr2, argv2, envp);
-
-                posix_spawn_file_actions_destroy(&actions2);
-                posix_spawnattr_destroy(&attr2);
-                free(wrapped);
-
-                if (ret != 0) {
-                    fprintf(stderr, "[shell_exec] posix_spawn still failed after elevation: %d (%s)\n",
-                            ret, strerror(ret));
-                    if (exit_code) *exit_code = ret;
-                    char errbuf[256];
-                    snprintf(errbuf, sizeof(errbuf),
-                             "posix_spawn failed: %d (%s) — even after credential elevation",
-                             ret, strerror(ret));
-                    return strdup(errbuf);
-                }
-                // Fall through to waitpid
-            } else {
-                if (exit_code) *exit_code = ret;
-                char errbuf[256];
-                snprintf(errbuf, sizeof(errbuf),
-                         "posix_spawn failed: %d (%s) — credential elevation also failed",
-                         ret, strerror(ret));
-                return strdup(errbuf);
-            }
-        } else {
+        // NOTE: Do NOT call elevate_process_credentials() here.
+        // On iOS 18.1+, writing to ucred/cs_flags causes kernel panic
+        // because those structures are in PPL-protected memory zones.
+        // Just report the posix_spawn failure so the caller can try other tiers.
+        {
             if (exit_code) *exit_code = ret;
             char errbuf[256];
             snprintf(errbuf, sizeof(errbuf), "posix_spawn failed: %d (%s)", ret, strerror(ret));

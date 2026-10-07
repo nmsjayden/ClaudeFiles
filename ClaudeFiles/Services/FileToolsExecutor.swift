@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.4"
+    static let codeVersion = "2024-10-07.5"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -295,57 +295,27 @@ final class FileToolsExecutor {
         // ucred to root + CS_PLATFORM_BINARY). NO thread hijacking,
         // so NO kernel panics from PAC on iOS 18+.
         // ════════════════════════════════════════════════════════
-        if FileToolsExecutor.posixSpawnOk != false {
-            B("TIER0: trying posix_spawn via shell_exec()")
-            let result = await tryPosixSpawn(command: command, startTime: startTime)
-            if let output = result {
-                FileToolsExecutor.posixSpawnOk = true
-                return output
-            } else {
-                FileToolsExecutor.posixSpawnOk = false
-                B("TIER0 FAILED — falling through to remote_call tiers")
-            }
+        // Only TIER 0 is safe on iOS 18.1+.
+        // TIER 1 & 2 (remote_call / thread hijacking) cause kernel panics
+        // due to PAC enforcement on arm64e. They are permanently disabled.
+        B("TIER0: trying posix_spawn via shell_exec()")
+        let result = await tryPosixSpawn(command: command, startTime: startTime)
+        if let output = result {
+            FileToolsExecutor.posixSpawnOk = true
+            return output
         }
 
-        // ════════════════════════════════════════════════════════
-        // TIER 1: remote_call WITHOUT MIG filter bypass
-        // The MIG bypass (mig_bypass_resume/pause) is what causes
-        // kernel panics on iOS 18+. Try without it first.
-        // ════════════════════════════════════════════════════════
-        if FileToolsExecutor.remoteNoMig != false {
-            B("TIER1: trying remote_call WITHOUT MIG bypass (safe)")
-            let result = await tryRemoteCall(command: command, useMigBypass: false, startTime: startTime)
-            if let output = result {
-                FileToolsExecutor.remoteNoMig = true
-                return output
-            } else {
-                FileToolsExecutor.remoteNoMig = false
-                B("TIER1 FAILED")
-            }
-        }
+        FileToolsExecutor.posixSpawnOk = false
+        B("TIER0 FAILED — no safe fallback available")
 
-        // ════════════════════════════════════════════════════════
-        // TIER 2: remote_call WITH MIG filter bypass (DANGEROUS)
-        // This causes kernel panics on iOS 18+. Last resort only.
-        // ════════════════════════════════════════════════════════
-        if FileToolsExecutor.remoteMig != false {
-            B("TIER2: trying remote_call WITH MIG bypass (DANGEROUS on iOS 18+)")
-            let result = await tryRemoteCall(command: command, useMigBypass: true, startTime: startTime)
-            if let output = result {
-                FileToolsExecutor.remoteMig = true
-                return output
-            } else {
-                FileToolsExecutor.remoteMig = false
-                B("TIER2 FAILED")
-            }
-        }
+        // Do NOT fall through to remote_call tiers.
+        // init_remote_call() uses thread hijacking which triggers PAC
+        // kernel panics on iOS 18.1+ arm64e devices.
 
-        B("ALL TIERS FAILED")
         return """
-        Error: all execution methods failed.
-        • posix_spawn (TIER 0): \(FileToolsExecutor.posixSpawnOk == false ? "FAILED" : "untested")
-        • remote_call (no MIG bypass): \(FileToolsExecutor.remoteNoMig == false ? "FAILED" : "untested")
-        • remote_call (MIG bypass): \(FileToolsExecutor.remoteMig == false ? "FAILED/DANGEROUS" : "untested")
+        Error: posix_spawn failed. \
+        Thread hijacking (remote_call) is disabled — it causes kernel panics on iOS 18.1+ due to PAC. \
+        The sandbox escape is active but the process may lack credentials to spawn /bin/sh.
         """
     }
 
@@ -868,11 +838,9 @@ final class FileToolsExecutor {
         // Code version (bump on every push so we know if device has latest)
         lines.append("CodeVersion: \(FileToolsExecutor.codeVersion)")
 
-        // Exec tier status
+        // Exec tier status (remote_call tiers disabled — kernel panic on iOS 18.1+)
         let spawnStatus = FileToolsExecutor.posixSpawnOk.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        let noMigStatus = FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        let migStatus = FileToolsExecutor.remoteMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        lines.append("Exec: posix_spawn=\(spawnStatus) remote(noMIG)=\(noMigStatus) remote(MIG)=\(migStatus)")
+        lines.append("Exec: posix_spawn=\(spawnStatus) remote_call=disabled(PAC)")
 
         // Crash breadcrumbs from previous run (survives kernel panics)
         let crumbs = FileToolsExecutor.readBreadcrumbs()

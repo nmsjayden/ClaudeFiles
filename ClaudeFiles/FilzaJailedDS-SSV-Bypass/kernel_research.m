@@ -465,7 +465,25 @@ char *kresearch_swap_sandbox_profile(void) {
     gather_proc_info(proc_self(), &self_info);
 
     if (!kaddr_ok(self_info.sandbox)) {
-        buf_append("ERROR: No sandbox_label found\n");
+        buf_append("ERROR: No sandbox_label found. Chain diagnostics:\n");
+        buf_append("  proc_self(): 0x%llx  %s\n", self_info.proc,
+                   kaddr_ok(self_info.proc) ? "OK" : "INVALID");
+        buf_append("  proc_ro:     0x%llx  %s\n", self_info.proc_ro,
+                   kaddr_ok(self_info.proc_ro) ? "OK" : "INVALID");
+        buf_append("  ucred:       0x%llx  %s\n", self_info.ucred,
+                   kaddr_ok(self_info.ucred) ? "OK" : "INVALID");
+        buf_append("  label:       0x%llx  %s\n", self_info.label,
+                   kaddr_ok(self_info.label) ? "OK" : "INVALID");
+        buf_append("  sandbox:     0x%llx  %s\n", self_info.sandbox,
+                   kaddr_ok(self_info.sandbox) ? "OK" : "INVALID");
+        if (kaddr_ok(self_info.label)) {
+            // Try reading the sandbox slot directly
+            uint64_t raw = kread64(self_info.label + off_label_l_perpolicy_sandbox);
+            uint64_t stripped = kread_ptr(self_info.label + off_label_l_perpolicy_sandbox);
+            buf_append("  label+0x%x raw=0x%llx stripped=0x%llx\n",
+                       off_label_l_perpolicy_sandbox, raw, stripped);
+        }
+        buf_append("\nTry 'kresearch dump_self' to check full proc chain.\n");
         return buf_finish();
     }
 

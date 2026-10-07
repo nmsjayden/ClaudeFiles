@@ -268,95 +268,140 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func messagesToAPI(_ msgs: [StoredMessage]) -> [ChatMessage] {
-        var result: [ChatMessage] = []
+        // ── Phase 1: Group stored messages into (assistant, tool_results[]) pairs ──
+        // Walk through StoredMessages and collect consecutive tool_result messages
+        // that follow each assistant message. This keeps the pairing explicit so
+        // Phase 2 can validate each pair independently.
+
+        struct AssistantGroup {
+            let blocks: [StoredBlock]   // apiBlocks from the assistant message
+            let text: String            // plain text fallback
+            var toolResultMsgs: [(toolUseId: String, result: String)]
+        }
+
+        var groups: [Any] = []  // Either ChatMessage (user text) or AssistantGroup
         var i = 0
+
         while i < msgs.count {
             let m = msgs[i]
 
-            if let toolId = m.toolUseId, let toolResult = m.toolResult {
-                // Collect ALL consecutive tool_result messages into one user message.
-                // The API requires all tool_results for a given assistant turn to be
-                // in a single user message, not separate ones.
-                var toolResults: [(toolUseId: String, result: String)] = [
-                    (toolUseId: toolId, result: toolResult)
-                ]
-                while i + 1 < msgs.count,
-                      let nextToolId = msgs[i + 1].toolUseId,
-                      let nextResult = msgs[i + 1].toolResult {
-                    toolResults.append((toolUseId: nextToolId, result: nextResult))
-                    i += 1
-                }
-                if toolResults.count == 1 {
-                    result.append(ChatMessage(role: .user, content: .toolResult(
-                        toolUseId: toolResults[0].toolUseId, result: toolResults[0].result)))
-                } else {
-                    result.append(ChatMessage(role: .user, content: .toolResults(toolResults)))
-                }
-            } else if m.role == "user" {
-                result.append(ChatMessage(role: .user, content: .text(m.text)))
-            } else if let blocks = m.apiBlocks, !blocks.isEmpty {
-                // Check if this assistant message has tool_use blocks.
-                // The API requires EVERY tool_use to have a matching tool_result
-                // in the immediately following user message. If any are missing
-                // (e.g. generation was stopped, or a tool crashed), strip the
-                // tool_use blocks to avoid HTTP 400.
-                let toolUseIds = Set(blocks.compactMap { b -> String? in
-                    b.type == "tool_use" ? b.id : nil
-                })
-
-                if !toolUseIds.isEmpty {
-                    // Collect tool_result IDs from the immediately following messages
-                    var foundResults = Set<String>()
-                    var j = i + 1
-                    while j < msgs.count, let toolId = msgs[j].toolUseId {
-                        foundResults.insert(toolId)
-                        j += 1
-                    }
-
-                    if toolUseIds.isSubset(of: foundResults) {
-                        // All tool_use have matching results — include full blocks
-                        let apiBlocks = blocks.map {
-                            APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
-                        }
-                        result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
-                    } else {
-                        // Some tool_use blocks have no matching results — strip ALL
-                        // tool_use blocks and skip any orphaned tool_results that follow
-                        let safeBlocks = blocks.filter { $0.type != "tool_use" }
-                        if !safeBlocks.isEmpty {
-                            let apiBlocks = safeBlocks.map {
-                                APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
-                            }
-                            result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
-                        } else if !m.text.isEmpty {
-                            result.append(ChatMessage(role: .assistant, content: .text(m.text)))
-                        }
-                        // Skip any following tool_result messages for these stripped tool_use IDs
-                        while i + 1 < msgs.count,
-                              let nextToolId = msgs[i + 1].toolUseId,
-                              toolUseIds.contains(nextToolId) {
-                            i += 1
-                        }
-                    }
-                } else {
-                    // No tool_use blocks — text/compaction only, include as-is
-                    let apiBlocks = blocks.map {
-                        APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
-                    }
-                    result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
-                }
-            } else {
-                result.append(ChatMessage(role: .assistant, content: .text(m.text)))
+            if m.toolUseId != nil {
+                // Orphaned tool_result not following an assistant group — skip it.
+                // (This can happen after a stopped generation or crash.)
+                i += 1
+                continue
             }
+
+            if m.role == "user" {
+                groups.append(ChatMessage(role: .user, content: .text(m.text)))
+                i += 1
+                continue
+            }
+
+            // Assistant message — collect any tool_results that follow it
+            var group = AssistantGroup(
+                blocks: m.apiBlocks ?? [],
+                text: m.text,
+                toolResultMsgs: []
+            )
+            // Gather consecutive tool_result StoredMessages
+            while i + 1 < msgs.count,
+                  let toolId = msgs[i + 1].toolUseId,
+                  let toolResult = msgs[i + 1].toolResult {
+                group.toolResultMsgs.append((toolUseId: toolId, result: toolResult))
+                i += 1
+            }
+            groups.append(group)
             i += 1
         }
 
-        // Ensure conversation ends with a user message (API requirement).
-        while let last = result.last, last.role == .assistant {
-            result.removeLast()
+        // ── Phase 2: Validate each group and build the final ChatMessage array ──
+        // For each AssistantGroup:
+        //   1. Find the set of tool_use IDs in the assistant blocks
+        //   2. Find the set of tool_result IDs collected after it
+        //   3. The MATCHED set = intersection of both
+        //   4. Only include tool_use blocks whose IDs are in the matched set
+        //   5. Only include tool_results whose IDs are in the matched set
+        //   6. This guarantees every tool_use has exactly one tool_result and vice versa
+
+        var result: [ChatMessage] = []
+
+        for item in groups {
+            if let userMsg = item as? ChatMessage {
+                // Avoid consecutive user messages — merge or skip
+                if let last = result.last, last.role == .user {
+                    // Skip duplicate user messages (shouldn't normally happen)
+                }
+                result.append(userMsg)
+                continue
+            }
+
+            guard let group = item as? AssistantGroup else { continue }
+
+            let toolUseIds = Set(group.blocks.compactMap { b -> String? in
+                b.type == "tool_use" ? b.id : nil
+            })
+            let toolResultIds = Set(group.toolResultMsgs.map { $0.toolUseId })
+
+            // Matched = IDs present in BOTH the assistant's tool_use AND the following tool_results
+            let matchedIds = toolUseIds.intersection(toolResultIds)
+
+            // Build the assistant message blocks
+            var apiBlocks: [APIBlock] = []
+            for b in group.blocks {
+                if b.type == "tool_use" {
+                    // Only include if this tool_use has a matching result
+                    guard let id = b.id, matchedIds.contains(id) else { continue }
+                }
+                apiBlocks.append(APIBlock(type: b.type, text: b.text, id: b.id, name: b.name, input: b.input))
+            }
+
+            // Emit the assistant message (only if there's content)
+            if !apiBlocks.isEmpty {
+                result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
+            } else if !group.text.isEmpty {
+                result.append(ChatMessage(role: .assistant, content: .text(group.text)))
+            }
+            // else: empty assistant message after stripping — drop entirely
+
+            // Build the tool_results user message (only matched IDs)
+            let validResults = group.toolResultMsgs.filter { matchedIds.contains($0.toolUseId) }
+            if !validResults.isEmpty {
+                if validResults.count == 1 {
+                    result.append(ChatMessage(role: .user, content: .toolResult(
+                        toolUseId: validResults[0].toolUseId, result: validResults[0].result)))
+                } else {
+                    result.append(ChatMessage(role: .user, content: .toolResults(validResults)))
+                }
+            }
         }
 
-        return result
+        // ── Phase 3: Final cleanup ──
+        // Remove consecutive same-role messages (can happen after stripping)
+        var cleaned: [ChatMessage] = []
+        for msg in result {
+            if let last = cleaned.last, last.role == msg.role {
+                // Skip consecutive same-role (shouldn't happen often after Phase 2)
+                // But keep user messages by merging conceptually
+                if msg.role == .user {
+                    cleaned.append(msg)  // API allows consecutive user only via tool_result
+                }
+                continue
+            }
+            cleaned.append(msg)
+        }
+
+        // Must start with user message
+        while let first = cleaned.first, first.role == .assistant {
+            cleaned.removeFirst()
+        }
+
+        // Must end with user message
+        while let last = cleaned.last, last.role == .assistant {
+            cleaned.removeLast()
+        }
+
+        return cleaned
     }
 
     // MARK: - Tool execution

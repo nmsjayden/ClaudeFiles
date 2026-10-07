@@ -3,6 +3,9 @@ import UIKit
 
 final class FileToolsExecutor {
 
+    /// Bump this every time code changes so device_info confirms the build is current.
+    static let codeVersion = "2024-10-07.2"
+
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
     /// Serial queue to prevent concurrent access to non-thread-safe remote_call globals.
@@ -775,6 +778,9 @@ final class FileToolsExecutor {
         if level >= 0 {
             lines.append("Battery: \(Int(level * 100))%")
         }
+
+        // Code version (bump on every push so we know if device has latest)
+        lines.append("CodeVersion: \(FileToolsExecutor.codeVersion)")
 
         // Exec tier status
         let noMigStatus = FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"

@@ -32,9 +32,16 @@ final class AuthManager: NSObject, ObservableObject {
     // MARK: - Start login (opens Safari to Claude.ai → shows code on page)
 
     func startLogin(anchor: ASPresentationAnchor) {
+        // Reset ALL state from any previous attempt
         isLoading    = true
         errorMessage = nil
         awaitingCode = false
+        authSession?.cancel()
+        authSession  = nil
+
+        // Clear any stale tokens from a revoked session
+        keychainDelete("access_token")
+        keychainDelete("refresh_token")
 
         let verifier  = randomBase64(32)
         let challenge = pkceChallenge(verifier)
@@ -54,7 +61,13 @@ final class AuthManager: NSObject, ObservableObject {
             .init(name: "code_challenge_method", value: "S256"),
             .init(name: "state",                 value: state),
         ]
-        guard let url = c.url else { isLoading = false; return }
+        guard let url = c.url else {
+            isLoading = false
+            errorMessage = "Failed to build OAuth URL"
+            return
+        }
+
+        DebugLog.log("[Auth] Opening OAuth: \(url.absoluteString.prefix(120))…")
 
         let provider = AnchorProvider(anchor: anchor)
         anchorProvider = provider
@@ -64,15 +77,26 @@ final class AuthManager: NSObject, ObservableObject {
         let session = ASWebAuthenticationSession(
             url: url,
             callbackURLScheme: nil
-        ) { [weak self] _, _ in
+        ) { [weak self] callbackURL, error in
             Task { @MainActor [weak self] in
+                if let error {
+                    DebugLog.log("[Auth] ASWebAuth completed with error: \(error.localizedDescription)")
+                }
                 self?.isLoading = false
                 self?.awaitingCode = true   // show paste UI
             }
         }
         session.presentationContextProvider = provider
         session.prefersEphemeralWebBrowserSession = false
-        session.start()
+
+        let started = session.start()
+        DebugLog.log("[Auth] ASWebAuthenticationSession.start() → \(started)")
+
+        if !started {
+            isLoading = false
+            errorMessage = "Could not open sign-in page. Try again."
+            return
+        }
         authSession = session
     }
 
@@ -160,7 +184,8 @@ final class AuthManager: NSObject, ObservableObject {
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 let msg = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
                 DebugLog.log("[Auth] Refresh failed: \(msg.prefix(300))")
-                // Refresh token is also expired/invalid — force re-login
+                // Refresh token is also expired/invalid — clear everything and force re-login
+                for k in ["access_token", "refresh_token"] { keychainDelete(k) }
                 isAuthenticated = false
                 return nil
             }

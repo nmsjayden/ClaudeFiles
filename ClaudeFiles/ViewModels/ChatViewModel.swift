@@ -740,9 +740,12 @@ final class ChatViewModel: ObservableObject {
             }
         }
 
-        // Must start with user message
-        while let first = cleaned.first, first.role == .assistant {
-            cleaned.removeFirst()
+        // Must start with a real user message (not a tool_result)
+        while let first = cleaned.first {
+            if first.role == .assistant { cleaned.removeFirst(); continue }
+            if case .toolResult = first.content { cleaned.removeFirst(); continue }
+            if case .toolResults = first.content { cleaned.removeFirst(); continue }
+            break
         }
 
         // Must end with user message

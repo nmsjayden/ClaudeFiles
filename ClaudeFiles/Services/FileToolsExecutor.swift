@@ -416,56 +416,35 @@ final class FileToolsExecutor {
 
         let tmpOut = "/tmp/.claude_spawn_\(ProcessInfo.processInfo.processIdentifier)"
 
-        // Set up file actions to redirect stdout/stderr to temp file
-        var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
-        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        // Redirect output: command > tmpOut 2>&1
+        let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
 
-        // Create output file
-        let outFd = open(tmpOut, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        guard outFd >= 0 else {
-            B("TIER2: can't create output file")
-            return nil
-        }
-        close(outFd)
+        // Use C-level posix_spawn with proper Swift bridging
+        let shPath = "/bin/sh"
+        let shArg = "-c"
 
-        // Redirect stdout and stderr to the temp file
-        posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, tmpOut,
-                                          O_WRONLY | O_TRUNC, 0o644)
-        posix_spawn_file_actions_adddup2(&fileActions, STDOUT_FILENO, STDERR_FILENO)
-
-        // Set up spawn attributes
-        var spawnAttr: posix_spawnattr_t?
-        posix_spawnattr_init(&spawnAttr)
-        defer { posix_spawnattr_destroy(&spawnAttr) }
-
-        // Spawn /bin/sh -c "command"
         var pid: pid_t = 0
-        let argv: [UnsafeMutablePointer<CChar>?] = [
-            strdup("/bin/sh"),
-            strdup("-c"),
-            strdup(command),
-            nil
-        ]
-        defer { for a in argv { if let a = a { free(a) } } }
-
-        // Environment — pass through minimal env
-        let envp: [UnsafeMutablePointer<CChar>?] = [
-            strdup("PATH=/usr/bin:/bin:/usr/sbin:/sbin"),
-            strdup("HOME=/var/mobile"),
-            strdup("TMPDIR=/tmp"),
-            nil
-        ]
-        defer { for e in envp { if let e = e { free(e) } } }
 
         B("BEFORE posix_spawn(/bin/sh)")
-        let spawnRet = posix_spawn(&pid, "/bin/sh", &fileActions, &spawnAttr,
-                                     argv, envp)
+
+        let spawnRet = shPath.withCString { pathPtr in
+            shArg.withCString { argPtr in
+                wrappedCmd.withCString { cmdPtr in
+                    // Build argv: ["/bin/sh", "-c", wrappedCmd, NULL]
+                    let mutPath = UnsafeMutablePointer(mutating: pathPtr)
+                    let mutArg = UnsafeMutablePointer(mutating: argPtr)
+                    let mutCmd = UnsafeMutablePointer(mutating: cmdPtr)
+                    var argv: [UnsafeMutablePointer<CChar>?] = [mutPath, mutArg, mutCmd, nil]
+
+                    return posix_spawn(&pid, pathPtr, nil, nil, &argv, nil)
+                }
+            }
+        }
+
         B("AFTER posix_spawn = \(spawnRet) pid=\(pid)")
 
         guard spawnRet == 0 else {
             B("posix_spawn failed: \(spawnRet) (\(String(cString: strerror(spawnRet))))")
-            unlink(tmpOut)
             return nil
         }
 
@@ -475,25 +454,33 @@ final class FileToolsExecutor {
         waitpid(pid, &status, 0)
         B("AFTER waitpid status=\(status)")
 
-        let exitCode = (status >> 8) & 0xFF
-
-        // Read output
+        // Read output (same format as remote_call: output + exit code on last line)
         guard let data = FileManager.default.contents(atPath: tmpOut),
-              var output = String(data: data, encoding: .utf8) else {
+              let raw = String(data: data, encoding: .utf8) else {
             unlink(tmpOut)
-            return "(no output, exit code \(exitCode))"
+            return "(command ran but no output file)"
         }
         unlink(tmpOut)
 
-        if output.hasSuffix("\n") { output = String(output.dropLast()) }
-        if output.isEmpty { output = "(no output)" }
-        if exitCode != 0 {
-            output += "\n[exit code: \(exitCode)]"
+        var lines = raw.components(separatedBy: "\n")
+        var exitCode = "?"
+        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+            lines.removeLast()
         }
-        if output.count > 20_000 {
-            output = String(output.prefix(20_000)) + "\n[truncated — \(output.count) total chars]"
+        if let last = lines.last, last.allSatisfy({ $0.isNumber }) {
+            exitCode = last
+            lines.removeLast()
         }
-        return output
+
+        var text = lines.joined(separator: "\n")
+        if !text.isEmpty && exitCode != "0" {
+            text += "\n[exit code: \(exitCode)]"
+        }
+        if text.isEmpty { text = "(no output, exit code \(exitCode))" }
+        if text.count > 20_000 {
+            text = String(text.prefix(20_000)) + "\n[truncated]"
+        }
+        return text
     }
 
     // MARK: - Tier 3/4: remote_call (with or without MIG bypass)

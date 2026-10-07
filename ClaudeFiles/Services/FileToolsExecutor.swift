@@ -235,22 +235,16 @@ final class FileToolsExecutor {
         let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"
 
         return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
-            let lock = NSLock()
-            var resumed = false
-            func resumeOnce(_ value: String) {
-                lock.lock()
-                defer { lock.unlock() }
-                guard !resumed else { return }
-                resumed = true
-                cont.resume(returning: value)
-            }
+            // Use a reference-type wrapper so closures and the helper method
+            // can safely share the "resume once" guard across threads.
+            let once = OnceResume(cont)
 
             // Timeout
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 20) {
-                resumeOnce("Error: bash_exec timed out after 20s")
+                once.resume("Error: bash_exec timed out after 20s")
             }
 
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
                 DebugLog.log("[bashExec] Attaching to mediaserverd…")
                 let initRet = init_remote_call("mediaserverd", true)
                 guard initRet == 0 else {
@@ -260,30 +254,45 @@ final class FileToolsExecutor {
                     let initRet2 = init_remote_call("backboardd", true)
                     guard initRet2 == 0 else {
                         DebugLog.log("[bashExec] init_remote_call(backboardd) also failed: \(initRet2)")
-                        resumeOnce("Error: could not attach to any system daemon for command execution (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
+                        once.resume("Error: could not attach to any system daemon for command execution (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
                         return
                     }
                     // Continue with backboardd
                     defer { destroy_remote_call() }
-                    self.executeViaRemoteCall(command: command, tmpOut: tmpOut, resumeOnce: resumeOnce)
+                    self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
                     return
                 }
                 defer { destroy_remote_call() }
-                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, resumeOnce: resumeOnce)
+                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once)
             }
+        }
+    }
+
+    /// Thread-safe "resume exactly once" wrapper for CheckedContinuation.
+    private final class OnceResume {
+        private let lock = NSLock()
+        private var resumed = false
+        private let cont: CheckedContinuation<String, Never>
+        init(_ cont: CheckedContinuation<String, Never>) { self.cont = cont }
+        func resume(_ value: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !resumed else { return }
+            resumed = true
+            cont.resume(returning: value)
         }
     }
 
     /// Execute a command string via system() in the currently-attached remote process.
     /// Captures output by redirecting to a temp file, then reads it back.
     private func executeViaRemoteCall(command: String, tmpOut: String,
-                                       resumeOnce: @escaping (String) -> Void) {
+                                       once: OnceResume) {
         // Build the shell command that redirects output to our temp file
         let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
 
         // Write command string to trojan shared memory page
         guard remote_writeStr(g_RC_trojanMem, wrappedCmd) else {
-            resumeOnce("Error: failed to write command to remote process memory")
+            once.resume("Error: failed to write command to remote process memory")
             return
         }
 
@@ -326,7 +335,7 @@ final class FileToolsExecutor {
                 text = String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
             }
             DebugLog.log("[bashExec] Output: \(text.count) chars, exit=\(exitCode)")
-            resumeOnce(text)
+            once.resume(text)
         } else {
             // Couldn't read output file — return the system() return value
             DebugLog.log("[bashExec] Could not read output file \(tmpOut)")
@@ -339,11 +348,11 @@ final class FileToolsExecutor {
                 unlink(tmpOut)
                 if n > 0 {
                     let text = String(bytes: buf[0..<n], encoding: .utf8) ?? "(binary output, \(n) bytes)"
-                    resumeOnce(text)
+                    once.resume(text)
                     return
                 }
             }
-            resumeOnce("Command executed (system() returned \(result)). Output file not readable — the command may not have produced output, or /tmp may not be writable from the target process.")
+            once.resume("Command executed (system() returned \(result)). Output file not readable — the command may not have produced output, or /tmp may not be writable from the target process.")
         }
     }
 
@@ -441,25 +450,19 @@ final class FileToolsExecutor {
         }
 
         let actualCount = size / MemoryLayout<kinfo_proc>.stride
-        var lines: [String] = ["PID\tNAME"]
+        var entries: [(pid: Int32, name: String)] = []
 
         for i in 0..<actualCount {
             let pid = procs[i].kp_proc.p_pid
-            let name = withUnsafePointer(to: procs[i].kp_proc.p_comm) { ptr in
-                ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
-                    String(cString: $0)
-                }
-            }
-            lines.append("\(pid)\t\(name)")
+            let name = extractProcName(&procs[i])
+            entries.append((pid: pid, name: name))
         }
 
-        lines.sort { a, b in
-            // Keep header first, sort rest by PID
-            if a.hasPrefix("PID") { return true }
-            if b.hasPrefix("PID") { return false }
-            let pidA = Int(a.prefix(while: { $0 != "\t" })) ?? 0
-            let pidB = Int(b.prefix(while: { $0 != "\t" })) ?? 0
-            return pidA < pidB
+        entries.sort { $0.pid < $1.pid }
+
+        var lines: [String] = ["PID\tNAME"]
+        for e in entries {
+            lines.append("\(e.pid)\t\(e.name)")
         }
 
         DebugLog.log("processList: \(actualCount) processes via sysctl")
@@ -468,6 +471,20 @@ final class FileToolsExecutor {
             result = String(result.prefix(20_000)) + "\n[truncated]"
         }
         return result
+    }
+
+    /// Safely extract process name from kinfo_proc's p_comm tuple
+    private func extractProcName(_ info: inout kinfo_proc) -> String {
+        let commSize = MemoryLayout.size(ofValue: info.kp_proc.p_comm)
+        return withUnsafeBytes(of: &info.kp_proc.p_comm) { rawBuf in
+            // Ensure null-terminated within the buffer
+            let bytes = rawBuf.bindMemory(to: CChar.self)
+            // Find the null terminator or use the whole buffer
+            var len = 0
+            while len < commSize && bytes[len] != 0 { len += 1 }
+            if len == 0 { return "?" }
+            return String(cString: bytes.baseAddress!)
+        }
     }
 
     /// Find a PID by process name using sysctl (no shell needed)
@@ -481,11 +498,7 @@ final class FileToolsExecutor {
         let actual = size / MemoryLayout<kinfo_proc>.stride
 
         for i in 0..<actual {
-            let procName = withUnsafePointer(to: procs[i].kp_proc.p_comm) { ptr in
-                ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
-                    String(cString: $0)
-                }
-            }
+            let procName = extractProcName(&procs[i])
             // Match by exact name or case-insensitive contains
             if procName == name || procName.localizedCaseInsensitiveContains(name) {
                 return procs[i].kp_proc.p_pid

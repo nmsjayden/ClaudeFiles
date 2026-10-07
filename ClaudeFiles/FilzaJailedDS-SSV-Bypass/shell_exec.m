@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 // ── Credential elevation via kernel r/w ──
 // Patches our own process to root + platform binary so posix_spawn works.

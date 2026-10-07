@@ -224,6 +224,7 @@ struct BuiltinShell {
         case "base64":   return cmdBase64(args, stdin: stdin)
         case "strings":  return cmdStrings(args)
         case "xargs":    return cmdXargs(args, stdin: stdin)
+        case "kresearch": return cmdKresearch(args)
         default:         return nil
         }
     }
@@ -1399,5 +1400,102 @@ struct BuiltinShell {
             }
         }
         return (output.joined(separator: "\n"), 0)
+    }
+
+    // MARK: ── Kernel Research (SPTM bypass investigation) ──
+
+    private static func cmdKresearch(_ args: [String]) -> (String, Int32) {
+        guard let subcmd = args.first else {
+            return ("""
+            kresearch — Kernel research toolkit for SPTM bypass investigation
+
+            Subcommands:
+              dump_self        Dump this process's kernel state (proc, proc_ro, ucred, sandbox)
+              dump_proc <pid>  Dump a target process's kernel state
+              compare <pid>    Compare our credentials to another process (e.g. 1 = launchd)
+              sandbox_ops      Check which sandbox operations are permitted
+              sandbox_profile  Dump sandbox_label structure (platform_profile, extension_set)
+              swap_profile     [WRITE] Swap our sandbox profile with launchd's
+              exec_ext         [WRITE] Add process-exec sandbox extension
+              test_spawn       Test posix_spawn after modifications
+
+            READ-ONLY commands are safe. [WRITE] commands modify kernel state — use carefully.
+            """, 0)
+        }
+
+        switch subcmd {
+        case "dump_self":
+            if let result = kresearch_dump_self() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch dump_self: failed (exploit not initialized?)", 1)
+
+        case "dump_proc":
+            guard args.count > 1, let pid = Int32(args[1]) else {
+                return ("Usage: kresearch dump_proc <pid>", 1)
+            }
+            if let result = kresearch_dump_proc(pid) {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch dump_proc: failed for pid \(pid)", 1)
+
+        case "compare":
+            guard args.count > 1, let pid = Int32(args[1]) else {
+                return ("Usage: kresearch compare <pid>  (e.g. kresearch compare 1)", 1)
+            }
+            if let result = kresearch_compare_creds(pid) {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch compare: failed for pid \(pid)", 1)
+
+        case "sandbox_ops":
+            if let result = kresearch_check_sandbox_ops() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch sandbox_ops: failed", 1)
+
+        case "sandbox_profile":
+            if let result = kresearch_dump_sandbox_profile() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch sandbox_profile: failed", 1)
+
+        case "swap_profile":
+            if let result = kresearch_swap_sandbox_profile() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch swap_profile: failed", 1)
+
+        case "exec_ext":
+            if let result = kresearch_add_exec_extension() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch exec_ext: failed", 1)
+
+        case "test_spawn":
+            if let result = kresearch_test_spawn() {
+                let str = String(cString: result)
+                free(result)
+                return (str, 0)
+            }
+            return ("kresearch test_spawn: failed", 1)
+
+        default:
+            return ("kresearch: unknown subcommand '\(subcmd)'. Run 'kresearch' for help.", 1)
+        }
     }
 }

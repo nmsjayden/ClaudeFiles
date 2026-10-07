@@ -38,6 +38,9 @@ final class FileToolsExecutor {
                                                         size: input["size"]?.intValue ?? 256)
         case "app_control":    return await appControl(action: input["action"]?.string ?? "",
                                                         target: input["target"]?.string ?? "")
+        case "copy_move_file": return copyMoveFile(source: input["source"]?.string ?? "",
+                                                     destination: input["destination"]?.string ?? "",
+                                                     move: input["move"]?.string == "true")
         default:               return "Unknown tool: \(name)"
         }
     }
@@ -887,6 +890,56 @@ final class FileToolsExecutor {
         }
 
         return "Error: could not launch '\(bundleId)' — uiopen failed and URL scheme didn't work"
+    }
+
+    // MARK: - copy_move_file
+
+    private func copyMoveFile(source: String, destination: String, move: Bool) -> String {
+        guard !source.isEmpty else { return "Error: source path required" }
+        guard !destination.isEmpty else { return "Error: destination path required" }
+
+        for blocked in writeBlocklist where destination.hasPrefix(blocked) {
+            return "Error: \(blocked) is blocked for safety"
+        }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: source) else {
+            return "Error: source file does not exist: \(source)"
+        }
+
+        // If destination exists, remove it first
+        if fm.fileExists(atPath: destination) {
+            do {
+                try fm.removeItem(atPath: destination)
+            } catch {
+                return "Error removing existing destination: \(error.localizedDescription)"
+            }
+        }
+
+        // Make sure destination directory exists
+        let destDir = (destination as NSString).deletingLastPathComponent
+        if !fm.fileExists(atPath: destDir) {
+            do {
+                try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true)
+            } catch {
+                return "Error creating destination directory: \(error.localizedDescription)"
+            }
+        }
+
+        do {
+            if move {
+                try fm.moveItem(atPath: source, toPath: destination)
+                DebugLog.log("[CopyMove] Moved \(source) → \(destination)")
+                return "Moved \(source) → \(destination)"
+            } else {
+                try fm.copyItem(atPath: source, toPath: destination)
+                let size = (try? fm.attributesOfItem(atPath: destination)[.size] as? Int) ?? 0
+                DebugLog.log("[CopyMove] Copied \(source) → \(destination) (\(size) bytes)")
+                return "Copied \(source) → \(destination) (\(size) bytes)"
+            }
+        } catch {
+            return "Error \(move ? "moving" : "copying"): \(error.localizedDescription)"
+        }
     }
 
     /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.

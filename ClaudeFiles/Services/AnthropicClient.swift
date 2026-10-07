@@ -468,6 +468,13 @@ enum FileToolDefinitions {
                     "action": Prop(description: "One of: freeze, unfreeze, kill, launch"),
                     "target": Prop(description: "Process name or PID (for freeze/unfreeze/kill), or bundle ID (for launch)")
                 ], required: ["action", "target"])),
+        ToolDef(name: "copy_move_file",
+                description: "Copy or move a file. Works with binary files (plists, databases, images, etc.) unlike write_file which is text-only. Use this to restore .claudebackup files, duplicate files, or relocate them. Shell commands like cp/mv may not be available — always use this tool instead.",
+                inputSchema: Schema(properties: [
+                    "source": Prop(description: "Absolute path of the source file"),
+                    "destination": Prop(description: "Absolute path of the destination"),
+                    "move": Prop(description: "Set to 'true' to move instead of copy (default: copy)")
+                ], required: ["source", "destination"])),
     ]
 }
 

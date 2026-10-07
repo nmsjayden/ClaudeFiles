@@ -28,7 +28,7 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 18 tools:
+    the FilzaJailedDS kernel exploit (opa334). You have 19 tools:
     - read_file, write_file, list_directory, search_files, get_file_info
     - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
     - grep_search: search file contents for a pattern
@@ -48,6 +48,8 @@ final class ChatViewModel: ObservableObject {
     strings in memory, inspecting runtime state.
     - app_control: freeze (pause), unfreeze (resume), kill, or launch any app. \
     Freezing an app stops its process cold — it stays frozen until you unfreeze it.
+    - copy_move_file: copy or move files (including binary files like plists, \
+    databases, images). Use this instead of bash cp/mv which may not be available.
 
     FILESYSTEM NOTES:
     - /var is a symlink to /private/var, /tmp → /private/tmp, /etc → /private/etc
@@ -55,6 +57,8 @@ final class ChatViewModel: ObservableObject {
     - User-data paths like /var/mobile/* may need /private/var/mobile/*
     - When a tool errors, use the exact error message to decide your next move
     - Use bash_exec for complex operations like piped commands, process listing, etc.
+    - Shell commands cp, mv, rm may NOT be available. Use copy_move_file to copy/move \
+    files and write_file to create files. To restore a .claudebackup, use copy_move_file.
 
     REMOTE_CALL NOTES:
     - Attaches to a target process by name and calls a named C function with up to 8 args

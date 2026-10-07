@@ -295,10 +295,56 @@ final class ChatViewModel: ObservableObject {
             } else if m.role == "user" {
                 result.append(ChatMessage(role: .user, content: .text(m.text)))
             } else if let blocks = m.apiBlocks, !blocks.isEmpty {
-                let apiBlocks = blocks.map {
-                    APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
+                // Check if this assistant message has tool_use blocks.
+                // The API requires EVERY tool_use to have a matching tool_result
+                // in the immediately following user message. If any are missing
+                // (e.g. generation was stopped, or a tool crashed), strip the
+                // tool_use blocks to avoid HTTP 400.
+                let toolUseIds = Set(blocks.compactMap { b -> String? in
+                    b.type == "tool_use" ? b.id : nil
+                })
+
+                if !toolUseIds.isEmpty {
+                    // Collect tool_result IDs from the immediately following messages
+                    var foundResults = Set<String>()
+                    var j = i + 1
+                    while j < msgs.count, let toolId = msgs[j].toolUseId {
+                        foundResults.insert(toolId)
+                        j += 1
+                    }
+
+                    if toolUseIds.isSubset(of: foundResults) {
+                        // All tool_use have matching results — include full blocks
+                        let apiBlocks = blocks.map {
+                            APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
+                        }
+                        result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
+                    } else {
+                        // Some tool_use blocks have no matching results — strip ALL
+                        // tool_use blocks and skip any orphaned tool_results that follow
+                        let safeBlocks = blocks.filter { $0.type != "tool_use" }
+                        if !safeBlocks.isEmpty {
+                            let apiBlocks = safeBlocks.map {
+                                APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
+                            }
+                            result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
+                        } else if !m.text.isEmpty {
+                            result.append(ChatMessage(role: .assistant, content: .text(m.text)))
+                        }
+                        // Skip any following tool_result messages for these stripped tool_use IDs
+                        while i + 1 < msgs.count,
+                              let nextToolId = msgs[i + 1].toolUseId,
+                              toolUseIds.contains(nextToolId) {
+                            i += 1
+                        }
+                    }
+                } else {
+                    // No tool_use blocks — text/compaction only, include as-is
+                    let apiBlocks = blocks.map {
+                        APIBlock(type: $0.type, text: $0.text, id: $0.id, name: $0.name, input: $0.input)
+                    }
+                    result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
                 }
-                result.append(ChatMessage(role: .assistant, content: .blocks(apiBlocks)))
             } else {
                 result.append(ChatMessage(role: .assistant, content: .text(m.text)))
             }

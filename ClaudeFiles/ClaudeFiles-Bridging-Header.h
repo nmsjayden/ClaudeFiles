@@ -23,3 +23,6 @@
 
 // RemoteCall — call functions in other processes via Mach task ports
 #import "FilzaJailedDS-SSV-Bypass/kexploit/RemoteCall.h"
+
+// SQLite3 — query any database on the device
+#include <sqlite3.h>

@@ -29,6 +29,15 @@ final class FileToolsExecutor {
         case "remote_call":    return await remoteCall(process: input["process"]?.string ?? "",
                                                        function: input["function"]?.string ?? "",
                                                        args: input["args"]?.arrayValue ?? [])
+        case "sqlite_query":   return sqliteQuery(dbPath: input["database"]?.string ?? "",
+                                                   query: input["query"]?.string ?? "")
+        case "installed_apps": return installedApps()
+        case "read_plist":     return readPlist(path: path)
+        case "memory_dump":    return await memoryDump(process: input["process"]?.string ?? "",
+                                                        address: input["address"]?.string ?? "0",
+                                                        size: input["size"]?.intValue ?? 256)
+        case "app_control":    return await appControl(action: input["action"]?.string ?? "",
+                                                        target: input["target"]?.string ?? "")
         default:               return "Unknown tool: \(name)"
         }
     }
@@ -461,6 +470,423 @@ final class FileToolsExecutor {
                 safeResume("Error: remote_call timed out after 15s. The target process may not be reachable.")
             }
         }
+    }
+
+    // MARK: - sqlite_query
+
+    private func sqliteQuery(dbPath: String, query: String) -> String {
+        guard !dbPath.isEmpty else { return "Error: database path required" }
+        guard !query.isEmpty else { return "Error: query required" }
+
+        // Safety: block destructive SQL
+        let upper = query.uppercased().trimmingCharacters(in: .whitespaces)
+        let destructive = ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "CREATE ", "REPLACE ", "ATTACH "]
+        for d in destructive where upper.hasPrefix(d) {
+            return "Error: only SELECT queries are allowed for safety. Use: SELECT ..."
+        }
+
+        DebugLog.log("sqliteQuery: db=\(dbPath) query=\(query.prefix(100))")
+
+        var db: OpaquePointer?
+        // Open read-only
+        let openFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+        guard sqlite3_open_v2(dbPath, &db, openFlags, nil) == SQLITE_OK else {
+            let err = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
+            sqlite3_close(db)
+            return "Error opening database: \(err)"
+        }
+        defer { sqlite3_close(db) }
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
+            let err = String(cString: sqlite3_errmsg(db))
+            return "SQL error: \(err)"
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let colCount = Int(sqlite3_column_count(stmt))
+        var headers: [String] = []
+        for i in 0..<colCount {
+            headers.append(String(cString: sqlite3_column_name(stmt, Int32(i))))
+        }
+
+        var rows: [String] = [headers.joined(separator: "\t")]
+        var rowCount = 0
+        let maxRows = 200
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            var cols: [String] = []
+            for i in 0..<colCount {
+                let idx = Int32(i)
+                switch sqlite3_column_type(stmt, idx) {
+                case SQLITE_NULL:
+                    cols.append("NULL")
+                case SQLITE_INTEGER:
+                    cols.append("\(sqlite3_column_int64(stmt, idx))")
+                case SQLITE_FLOAT:
+                    cols.append("\(sqlite3_column_double(stmt, idx))")
+                case SQLITE_TEXT:
+                    if let cStr = sqlite3_column_text(stmt, idx) {
+                        let s = String(cString: cStr)
+                        cols.append(s.count > 200 ? String(s.prefix(200)) + "…" : s)
+                    } else {
+                        cols.append("")
+                    }
+                case SQLITE_BLOB:
+                    let size = sqlite3_column_bytes(stmt, idx)
+                    cols.append("<blob \(size) bytes>")
+                default:
+                    cols.append("?")
+                }
+            }
+            rows.append(cols.joined(separator: "\t"))
+            rowCount += 1
+            if rowCount >= maxRows {
+                rows.append("... (limited to \(maxRows) rows)")
+                break
+            }
+        }
+
+        DebugLog.log("  → sqlite: \(rowCount) rows, \(colCount) cols")
+        return rows.count <= 1
+            ? "Query returned no results."
+            : rows.joined(separator: "\n")
+    }
+
+    // MARK: - installed_apps
+
+    private func installedApps() -> String {
+        DebugLog.log("installedApps")
+        let bundleFolder = "/private/var/containers/Bundle/Application"
+        let fm = FileManager.default
+
+        guard let bundles = try? fm.contentsOfDirectory(atPath: bundleFolder) else {
+            return "Error: cannot read \(bundleFolder). Is sandbox escape active?"
+        }
+
+        var apps: [(name: String, bundleID: String, version: String, path: String, size: Int64)] = []
+
+        for uuid in bundles {
+            let uuidPath = bundleFolder + "/" + uuid
+            guard let contents = try? fm.contentsOfDirectory(atPath: uuidPath) else { continue }
+            for item in contents where item.hasSuffix(".app") {
+                let appPath = uuidPath + "/" + item
+                let infoPath = appPath + "/Info.plist"
+                guard let info = NSDictionary(contentsOfFile: infoPath) else { continue }
+
+                let executable = info["CFBundleExecutable"] as? String ?? ""
+                if executable.isEmpty { continue }
+
+                let bundleID = info["CFBundleIdentifier"] as? String ?? "?"
+                let name = (info["CFBundleDisplayName"] as? String)
+                    ?? (info["CFBundleName"] as? String)
+                    ?? (item as NSString).deletingPathExtension
+                let version = (info["CFBundleShortVersionString"] as? String ?? "?")
+                    + " (\(info["CFBundleVersion"] as? String ?? "?"))"
+
+                // Calculate app bundle size
+                var totalSize: Int64 = 0
+                if let enumerator = fm.enumerator(at: URL(fileURLWithPath: appPath),
+                                                   includingPropertiesForKeys: [.fileSizeKey]) {
+                    for case let fileURL as URL in enumerator {
+                        if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
+                            totalSize += Int64(size)
+                        }
+                    }
+                }
+
+                apps.append((name: name, bundleID: bundleID, version: version,
+                             path: appPath, size: totalSize))
+                break // only first .app in each UUID folder
+            }
+        }
+
+        apps.sort { $0.name.lowercased() < $1.name.lowercased() }
+
+        DebugLog.log("  → found \(apps.count) apps")
+
+        var lines: [String] = ["Found \(apps.count) installed apps:\n"]
+        for app in apps {
+            let sizeMB = app.size / (1024 * 1024)
+            lines.append("• \(app.name)  [\(app.bundleID)]")
+            lines.append("  v\(app.version)  \(sizeMB)MB")
+            lines.append("  \(app.path)")
+        }
+
+        var result = lines.joined(separator: "\n")
+        if result.count > 20_000 {
+            result = String(result.prefix(20_000)) + "\n[truncated]"
+        }
+        return result
+    }
+
+    // MARK: - read_plist
+
+    private func readPlist(path: String) -> String {
+        guard !path.isEmpty else { return "Error: path required" }
+        DebugLog.log("readPlist: \(path)")
+
+        // Try reading as NSDictionary first (handles binary + XML plists)
+        if let dict = NSDictionary(contentsOfFile: path) {
+            return formatPlistObject(dict, indent: 0)
+        }
+
+        // Try NSArray
+        if let arr = NSArray(contentsOfFile: path) {
+            return formatPlistObject(arr, indent: 0)
+        }
+
+        // Try raw Data → PropertyListSerialization
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return "Error: cannot read file at \(path)"
+        }
+        do {
+            let obj = try PropertyListSerialization.propertyList(from: data, format: nil)
+            if let dict = obj as? NSDictionary {
+                return formatPlistObject(dict, indent: 0)
+            } else if let arr = obj as? NSArray {
+                return formatPlistObject(arr, indent: 0)
+            }
+            return "\(obj)"
+        } catch {
+            return "Error: not a valid plist — \(error.localizedDescription)"
+        }
+    }
+
+    private func formatPlistObject(_ obj: Any, indent: Int) -> String {
+        let pad = String(repeating: "  ", count: indent)
+        switch obj {
+        case let dict as NSDictionary:
+            if dict.count == 0 { return "\(pad){}" }
+            var lines: [String] = []
+            let sorted = dict.allKeys.compactMap { $0 as? String }.sorted()
+            for key in sorted {
+                let val = dict[key]!
+                let valStr = formatPlistObject(val, indent: indent + 1)
+                if valStr.contains("\n") {
+                    lines.append("\(pad)\(key):")
+                    lines.append(valStr)
+                } else {
+                    lines.append("\(pad)\(key): \(valStr.trimmingCharacters(in: .whitespaces))")
+                }
+            }
+            return lines.joined(separator: "\n")
+        case let arr as NSArray:
+            if arr.count == 0 { return "\(pad)[]" }
+            var lines: [String] = []
+            for (i, item) in arr.enumerated() {
+                let s = formatPlistObject(item, indent: indent + 1)
+                if s.contains("\n") {
+                    lines.append("\(pad)[\(i)]:")
+                    lines.append(s)
+                } else {
+                    lines.append("\(pad)[\(i)]: \(s.trimmingCharacters(in: .whitespaces))")
+                }
+            }
+            return lines.joined(separator: "\n")
+        case let data as Data:
+            if data.count <= 64 {
+                return "\(pad)<\(data.map { String(format: "%02x", $0) }.joined())>"
+            }
+            return "\(pad)<data: \(data.count) bytes>"
+        case let date as Date:
+            return "\(pad)\(date)"
+        case let num as NSNumber:
+            // Check if it's a boolean
+            if CFGetTypeID(num) == CFBooleanGetTypeID() {
+                return "\(pad)\(num.boolValue)"
+            }
+            return "\(pad)\(num)"
+        case let str as String:
+            return "\(pad)\(str)"
+        default:
+            return "\(pad)\(obj)"
+        }
+    }
+
+    // MARK: - memory_dump
+
+    private func memoryDump(process: String, address addressStr: String, size: Int) async -> String {
+        guard !process.isEmpty else { return "Error: process name is required" }
+
+        // Parse address — support hex (0x...) and decimal
+        let addr: UInt64
+        if addressStr.hasPrefix("0x") || addressStr.hasPrefix("0X") {
+            guard let val = UInt64(addressStr.dropFirst(2), radix: 16) else {
+                return "Error: invalid hex address '\(addressStr)'"
+            }
+            addr = val
+        } else {
+            guard let val = UInt64(addressStr) else {
+                return "Error: invalid address '\(addressStr)'"
+            }
+            addr = val
+        }
+
+        guard addr != 0 else { return "Error: cannot read from NULL (address 0x0)" }
+
+        let clampedSize = min(max(size, 16), 4096)
+
+        // Check sandbox escape
+        let escaped = await MainActor.run { SandboxManager.shared.status.isUsable }
+        guard escaped else { return "Error: sandbox escape not active — memory_dump requires kernel exploit" }
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            let lock = NSLock()
+            var resumed = false
+            func resumeOnce(_ value: String) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                cont.resume(returning: value)
+            }
+
+            // Timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                resumeOnce("Error: memory_dump timed out after 15s")
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                DebugLog.log("[MemDump] Attaching to \(process)…")
+                let initRet = init_remote_call(process, false)
+                guard initRet == 0 else {
+                    DebugLog.log("[MemDump] init_remote_call failed: \(initRet)")
+                    resumeOnce("Error: could not attach to process '\(process)' (init returned \(initRet)). Is the process running?")
+                    return
+                }
+                defer { destroy_remote_call() }
+
+                DebugLog.log("[MemDump] Reading \(clampedSize) bytes at 0x\(String(addr, radix: 16))…")
+                var buffer = [UInt8](repeating: 0, count: clampedSize)
+                let ok = remote_read(addr, &buffer, UInt64(clampedSize))
+
+                guard ok else {
+                    DebugLog.log("[MemDump] remote_read failed")
+                    resumeOnce("Error: remote_read failed — address 0x\(String(addr, radix: 16)) may be unmapped or unreadable")
+                    return
+                }
+
+                // Format hex dump: offset | hex bytes | ASCII
+                var lines: [String] = []
+                lines.append("Memory dump of \(process) at 0x\(String(addr, radix: 16)), \(clampedSize) bytes:")
+                lines.append("")
+
+                for row in stride(from: 0, to: clampedSize, by: 16) {
+                    let end = min(row + 16, clampedSize)
+                    let offsetStr = String(format: "%08x", UInt(addr) + UInt(row))
+
+                    // Hex part
+                    var hexParts: [String] = []
+                    for i in row..<end {
+                        hexParts.append(String(format: "%02x", buffer[i]))
+                    }
+                    // Pad if less than 16 bytes
+                    while hexParts.count < 16 { hexParts.append("  ") }
+                    let hexStr = hexParts[0..<8].joined(separator: " ") + "  " + hexParts[8..<16].joined(separator: " ")
+
+                    // ASCII part
+                    var ascii = ""
+                    for i in row..<end {
+                        let b = buffer[i]
+                        ascii.append(b >= 0x20 && b < 0x7f ? Character(UnicodeScalar(b)) : ".")
+                    }
+
+                    lines.append("\(offsetStr)  \(hexStr)  |\(ascii)|")
+                }
+
+                let result = lines.joined(separator: "\n")
+                DebugLog.log("[MemDump] Success — \(lines.count - 2) rows")
+                resumeOnce(result)
+            }
+        }
+    }
+
+    // MARK: - app_control
+
+    private func appControl(action: String, target: String) async -> String {
+        guard !action.isEmpty else {
+            return "Error: action is required. Use: freeze, unfreeze, kill, or launch"
+        }
+        guard !target.isEmpty else {
+            return "Error: target is required (app name, process name, PID, or bundle ID for launch)"
+        }
+
+        switch action.lowercased() {
+        case "freeze":
+            return freezeOrResume(target: target, signal: "STOP", verb: "Frozen")
+        case "unfreeze", "resume", "thaw":
+            return freezeOrResume(target: target, signal: "CONT", verb: "Resumed")
+        case "kill", "terminate":
+            return freezeOrResume(target: target, signal: "TERM", verb: "Terminated")
+        case "launch", "open":
+            return await launchApp(bundleId: target)
+        default:
+            return "Error: unknown action '\(action)'. Use: freeze, unfreeze, kill, or launch"
+        }
+    }
+
+    private func freezeOrResume(target: String, signal: String, verb: String) -> String {
+        // If target looks like a PID (all digits), use directly
+        let pid: String
+        if target.allSatisfy(\.isNumber) {
+            pid = target
+        } else {
+            // Find PID by process name using pgrep
+            var exitCode: Int32 = -1
+            guard let result = shell_exec("pgrep -x '\(target)' 2>/dev/null || pgrep -f '\(target)' 2>/dev/null", &exitCode) else {
+                return "Error: could not find process '\(target)'"
+            }
+            defer { free(result) }
+            let pids = String(cString: result).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let firstPid = pids.split(separator: "\n").first else {
+                return "Error: no running process found matching '\(target)'"
+            }
+            pid = String(firstPid)
+        }
+
+        // Send the signal
+        var exitCode: Int32 = -1
+        let cmd = "kill -\(signal) \(pid) 2>&1"
+        guard let result = shell_exec(cmd, &exitCode) else {
+            return "Error: kill command failed"
+        }
+        defer { free(result) }
+
+        let output = String(cString: result).trimmingCharacters(in: .whitespacesAndNewlines)
+        if exitCode == 0 {
+            DebugLog.log("[AppControl] \(verb) PID \(pid) (target: \(target))")
+            return "\(verb) process '\(target)' (PID \(pid))"
+        } else {
+            return "Error: kill -\(signal) \(pid) failed (exit \(exitCode)): \(output)"
+        }
+    }
+
+    private func launchApp(bundleId: String) async -> String {
+        // Try uiopen first (if available), then fall back to open URL scheme
+        var exitCode: Int32 = -1
+        if let result = shell_exec("uiopen --bundleid \(bundleId) 2>&1", &exitCode) {
+            defer { free(result) }
+            if exitCode == 0 {
+                DebugLog.log("[AppControl] Launched \(bundleId) via uiopen")
+                return "Launched app: \(bundleId)"
+            }
+        }
+
+        // Fall back to opening via URL (for apps with URL schemes)
+        let urlStr = "\(bundleId)://"
+        let opened = await MainActor.run {
+            guard let url = URL(string: urlStr) else { return false }
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            return true
+        }
+
+        if opened {
+            DebugLog.log("[AppControl] Launched \(bundleId) via URL scheme")
+            return "Attempted to launch \(bundleId) via URL scheme '\(urlStr)'"
+        }
+
+        return "Error: could not launch '\(bundleId)' — uiopen failed and URL scheme didn't work"
     }
 
     /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.

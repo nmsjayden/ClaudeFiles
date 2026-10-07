@@ -441,6 +441,33 @@ enum FileToolDefinitions {
                         description: "Up to 8 uint64 arguments. Pass numbers or hex strings like '0x1234'.",
                         items: Prop(description: "Argument value")))
                 ], required: ["process", "function"])),
+        ToolDef(name: "sqlite_query",
+                description: "Run a read-only SQL query against any SQLite database on the device. Returns results as tab-separated text with column headers. Use for reading SMS (sms.db), call history, Safari history, app databases, etc.",
+                inputSchema: Schema(properties: [
+                    "database": Prop(description: "Absolute path to the SQLite database file"),
+                    "query": Prop(description: "SQL SELECT query to execute (read-only, no DROP/DELETE/UPDATE/INSERT)")
+                ], required: ["database", "query"])),
+        ToolDef(name: "installed_apps",
+                description: "List all installed applications on the device with bundle ID, version, size, and install path. Requires sandbox escape.",
+                inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "read_plist",
+                description: "Read and decode a binary or XML property list (.plist) file into human-readable text. Use for reading app preferences, system configuration, entitlements, etc.",
+                inputSchema: Schema(properties: [
+                    "path": Prop(description: "Absolute path to the .plist file")
+                ], required: ["path"])),
+        ToolDef(name: "memory_dump",
+                description: "Read and hex-dump memory from any running process. Attaches via Mach task ports, reads raw bytes at a given address, and displays a formatted hex+ASCII dump. Use for inspecting process memory, finding strings, reverse engineering. Requires sandbox escape.",
+                inputSchema: Schema(rawProperties: [
+                    "process": AnyEncodable(Prop(description: "Target process name (e.g. 'SpringBoard', 'MobileSafari')")),
+                    "address": AnyEncodable(Prop(description: "Memory address to read from. Hex (0x1a2b3c) or decimal.")),
+                    "size": AnyEncodable(Prop(type: "integer", description: "Number of bytes to read (16–4096, default 256)"))
+                ], required: ["process", "address"])),
+        ToolDef(name: "app_control",
+                description: "Control running apps: freeze (SIGSTOP — pauses the process entirely), unfreeze (SIGCONT — resumes it), kill (SIGTERM), or launch an app by bundle ID. Freeze is instant and the app stays frozen until you unfreeze it.",
+                inputSchema: Schema(properties: [
+                    "action": Prop(description: "One of: freeze, unfreeze, kill, launch"),
+                    "target": Prop(description: "Process name or PID (for freeze/unfreeze/kill), or bundle ID (for launch)")
+                ], required: ["action", "target"])),
     ]
 }
 

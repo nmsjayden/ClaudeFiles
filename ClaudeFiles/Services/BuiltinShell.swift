@@ -111,7 +111,7 @@ struct BuiltinShell {
 
     // MARK: - Single command execution
 
-    private static func runSingle(_ cmd: String, stdin: String?) -> (String, Int32)? {
+    private static func runSingle(_ cmd: String, stdin: String?) -> (output: String, exitCode: Int32)? {
         var command = cmd
 
         // Handle output redirection: > file or >> file

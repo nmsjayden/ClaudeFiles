@@ -214,15 +214,15 @@ char *kresearch_dump_self(void) {
         for (int i = 0; i < 9; i++) {
             uint64_t bucket = kread_ptr(info.extension_set + (i * 8));
             if (bucket && kaddr_ok(bucket)) {
-                // Read class name
-                struct extension_class_node node = {0};
-                kreadbuf(bucket, &node, sizeof(node));
+                // Read class node fields using raw kread (avoids pointer cast issues)
+                uint64_t class_name_ptr = kread_ptr(bucket + 0x00);
+                uint64_t node_count     = kread64(bucket + 0x18);
                 char name[128] = {0};
-                if (kaddr_ok((uint64_t)node.class_name)) {
-                    kreadbuf((uint64_t)node.class_name, name, sizeof(name) - 1);
+                if (kaddr_ok(class_name_ptr)) {
+                    kreadbuf(class_name_ptr, name, sizeof(name) - 1);
                 }
-                buf_append("    [%d] 0x%llx → class: \"%s\" (count: %llu)\n",
-                           i, bucket, name, (unsigned long long)node.count);
+                buf_append("    [%d] 0x%llx -> class: \"%s\" (count: %llu)\n",
+                           i, bucket, name, (unsigned long long)node_count);
             }
         }
     }

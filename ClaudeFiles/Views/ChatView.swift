@@ -295,6 +295,7 @@ private struct MessageList: View {
     @FocusState var inputFocused: Bool
     @State private var autoScroll: Bool = true
     @State private var bottomVisible: Bool = false
+    @State private var keyboardHeight: CGFloat = 0
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -313,8 +314,13 @@ private struct MessageList: View {
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
-                            .onAppear { bottomVisible = true; autoScroll = true }
-                            .onDisappear { bottomVisible = false; autoScroll = false }
+                            .onAppear  { bottomVisible = true;  autoScroll = true }
+                            .onDisappear {
+                                bottomVisible = false
+                                // Only stop auto-scroll if user manually scrolled up
+                                // (not when new content pushed the anchor off-screen)
+                                if !vm.isSending { autoScroll = false }
+                            }
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 18)
@@ -330,6 +336,30 @@ private struct MessageList: View {
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onTapGesture { inputFocused = false }
+                // When keyboard opens/closes, scroll to bottom if we were following
+                .onReceive(
+                    NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)
+                ) { note in
+                    if let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
+                        keyboardHeight = frame.height
+                    }
+                    if autoScroll || bottomVisible {
+                        // Delay slightly to let the keyboard animation start
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            scrollToBottom(proxy)
+                        }
+                    }
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)
+                ) { _ in
+                    keyboardHeight = 0
+                    if autoScroll || bottomVisible {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            scrollToBottom(proxy)
+                        }
+                    }
+                }
 
                 // Jump-to-bottom button — visible when bottom anchor is off-screen
                 if !bottomVisible {

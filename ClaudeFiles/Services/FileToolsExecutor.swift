@@ -373,29 +373,33 @@ final class FileToolsExecutor {
 
     // MARK: - remote_call
 
-    @MainActor
+    /// Known safe processes for remote_call
+    private let knownProcesses = ["SpringBoard", "launchd", "backboardd", "mediaserverd"]
+
     private func remoteCall(process: String, function: String, args: [AnyJSON]) async -> String {
         guard !process.isEmpty else { return "Error: process name required" }
         guard !function.isEmpty else { return "Error: function name required" }
-        guard SandboxManager.shared.status.isUsable else {
+
+        // Check sandbox on main actor
+        let isUsable = await MainActor.run { SandboxManager.shared.status.isUsable }
+        guard isUsable else {
             return "Error: sandbox escape required for remote_call"
+        }
+
+        // Block obviously dangerous function names
+        let blocked = ["exit", "abort", "_exit", "kill", "reboot", "shutdown"]
+        if blocked.contains(function) {
+            return "Error: '\(function)' is blocked for safety"
         }
 
         DebugLog.log("remoteCall: process=\(process) func=\(function) args=\(args.count)")
 
-        // Initialize RemoteCall connection to target process
-        let initRet = init_remote_call(process, true)
-        guard initRet == 0 else {
-            return "Error: failed to attach to process '\(process)' (code \(initRet)). Is it running?"
-        }
-
-        // Parse up to 8 uint64 arguments
+        // Parse up to 8 uint64 arguments ahead of time
         var x: [UInt64] = Array(repeating: 0, count: 8)
         for (i, arg) in args.prefix(8).enumerated() {
             if let n = arg.uint64Value {
                 x[i] = n
             } else if let s = arg.string {
-                // If it's a hex string like "0x1234", parse it
                 if s.hasPrefix("0x"), let val = UInt64(s.dropFirst(2), radix: 16) {
                     x[i] = val
                 } else if let val = UInt64(s) {
@@ -404,14 +408,59 @@ final class FileToolsExecutor {
             }
         }
 
-        let result = do_remote_call_stable(5, function,
-                                           x[0], x[1], x[2], x[3],
-                                           x[4], x[5], x[6], x[7])
+        // Run entirely on a background thread with a timeout.
+        // Use NSLock + flag to ensure the continuation is resumed exactly once.
+        let localX = x
+        let localProcess = process
+        let localFunction = function
 
-        destroy_remote_call()
+        return await withCheckedContinuation { continuation in
+            let lock = NSLock()
+            var resumed = false
 
-        DebugLog.log("  → remote_call result: 0x\(String(result, radix: 16))")
-        return "Result: \(result) (0x\(String(result, radix: 16)))"
+            func safeResume(_ value: String) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: value)
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                var initOk = false
+                defer {
+                    if initOk {
+                        DebugLog.log("  → remote_call: destroying connection")
+                        destroy_remote_call()
+                    }
+                }
+
+                // Step 1: init — Mach task port attachment + thread hijacking
+                DebugLog.log("  → remote_call: init_remote_call(\(localProcess))...")
+                let initRet = init_remote_call(localProcess, true)
+                guard initRet == 0 else {
+                    DebugLog.log("  → remote_call: init failed with \(initRet)")
+                    safeResume("Error: failed to attach to process '\(localProcess)' (code \(initRet)). Make sure the process is running and the sandbox escape is active.")
+                    return
+                }
+                initOk = true
+                DebugLog.log("  → remote_call: init succeeded")
+
+                // Step 2: call the function
+                DebugLog.log("  → remote_call: calling \(localFunction)...")
+                let result = do_remote_call_stable(5000, localFunction,
+                                                   localX[0], localX[1], localX[2], localX[3],
+                                                   localX[4], localX[5], localX[6], localX[7])
+
+                DebugLog.log("  → remote_call result: \(result) (0x\(String(result, radix: 16)))")
+                safeResume("Result: \(result) (0x\(String(result, radix: 16)))")
+            }
+
+            // Timeout: if it takes more than 15 seconds, give up
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 15) {
+                safeResume("Error: remote_call timed out after 15s. The target process may not be reachable.")
+            }
+        }
     }
 
     /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.

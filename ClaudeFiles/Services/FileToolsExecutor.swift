@@ -304,38 +304,30 @@ final class FileToolsExecutor {
     // MARK: - process_list
 
     private func processList() -> String {
-        var pids = [pid_t](repeating: 0, count: 1024)
-        let byteCount = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids,
-                                       Int32(MemoryLayout<pid_t>.stride * pids.count))
-        guard byteCount > 0 else {
-            // Fallback to bash
-            return "proc_listpids unavailable — use bash_exec with 'ps aux' instead"
+        // Use shell_exec to run ps — avoids libproc linking issues on iOS
+        var exitCode: Int32 = -1
+        guard let cResult = shell_exec("ps -e -o pid,comm", &exitCode) else {
+            return "Error: could not list processes"
         }
-        let pidCount = Int(byteCount) / MemoryLayout<pid_t>.stride
-        var lines: [String] = ["PID\tNAME"]
-        for i in 0..<pidCount {
-            let pid = pids[i]
-            if pid == 0 { continue }
-            var buf = [CChar](repeating: 0, count: 1024)
-            proc_name(pid, &buf, UInt32(buf.count))
-            let name = String(cString: buf)
-            if !name.isEmpty {
-                lines.append("\(pid)\t\(name)")
-            }
+        defer { free(cResult) }
+        var result = String(cString: cResult)
+        if result.count > 20_000 {
+            result = String(result.prefix(20_000)) + "\n[truncated]"
         }
-        return lines.joined(separator: "\n")
+        return result
     }
 
     // MARK: - device_info
 
+    @MainActor
     private func deviceInfo() async -> String {
-        let device = await UIDevice.current
+        let device = UIDevice.current
         let proc   = ProcessInfo.processInfo
 
         var lines: [String] = []
-        lines.append("Device: \(await device.model)")
-        lines.append("Name: \(await device.name)")
-        lines.append("System: \(await device.systemName) \(await device.systemVersion)")
+        lines.append("Device: \(device.model)")
+        lines.append("Name: \(device.name)")
+        lines.append("System: \(device.systemName) \(device.systemVersion)")
         lines.append("Processors: \(proc.processorCount) cores")
         lines.append("RAM: \(proc.physicalMemory / (1024*1024)) MB")
         lines.append("Uptime: \(Int(proc.systemUptime))s")
@@ -351,12 +343,12 @@ final class FileToolsExecutor {
         }
 
         // Sandbox status
-        let sbx = await SandboxManager.shared.status
+        let sbx = SandboxManager.shared.status
         lines.append("Sandbox: \(sbx.label)")
 
         // Battery
-        await device.isBatteryMonitoringEnabled = true
-        let level = await device.batteryLevel
+        device.isBatteryMonitoringEnabled = true
+        let level = device.batteryLevel
         if level >= 0 {
             lines.append("Battery: \(Int(level * 100))%")
         }
@@ -381,11 +373,11 @@ final class FileToolsExecutor {
 
     // MARK: - remote_call
 
+    @MainActor
     private func remoteCall(process: String, function: String, args: [AnyJSON]) async -> String {
         guard !process.isEmpty else { return "Error: process name required" }
         guard !function.isEmpty else { return "Error: function name required" }
-        let isUsable = await SandboxManager.shared.status.isUsable
-        guard isUsable else {
+        guard SandboxManager.shared.status.isUsable else {
             return "Error: sandbox escape required for remote_call"
         }
 

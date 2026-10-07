@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.5"
+    static let codeVersion = "2024-10-07.6"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -289,33 +289,57 @@ final class FileToolsExecutor {
         B("Sandbox: \(sandboxStatus.label)")
 
         // ════════════════════════════════════════════════════════
-        // TIER 0: posix_spawn via shell_exec() (C function)
-        // Uses posix_spawn("/bin/sh") directly from our process.
-        // Requires credential elevation (kernel r/w patches our
-        // ucred to root + CS_PLATFORM_BINARY). NO thread hijacking,
-        // so NO kernel panics from PAC on iOS 18+.
+        // BUILT-IN SHELL: Execute common commands directly in Swift.
+        // No process spawning needed — works with sandbox escape alone.
+        // Handles: ls, cat, grep, find, echo, id, whoami, uname,
+        // mkdir, rm, cp, mv, stat, head, tail, wc, sort, sed, etc.
+        // Also handles pipes (|), chains (&&, ;), and redirection (>).
         // ════════════════════════════════════════════════════════
-        // Only TIER 0 is safe on iOS 18.1+.
-        // TIER 1 & 2 (remote_call / thread hijacking) cause kernel panics
-        // due to PAC enforcement on arm64e. They are permanently disabled.
-        B("TIER0: trying posix_spawn via shell_exec()")
-        let result = await tryPosixSpawn(command: command, startTime: startTime)
-        if let output = result {
-            FileToolsExecutor.posixSpawnOk = true
+        B("BUILTIN: trying built-in shell")
+        if let builtinResult = BuiltinShell.exec(command) {
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            var output = builtinResult.output
+            if output.count > 20_000 {
+                output = String(output.prefix(20_000)) + "\n[truncated]"
+            }
+            if builtinResult.exitCode != 0 && !output.isEmpty {
+                output += "\n[exit code: \(builtinResult.exitCode)]"
+            }
+            if output.isEmpty {
+                output = "(no output, exit code \(builtinResult.exitCode))"
+            }
+            B("BUILTIN DONE: \(output.count)ch exit=\(builtinResult.exitCode) \(String(format: "%.2f", elapsed))s")
+            DebugLog.log("[bashExec] ✓ BUILTIN exit=\(builtinResult.exitCode) \(output.count)ch \(String(format: "%.2f", elapsed))s")
             return output
         }
+        B("BUILTIN: command not recognized, trying posix_spawn")
 
-        FileToolsExecutor.posixSpawnOk = false
-        B("TIER0 FAILED — no safe fallback available")
+        // ════════════════════════════════════════════════════════
+        // TIER 0: posix_spawn via shell_exec() (C function)
+        // Fallback for commands the built-in shell doesn't handle.
+        // On iOS 18.1+ this usually fails with EPERM (no root creds)
+        // because ucred is in PPL-protected memory.
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.posixSpawnOk != false {
+            B("TIER0: trying posix_spawn via shell_exec()")
+            let spawnResult = await tryPosixSpawn(command: command, startTime: startTime)
+            if let output = spawnResult {
+                FileToolsExecutor.posixSpawnOk = true
+                return output
+            }
+            FileToolsExecutor.posixSpawnOk = false
+            B("TIER0 FAILED")
+        }
 
-        // Do NOT fall through to remote_call tiers.
-        // init_remote_call() uses thread hijacking which triggers PAC
-        // kernel panics on iOS 18.1+ arm64e devices.
-
+        // No more tiers. remote_call (thread hijacking) is permanently
+        // disabled — it causes kernel panics on iOS 18.1+ due to PAC.
+        B("ALL METHODS FAILED")
         return """
-        Error: posix_spawn failed. \
-        Thread hijacking (remote_call) is disabled — it causes kernel panics on iOS 18.1+ due to PAC. \
-        The sandbox escape is active but the process may lack credentials to spawn /bin/sh.
+        Error: command not recognized by built-in shell and posix_spawn failed (EPERM). \
+        Supported built-in commands: echo, cat, head, tail, wc, sort, grep, sed, cut, \
+        ls, find, stat, file, du, df, mkdir, rm, cp, mv, touch, chmod, ln, \
+        id, whoami, uname, hostname, uptime, date, pwd, env, which, ps, \
+        base64, md5, shasum, strings, test, expr, seq, and pipes/chains (|, &&, ;, >).
         """
     }
 
@@ -838,9 +862,9 @@ final class FileToolsExecutor {
         // Code version (bump on every push so we know if device has latest)
         lines.append("CodeVersion: \(FileToolsExecutor.codeVersion)")
 
-        // Exec tier status (remote_call tiers disabled — kernel panic on iOS 18.1+)
+        // Exec tier status
         let spawnStatus = FileToolsExecutor.posixSpawnOk.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        lines.append("Exec: posix_spawn=\(spawnStatus) remote_call=disabled(PAC)")
+        lines.append("Exec: builtin_shell=active posix_spawn=\(spawnStatus) remote_call=disabled(PAC)")
 
         // Crash breadcrumbs from previous run (survives kernel panics)
         let crumbs = FileToolsExecutor.readBreadcrumbs()

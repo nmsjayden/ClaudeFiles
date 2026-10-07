@@ -342,12 +342,44 @@ struct ToolDef: Encodable {
 }
 struct Schema: Encodable {
     let type = "object"
-    let properties: [String: Prop]
+    let properties: [String: AnyEncodable]
     let required: [String]
+
+    init(properties: [String: Prop], required: [String]) {
+        self.properties = properties.mapValues { AnyEncodable($0) }
+        self.required = required
+    }
+
+    init(rawProperties: [String: AnyEncodable], required: [String]) {
+        self.properties = rawProperties
+        self.required = required
+    }
 }
 struct Prop: Encodable {
-    let type = "string"
+    let type: String
     let description: String
+
+    init(description: String) {
+        self.type = "string"
+        self.description = description
+    }
+    init(type: String, description: String) {
+        self.type = type
+        self.description = description
+    }
+}
+struct ArrayProp: Encodable {
+    let type = "array"
+    let description: String
+    let items: Prop
+}
+/// Type-erased Encodable wrapper
+struct AnyEncodable: Encodable {
+    private let _encode: (Encoder) throws -> Void
+    init<T: Encodable>(_ value: T) {
+        _encode = { try value.encode(to: $0) }
+    }
+    func encode(to encoder: Encoder) throws { try _encode(encoder) }
 }
 
 enum FileToolDefinitions {
@@ -390,6 +422,25 @@ enum FileToolDefinitions {
                 inputSchema: Schema(properties: ["path": Prop(description: "Absolute path"),
                                                  "lines": Prop(description: "Number of lines to read (default 50)")],
                                     required: ["path"])),
+        ToolDef(name: "process_list",
+                description: "List all running processes with PID and name.",
+                inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "device_info",
+                description: "Get device information: model, iOS version, RAM, disk space, battery, sandbox status.",
+                inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "open_url",
+                description: "Open a URL on the device (launches Safari, App Store links, URL schemes, etc.).",
+                inputSchema: Schema(properties: ["url": Prop(description: "URL to open")],
+                                    required: ["url"])),
+        ToolDef(name: "remote_call",
+                description: "Call a C function in another running process via Mach task ports (requires sandbox escape). Attaches to target process, calls the named function with up to 8 uint64 arguments, returns the result. Use for SpringBoard tweaks, process inspection, etc.",
+                inputSchema: Schema(rawProperties: [
+                    "process": AnyEncodable(Prop(description: "Target process name (e.g. 'SpringBoard', 'launchd')")),
+                    "function": AnyEncodable(Prop(description: "C function name to call in the remote process")),
+                    "args": AnyEncodable(ArrayProp(
+                        description: "Up to 8 uint64 arguments. Pass numbers or hex strings like '0x1234'.",
+                        items: Prop(description: "Argument value")))
+                ], required: ["process", "function"])),
     ]
 }
 
@@ -421,6 +472,8 @@ enum AnyJSON: Codable {
     }
     var string: String? { if case .string(let s) = self { return s } else { return nil } }
     var intValue: Int? { if case .number(let n) = self { return Int(n) } else { return nil } }
+    var uint64Value: UInt64? { if case .number(let n) = self { return UInt64(n) } else { return nil } }
+    var arrayValue: [AnyJSON] { if case .array(let a) = self { return a } else { return [] } }
 }
 
 // MARK: - Errors

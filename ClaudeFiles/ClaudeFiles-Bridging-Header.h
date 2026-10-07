@@ -20,3 +20,9 @@
 
 // Shell command execution (bypasses Swift's iOS popen restriction)
 #import "FilzaJailedDS-SSV-Bypass/shell_exec.h"
+
+// RemoteCall — call functions in other processes via Mach task ports
+#import "FilzaJailedDS-SSV-Bypass/kexploit/RemoteCall.h"
+
+// Process enumeration helper
+#include <libproc.h>

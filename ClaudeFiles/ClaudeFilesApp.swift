@@ -26,9 +26,10 @@ struct ClaudeFilesApp: App {
 
 // MARK: - Background execution support
 
-/// Keeps API calls alive when the app goes to the background.
-/// Uses a UIKit background task to request extra execution time from iOS,
-/// so streaming responses and tool loops finish instead of being killed.
+/// Keeps API calls alive when the app goes to the background using two layers:
+/// 1. Silent audio keepalive — plays inaudible audio so iOS treats the app
+///    as actively playing media and never suspends it (technique from lara/rooootdev)
+/// 2. UIKit background task — fallback that gives ~30s if audio session fails
 class AppDelegate: NSObject, UIApplicationDelegate {
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
@@ -44,22 +45,24 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     @objc private func appDidEnterBackground() {
-        // Request background execution time (up to ~30s, sometimes more)
+        // Layer 1: Silent audio keepalive (indefinite background execution)
+        KeepAliveManager.shared.activate()
+
+        // Layer 2: UIKit background task (fallback, ~30s)
         guard backgroundTaskID == .invalid else { return }
         backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "ClaudeAPICall") { [weak self] in
-            // Expiration handler — system is about to kill us, end gracefully
             self?.endBackgroundTask()
         }
-        DebugLog.log("Background task started (id: \(backgroundTaskID.rawValue))")
+        DebugLog.log("Background: keepalive + task started")
     }
 
     @objc private func appWillEnterForeground() {
+        KeepAliveManager.shared.deactivate()
         endBackgroundTask()
     }
 
     private func endBackgroundTask() {
         guard backgroundTaskID != .invalid else { return }
-        DebugLog.log("Background task ended (id: \(backgroundTaskID.rawValue))")
         UIApplication.shared.endBackgroundTask(backgroundTaskID)
         backgroundTaskID = .invalid
     }

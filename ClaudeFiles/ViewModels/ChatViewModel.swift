@@ -28,11 +28,16 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 9 tools:
+    the FilzaJailedDS kernel exploit (opa334). You have 13 tools:
     - read_file, write_file, list_directory, search_files, get_file_info
     - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
     - grep_search: search file contents for a pattern
     - head_file, tail_file: read first/last N lines of a file
+    - process_list: list all running processes with PIDs
+    - device_info: get device model, iOS version, RAM, disk, battery, sandbox status
+    - open_url: open URLs on the device (Safari, App Store, URL schemes)
+    - remote_call: call C functions in other running processes via Mach task ports \
+    (requires sandbox escape). Use for SpringBoard tweaks, process inspection, etc.
 
     FILESYSTEM NOTES:
     - /var is a symlink to /private/var, /tmp → /private/tmp, /etc → /private/etc
@@ -40,6 +45,12 @@ final class ChatViewModel: ObservableObject {
     - User-data paths like /var/mobile/* may need /private/var/mobile/*
     - When a tool errors, use the exact error message to decide your next move
     - Use bash_exec for complex operations like piped commands, process listing, etc.
+
+    REMOTE_CALL NOTES:
+    - Attaches to a target process by name and calls a named C function with up to 8 args
+    - Requires the sandbox escape to be active
+    - Example: remote_call(process: "SpringBoard", function: "SBSRelaunchAction", args: [])
+    - Returns the uint64 return value of the called function
 
     Always try paths before concluding you lack access. Use markdown in responses: \
     code blocks with language tags, bold for emphasis. Confirm before writing files.

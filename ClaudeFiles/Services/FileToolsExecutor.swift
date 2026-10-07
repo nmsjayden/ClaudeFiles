@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 final class FileToolsExecutor {
 
@@ -11,7 +12,6 @@ final class FileToolsExecutor {
         let pattern   = input["pattern"]?.string   ?? ""
 
         let command   = input["command"]?.string   ?? ""
-        let text      = input["text"]?.string     ?? ""
 
         switch name {
         case "read_file":      return readFile(path: path)
@@ -23,6 +23,12 @@ final class FileToolsExecutor {
         case "grep_search":    return grepSearch(pattern: pattern, directory: directory.isEmpty ? "/" : directory)
         case "head_file":      return headFile(path: path, lines: input["lines"]?.intValue ?? 50)
         case "tail_file":      return tailFile(path: path, lines: input["lines"]?.intValue ?? 50)
+        case "process_list":   return processList()
+        case "device_info":    return await deviceInfo()
+        case "open_url":       return await openURL(input["url"]?.string ?? "")
+        case "remote_call":    return await remoteCall(process: input["process"]?.string ?? "",
+                                                       function: input["function"]?.string ?? "",
+                                                       args: input["args"]?.arrayValue ?? [])
         default:               return "Unknown tool: \(name)"
         }
     }
@@ -293,6 +299,127 @@ final class FileToolsExecutor {
         let start = max(0, lines.count - count)
         let taken = lines[start...]
         return taken.enumerated().map { "\(start + $0.offset + 1): \($0.element)" }.joined(separator: "\n")
+    }
+
+    // MARK: - process_list
+
+    private func processList() -> String {
+        var pids = [pid_t](repeating: 0, count: 1024)
+        let byteCount = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids,
+                                       Int32(MemoryLayout<pid_t>.stride * pids.count))
+        guard byteCount > 0 else {
+            // Fallback to bash
+            return "proc_listpids unavailable — use bash_exec with 'ps aux' instead"
+        }
+        let pidCount = Int(byteCount) / MemoryLayout<pid_t>.stride
+        var lines: [String] = ["PID\tNAME"]
+        for i in 0..<pidCount {
+            let pid = pids[i]
+            if pid == 0 { continue }
+            var buf = [CChar](repeating: 0, count: 1024)
+            proc_name(pid, &buf, UInt32(buf.count))
+            let name = String(cString: buf)
+            if !name.isEmpty {
+                lines.append("\(pid)\t\(name)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - device_info
+
+    private func deviceInfo() async -> String {
+        let device = await UIDevice.current
+        let proc   = ProcessInfo.processInfo
+
+        var lines: [String] = []
+        lines.append("Device: \(await device.model)")
+        lines.append("Name: \(await device.name)")
+        lines.append("System: \(await device.systemName) \(await device.systemVersion)")
+        lines.append("Processors: \(proc.processorCount) cores")
+        lines.append("RAM: \(proc.physicalMemory / (1024*1024)) MB")
+        lines.append("Uptime: \(Int(proc.systemUptime))s")
+
+        // Disk space
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/") {
+            if let total = attrs[.systemSize] as? Int64 {
+                lines.append("Disk total: \(total / (1024*1024*1024)) GB")
+            }
+            if let free = attrs[.systemFreeSize] as? Int64 {
+                lines.append("Disk free: \(free / (1024*1024*1024)) GB")
+            }
+        }
+
+        // Sandbox status
+        let sbx = await SandboxManager.shared.status
+        lines.append("Sandbox: \(sbx.label)")
+
+        // Battery
+        await device.isBatteryMonitoringEnabled = true
+        let level = await device.batteryLevel
+        if level >= 0 {
+            lines.append("Battery: \(Int(level * 100))%")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - open_url
+
+    @MainActor
+    private func openURL(_ urlString: String) async -> String {
+        guard !urlString.isEmpty else { return "Error: url required" }
+        guard let url = URL(string: urlString) else { return "Error: invalid URL" }
+
+        if await UIApplication.shared.canOpenURL(url) {
+            await UIApplication.shared.open(url)
+            return "Opened \(urlString)"
+        } else {
+            return "Error: cannot open URL \(urlString)"
+        }
+    }
+
+    // MARK: - remote_call
+
+    private func remoteCall(process: String, function: String, args: [AnyJSON]) async -> String {
+        guard !process.isEmpty else { return "Error: process name required" }
+        guard !function.isEmpty else { return "Error: function name required" }
+        let isUsable = await SandboxManager.shared.status.isUsable
+        guard isUsable else {
+            return "Error: sandbox escape required for remote_call"
+        }
+
+        DebugLog.log("remoteCall: process=\(process) func=\(function) args=\(args.count)")
+
+        // Initialize RemoteCall connection to target process
+        let initRet = init_remote_call(process, true)
+        guard initRet == 0 else {
+            return "Error: failed to attach to process '\(process)' (code \(initRet)). Is it running?"
+        }
+
+        // Parse up to 8 uint64 arguments
+        var x: [UInt64] = Array(repeating: 0, count: 8)
+        for (i, arg) in args.prefix(8).enumerated() {
+            if let n = arg.uint64Value {
+                x[i] = n
+            } else if let s = arg.string {
+                // If it's a hex string like "0x1234", parse it
+                if s.hasPrefix("0x"), let val = UInt64(s.dropFirst(2), radix: 16) {
+                    x[i] = val
+                } else if let val = UInt64(s) {
+                    x[i] = val
+                }
+            }
+        }
+
+        let result = do_remote_call_stable(5, function,
+                                           x[0], x[1], x[2], x[3],
+                                           x[4], x[5], x[6], x[7])
+
+        destroy_remote_call()
+
+        DebugLog.log("  → remote_call result: 0x\(String(result, radix: 16))")
+        return "Result: \(result) (0x\(String(result, radix: 16)))"
     }
 
     /// Describe why a filesystem operation failed, with a hint if the path has a known symlink alias.

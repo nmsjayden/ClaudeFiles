@@ -404,7 +404,7 @@ enum FileToolDefinitions {
                 description: "Get file metadata.",
                 inputSchema: Schema(properties: ["path": Prop(description: "Absolute path")], required: ["path"])),
         ToolDef(name: "bash_exec",
-                description: "Execute a shell command via launchd remote exec and return stdout/stderr. Requires sandbox escape. Commands run as root through launchd. Keep commands under ~3500 chars. Output is captured from a temp file.",
+                description: "Execute a shell command and return stdout/stderr. Requires sandbox escape. Uses remote code execution through a system daemon (mediaserverd). Output is captured from a temp file. Keep commands under ~3500 chars.",
                 inputSchema: Schema(properties: ["command": Prop(description: "Shell command to execute (e.g. 'ls -la /var', 'uname -a', 'ps aux')")],
                                     required: ["command"])),
         ToolDef(name: "grep_search",

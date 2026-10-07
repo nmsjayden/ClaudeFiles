@@ -209,35 +209,142 @@ final class FileToolsExecutor {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - bash_exec (uses C bridge to bypass Swift's iOS popen restriction)
+    // MARK: - bash_exec (remote exec via mediaserverd — safe to crash/respawn)
 
     private func bashExec(command: String) async -> String {
         guard !command.isEmpty else { return "Error: command required" }
 
         // Block dangerous commands
-        let blocked = ["rm -rf /", "mkfs", "dd if=", ":(){ :", "fork bomb"]
+        let blocked = ["rm -rf /", "mkfs", "dd if=", ":(){ :", "fork bomb",
+                       "reboot", "shutdown", "halt"]
         for b in blocked where command.contains(b) {
             return "Error: blocked dangerous command"
         }
 
         DebugLog.log("bashExec: \(command.prefix(100))")
 
-        var exitCode: Int32 = -1
-        guard let cResult = shell_exec(command, &exitCode) else {
-            DebugLog.log("  → shell_exec returned NULL")
-            return "Error: shell_exec failed (command may not be available on this device)"
+        // Check sandbox escape — required for remote_call
+        let escaped = await MainActor.run { SandboxManager.shared.status.isUsable }
+        guard escaped else {
+            return "Error: sandbox escape required for bash_exec. Run the exploit first."
         }
-        defer { free(cResult) }
 
-        var result = String(cString: cResult)
-        if exitCode != 0 { result += "\n[exit code: \(exitCode)]" }
-        if result.isEmpty { result = "(no output, exit code \(exitCode))" }
+        // Use remote_call via mediaserverd (safe — launchd respawns it if it crashes).
+        // Strategy: write command to trojan mem, call system() in mediaserverd's context,
+        // redirect output to a temp file, then read the temp file back.
+        let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"
 
-        if result.count > 20_000 {
-            result = String(result.prefix(20_000)) + "\n[truncated — \(result.count) total chars]"
+        return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            let lock = NSLock()
+            var resumed = false
+            func resumeOnce(_ value: String) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                cont.resume(returning: value)
+            }
+
+            // Timeout
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 20) {
+                resumeOnce("Error: bash_exec timed out after 20s")
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                DebugLog.log("[bashExec] Attaching to mediaserverd…")
+                let initRet = init_remote_call("mediaserverd", true)
+                guard initRet == 0 else {
+                    DebugLog.log("[bashExec] init_remote_call(mediaserverd) failed: \(initRet)")
+                    // Fallback: try backboardd
+                    DebugLog.log("[bashExec] Trying backboardd…")
+                    let initRet2 = init_remote_call("backboardd", true)
+                    guard initRet2 == 0 else {
+                        DebugLog.log("[bashExec] init_remote_call(backboardd) also failed: \(initRet2)")
+                        resumeOnce("Error: could not attach to any system daemon for command execution (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
+                        return
+                    }
+                    // Continue with backboardd
+                    defer { destroy_remote_call() }
+                    self.executeViaRemoteCall(command: command, tmpOut: tmpOut, resumeOnce: resumeOnce)
+                    return
+                }
+                defer { destroy_remote_call() }
+                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, resumeOnce: resumeOnce)
+            }
         }
-        DebugLog.log("  → bash exit=\(exitCode), output=\(result.count)c")
-        return result
+    }
+
+    /// Execute a command string via system() in the currently-attached remote process.
+    /// Captures output by redirecting to a temp file, then reads it back.
+    private func executeViaRemoteCall(command: String, tmpOut: String,
+                                       resumeOnce: @escaping (String) -> Void) {
+        // Build the shell command that redirects output to our temp file
+        let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
+
+        // Write command string to trojan shared memory page
+        guard remote_writeStr(g_RC_trojanMem, wrappedCmd) else {
+            resumeOnce("Error: failed to write command to remote process memory")
+            return
+        }
+
+        DebugLog.log("[bashExec] Calling system() in remote process…")
+
+        // Call system(g_RC_trojanMem) — system() is in libSystem and available everywhere
+        let result = do_remote_call_stable(10000, "system",
+                                            g_RC_trojanMem, 0, 0, 0, 0, 0, 0, 0)
+
+        DebugLog.log("[bashExec] system() returned: \(result)")
+
+        // Small delay to let output file finish writing
+        usleep(100_000) // 100ms
+
+        // Read back the output file
+        if let data = FileManager.default.contents(atPath: tmpOut),
+           let output = String(data: data, encoding: .utf8) {
+            // Clean up temp file
+            try? FileManager.default.removeItem(atPath: tmpOut)
+
+            // Parse: last line is the exit code
+            var lines = output.components(separatedBy: "\n")
+            var exitCode = "?"
+            // Find the exit code (last non-empty line)
+            while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+                lines.removeLast()
+            }
+            if let last = lines.last, last.allSatisfy({ $0.isNumber }) {
+                exitCode = last
+                lines.removeLast()
+            }
+
+            var text = lines.joined(separator: "\n")
+            if !text.isEmpty && exitCode != "0" {
+                text += "\n[exit code: \(exitCode)]"
+            }
+            if text.isEmpty { text = "(no output, exit code \(exitCode))" }
+
+            if text.count > 20_000 {
+                text = String(text.prefix(20_000)) + "\n[truncated — \(text.count) total chars]"
+            }
+            DebugLog.log("[bashExec] Output: \(text.count) chars, exit=\(exitCode)")
+            resumeOnce(text)
+        } else {
+            // Couldn't read output file — return the system() return value
+            DebugLog.log("[bashExec] Could not read output file \(tmpOut)")
+            // Try POSIX read as fallback
+            let fd = open(tmpOut, O_RDONLY)
+            if fd >= 0 {
+                var buf = [UInt8](repeating: 0, count: 20_001)
+                let n = read(fd, &buf, 20_000)
+                close(fd)
+                unlink(tmpOut)
+                if n > 0 {
+                    let text = String(bytes: buf[0..<n], encoding: .utf8) ?? "(binary output, \(n) bytes)"
+                    resumeOnce(text)
+                    return
+                }
+            }
+            resumeOnce("Command executed (system() returned \(result)). Output file not readable — the command may not have produced output, or /tmp may not be writable from the target process.")
+        }
     }
 
     // MARK: - grep
@@ -316,17 +423,75 @@ final class FileToolsExecutor {
     // MARK: - process_list
 
     private func processList() -> String {
-        // Use shell_exec to run ps — avoids libproc linking issues on iOS
-        var exitCode: Int32 = -1
-        guard let cResult = shell_exec("ps -e -o pid,comm", &exitCode) else {
-            return "Error: could not list processes"
+        // Native sysctl-based process list — no shell needed
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+
+        // First call: get buffer size
+        guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0 else {
+            return "Error: sysctl KERN_PROC_ALL size failed (errno \(errno))"
         }
-        defer { free(cResult) }
-        var result = String(cString: cResult)
+
+        let count = size / MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+
+        // Second call: fill buffer
+        guard sysctl(&mib, UInt32(mib.count), &procs, &size, nil, 0) == 0 else {
+            return "Error: sysctl KERN_PROC_ALL failed (errno \(errno))"
+        }
+
+        let actualCount = size / MemoryLayout<kinfo_proc>.stride
+        var lines: [String] = ["PID\tNAME"]
+
+        for i in 0..<actualCount {
+            let pid = procs[i].kp_proc.p_pid
+            let name = withUnsafePointer(to: procs[i].kp_proc.p_comm) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                    String(cString: $0)
+                }
+            }
+            lines.append("\(pid)\t\(name)")
+        }
+
+        lines.sort { a, b in
+            // Keep header first, sort rest by PID
+            if a.hasPrefix("PID") { return true }
+            if b.hasPrefix("PID") { return false }
+            let pidA = Int(a.prefix(while: { $0 != "\t" })) ?? 0
+            let pidB = Int(b.prefix(while: { $0 != "\t" })) ?? 0
+            return pidA < pidB
+        }
+
+        DebugLog.log("processList: \(actualCount) processes via sysctl")
+        var result = lines.joined(separator: "\n")
         if result.count > 20_000 {
             result = String(result.prefix(20_000)) + "\n[truncated]"
         }
         return result
+    }
+
+    /// Find a PID by process name using sysctl (no shell needed)
+    private func findPid(byName name: String) -> pid_t? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+        guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0 else { return nil }
+        let count = size / MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
+        guard sysctl(&mib, UInt32(mib.count), &procs, &size, nil, 0) == 0 else { return nil }
+        let actual = size / MemoryLayout<kinfo_proc>.stride
+
+        for i in 0..<actual {
+            let procName = withUnsafePointer(to: procs[i].kp_proc.p_comm) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                    String(cString: $0)
+                }
+            }
+            // Match by exact name or case-insensitive contains
+            if procName == name || procName.localizedCaseInsensitiveContains(name) {
+                return procs[i].kp_proc.p_pid
+            }
+        }
+        return nil
     }
 
     // MARK: - device_info
@@ -830,48 +995,65 @@ final class FileToolsExecutor {
     }
 
     private func freezeOrResume(target: String, signal: String, verb: String) -> String {
-        // If target looks like a PID (all digits), use directly
-        let pid: String
-        if target.allSatisfy(\.isNumber) {
-            pid = target
+        // Resolve the target to a PID
+        let targetPid: pid_t
+        if target.allSatisfy(\.isNumber), let p = Int32(target) {
+            targetPid = p
+        } else if let p = findPid(byName: target) {
+            targetPid = p
         } else {
-            // Find PID by process name using pgrep
-            var exitCode: Int32 = -1
-            guard let result = shell_exec("pgrep -x '\(target)' 2>/dev/null || pgrep -f '\(target)' 2>/dev/null", &exitCode) else {
-                return "Error: could not find process '\(target)'"
-            }
-            defer { free(result) }
-            let pids = String(cString: result).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let firstPid = pids.split(separator: "\n").first else {
-                return "Error: no running process found matching '\(target)'"
-            }
-            pid = String(firstPid)
+            return "Error: no running process found matching '\(target)'"
         }
 
-        // Send the signal
-        var exitCode: Int32 = -1
-        let cmd = "kill -\(signal) \(pid) 2>&1"
-        guard let result = shell_exec(cmd, &exitCode) else {
-            return "Error: kill command failed"
+        // Map signal name to signal number
+        let sig: Int32
+        switch signal {
+        case "STOP": sig = SIGSTOP
+        case "CONT": sig = SIGCONT
+        case "TERM": sig = SIGTERM
+        default:     sig = SIGTERM
         }
-        defer { free(result) }
 
-        let output = String(cString: result).trimmingCharacters(in: .whitespacesAndNewlines)
-        if exitCode == 0 {
-            DebugLog.log("[AppControl] \(verb) PID \(pid) (target: \(target))")
-            return "\(verb) process '\(target)' (PID \(pid))"
+        // Native kill() syscall — no shell needed
+        let ret = kill(targetPid, sig)
+        if ret == 0 {
+            DebugLog.log("[AppControl] \(verb) PID \(targetPid) (target: \(target))")
+            return "\(verb) process '\(target)' (PID \(targetPid))"
         } else {
-            return "Error: kill -\(signal) \(pid) failed (exit \(exitCode)): \(output)"
+            let err = String(cString: strerror(errno))
+            return "Error: kill(\(targetPid), \(signal)) failed — \(err)"
         }
     }
 
     private func launchApp(bundleId: String) async -> String {
-        // Try uiopen first (if available), then fall back to open URL scheme
-        var exitCode: Int32 = -1
-        if let result = shell_exec("uiopen --bundleid \(bundleId) 2>&1", &exitCode) {
-            defer { free(result) }
-            if exitCode == 0 {
-                DebugLog.log("[AppControl] Launched \(bundleId) via uiopen")
+        // Use SBSLaunchApplicationWithIdentifier via remote_call if sandbox is escaped
+        let escaped = await MainActor.run { SandboxManager.shared.status.isUsable }
+        if escaped {
+            // Try launching via SpringBoard's private API
+            let launched = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let initRet = init_remote_call("SpringBoard", true)
+                    guard initRet == 0 else {
+                        cont.resume(returning: false)
+                        return
+                    }
+                    defer { destroy_remote_call() }
+
+                    // Write bundle ID to shared memory
+                    guard remote_writeStr(g_RC_trojanMem, bundleId) else {
+                        cont.resume(returning: false)
+                        return
+                    }
+
+                    // Call SBSLaunchApplicationWithIdentifier(bundleId, false)
+                    let result = do_remote_call_stable(5000,
+                        "SBSLaunchApplicationWithIdentifier",
+                        g_RC_trojanMem, 0, 0, 0, 0, 0, 0, 0)
+                    cont.resume(returning: result == 0)
+                }
+            }
+            if launched {
+                DebugLog.log("[AppControl] Launched \(bundleId) via SpringBoard remote_call")
                 return "Launched app: \(bundleId)"
             }
         }

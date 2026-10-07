@@ -469,7 +469,7 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("ERROR: proc_self() returned invalid: 0x%llx\n", self_proc);
         return buf_finish();
     }
-    buf_append("proc_self() = 0x%llx ✓\n", self_proc);
+    buf_append("proc_self() = 0x%llx OK\n", self_proc);
 
     // ── Step 2: Read proc fields safely ──
     NSLog(@"[SWAP] Step 2: read p_pid, p_name");
@@ -485,7 +485,7 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("ERROR: proc_ro invalid: 0x%llx\n", proc_ro);
         return buf_finish();
     }
-    buf_append("proc_ro = 0x%llx ✓\n", proc_ro);
+    buf_append("proc_ro = 0x%llx OK\n", proc_ro);
 
     // ── Step 4: ucred ──
     NSLog(@"[SWAP] Step 4: ucred");
@@ -494,7 +494,7 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("ERROR: ucred invalid: 0x%llx\n", ucred);
         return buf_finish();
     }
-    buf_append("ucred = 0x%llx ✓\n", ucred);
+    buf_append("ucred = 0x%llx OK\n", ucred);
 
     // ── Step 5: cr_label ──
     NSLog(@"[SWAP] Step 5: cr_label");
@@ -503,7 +503,7 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("ERROR: cr_label invalid: 0x%llx\n", label);
         return buf_finish();
     }
-    buf_append("cr_label = 0x%llx ✓\n", label);
+    buf_append("cr_label = 0x%llx OK\n", label);
 
     // ── Step 6: sandbox (from label perpolicy) ──
     NSLog(@"[SWAP] Step 6: sandbox from label+0x%x", off_label_l_perpolicy_sandbox);
@@ -518,7 +518,7 @@ char *kresearch_swap_sandbox_profile(void) {
         }
         return buf_finish();
     }
-    buf_append("sandbox = 0x%llx ✓\n", sandbox);
+    buf_append("sandbox = 0x%llx OK\n", sandbox);
 
     // ── Step 7: Read sandbox_label fields ──
     NSLog(@"[SWAP] Step 7: sandbox_label fields");

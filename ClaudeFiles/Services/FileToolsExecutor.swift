@@ -245,7 +245,13 @@ final class FileToolsExecutor {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - bash_exec (remote exec via mediaserverd — safe to crash/respawn)
+    // MARK: - bash_exec (tiered: popen → posix_spawn → remote_call)
+
+    /// Track which execution method works so we don't retry failed ones.
+    private static var popenWorks: Bool? = nil       // nil = untested
+    private static var spawnWorks: Bool? = nil        // nil = untested
+    private static var remoteNoMig: Bool? = nil       // nil = untested
+    private static var remoteMig: Bool? = nil         // nil = untested
 
     private func bashExec(command: String) async -> String {
         guard !command.isEmpty else { return "Error: command required" }
@@ -260,15 +266,12 @@ final class FileToolsExecutor {
         let startTime = CFAbsoluteTimeGetCurrent()
         let B = FileToolsExecutor.breadcrumb  // shorthand
 
-        // ── BREADCRUMB: survives kernel panics (fsync'd to disk) ──
         B("═══ bashExec START cmd=\(command.prefix(200))")
 
         // Check for breadcrumbs from a previous crash
         let oldCrumbs = FileToolsExecutor.readBreadcrumbs()
         if oldCrumbs.contains("bashExec START") && oldCrumbs.contains("BEFORE") && !oldCrumbs.contains("AFTER") {
-            // Previous run crashed between a BEFORE/AFTER pair — log what killed us
-            DebugLog.log("[bashExec] ⚠ PREVIOUS CRASH DETECTED. Breadcrumbs from last run:\n\(oldCrumbs)")
-            NSLog("[bashExec] ⚠ PREVIOUS CRASH DETECTED — see debug.log for breadcrumbs")
+            DebugLog.log("[bashExec] ⚠ PREVIOUS CRASH DETECTED. Breadcrumbs:\n\(oldCrumbs)")
         }
         FileToolsExecutor.clearBreadcrumbs()
         B("Fresh start for cmd=\(command.prefix(100))")
@@ -277,100 +280,366 @@ final class FileToolsExecutor {
 
         // ── SANDBOX STATE CHECK ──
         let sandboxStatus = await MainActor.run { SandboxManager.shared.status }
-        let escaped = sandboxStatus.isUsable
-        B("Sandbox: \(sandboxStatus.label) usable=\(escaped)")
-
-        guard escaped else {
+        guard sandboxStatus.isUsable else {
             B("ABORT: sandbox not active")
-            return "Error: sandbox escape required for bash_exec. Run the exploit first. Current status: \(sandboxStatus.label)"
+            return "Error: sandbox escape required for bash_exec. Current status: \(sandboxStatus.label)"
         }
+        B("Sandbox: \(sandboxStatus.label)")
 
-        // ── KERNEL R/W HEALTH CHECK ──
-        B("BEFORE proc_self()")
-        let selfProc = proc_self()
-        B("AFTER proc_self() = 0x\(String(selfProc, radix: 16))")
-
-        if selfProc == 0 {
-            B("ABORT: proc_self=0, kernel r/w dead")
-            return "Error: kernel read/write appears to be dead (proc_self returned NULL). The exploit may need to be re-run."
-        }
-
-        // ── PROCESS VISIBILITY (informational) ──
-        var visibleDaemons: [String] = []
-        for name in ["mediaserverd", "backboardd", "SpringBoard", "launchd"] {
-            if let pid = findPid(byName: name) {
-                visibleDaemons.append("\(name)(\(pid))")
+        // ════════════════════════════════════════════════════════
+        // TIER 1: popen() — in-process, ZERO kernel manipulation
+        // If sandbox escape patched our extensions, this may just work.
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.popenWorks != false {
+            B("TIER1: trying popen()")
+            let popenResult = tryPopen(command: command)
+            if let output = popenResult {
+                FileToolsExecutor.popenWorks = true
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                B("TIER1 SUCCESS via popen in \(String(format: "%.2f", elapsed))s")
+                DebugLog.log("[bashExec] ✓ popen() worked! \(output.count)ch \(String(format: "%.2f", elapsed))s")
+                return output
+            } else {
+                FileToolsExecutor.popenWorks = false
+                B("TIER1 FAILED: popen returned nil (errno=\(errno) \(String(cString: strerror(errno))))")
+                DebugLog.log("[bashExec] popen() failed: errno=\(errno) \(String(cString: strerror(errno)))")
             }
         }
-        B("sysctl visible: [\(visibleDaemons.joined(separator: ", "))]")
 
-        let targetProcess = "mediaserverd"  // always try mediaserverd first via kernel r/w
+        // ════════════════════════════════════════════════════════
+        // TIER 2: posix_spawn — in-process, no kernel manipulation
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.spawnWorks != false {
+            B("TIER2: trying posix_spawn")
+            let spawnResult = tryPosixSpawn(command: command)
+            if let output = spawnResult {
+                FileToolsExecutor.spawnWorks = true
+                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+                B("TIER2 SUCCESS via posix_spawn in \(String(format: "%.2f", elapsed))s")
+                DebugLog.log("[bashExec] ✓ posix_spawn() worked! \(output.count)ch \(String(format: "%.2f", elapsed))s")
+                return output
+            } else {
+                FileToolsExecutor.spawnWorks = false
+                B("TIER2 FAILED: posix_spawn failed")
+                DebugLog.log("[bashExec] posix_spawn() failed")
+            }
+        }
 
+        // ════════════════════════════════════════════════════════
+        // TIER 3: remote_call WITHOUT MIG filter bypass
+        // Avoids the code path that causes kernel panics on iOS 18+
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.remoteNoMig != false {
+            B("TIER3: trying remote_call WITHOUT MIG bypass")
+            let result = await tryRemoteCall(command: command, useMigBypass: false, startTime: startTime)
+            if let output = result {
+                FileToolsExecutor.remoteNoMig = true
+                return output
+            } else {
+                FileToolsExecutor.remoteNoMig = false
+                B("TIER3 FAILED")
+            }
+        }
+
+        // ════════════════════════════════════════════════════════
+        // TIER 4: remote_call WITH MIG filter bypass (DANGEROUS on iOS 18+)
+        // This is the path that causes kernel panics. Last resort only.
+        // ════════════════════════════════════════════════════════
+        if FileToolsExecutor.remoteMig != false {
+            B("TIER4: trying remote_call WITH MIG bypass (DANGEROUS)")
+            let result = await tryRemoteCall(command: command, useMigBypass: true, startTime: startTime)
+            if let output = result {
+                FileToolsExecutor.remoteMig = true
+                return output
+            } else {
+                FileToolsExecutor.remoteMig = false
+                B("TIER4 FAILED")
+            }
+        }
+
+        B("ALL TIERS FAILED")
+        let summary = """
+        Error: all execution methods failed.
+        • popen(): \(FileToolsExecutor.popenWorks == false ? "FAILED (AMFI/sandbox blocks fork+exec)" : "untested")
+        • posix_spawn(): \(FileToolsExecutor.spawnWorks == false ? "FAILED" : "untested")
+        • remote_call (no MIG): \(FileToolsExecutor.remoteNoMig == false ? "FAILED" : "untested")
+        • remote_call (MIG bypass): \(FileToolsExecutor.remoteMig == false ? "FAILED/SKIPPED (kernel panic risk)" : "untested")
+
+        The sandbox escape patches filesystem extensions but may not patch AMFI process execution policies.
+        """
+        return summary
+    }
+
+    // MARK: - Tier 1: popen() — direct in-process shell
+
+    /// Try executing command via popen(). Returns output string or nil if popen fails.
+    private func tryPopen(command: String) -> String? {
+        let B = FileToolsExecutor.breadcrumb
+
+        // popen calls fork+exec internally — if sandbox blocks this, it returns NULL
+        let wrappedCmd = "(\(command)) 2>&1"
+        B("BEFORE popen()")
+        guard let pipe = popen(wrappedCmd, "r") else {
+            B("AFTER popen() = NULL errno=\(errno)")
+            return nil
+        }
+        B("AFTER popen() = OK (pipe open)")
+
+        // Read output
+        var output = ""
+        var buf = [CChar](repeating: 0, count: 4096)
+        while fgets(&buf, Int32(buf.count), pipe) != nil {
+            output += String(cString: buf)
+        }
+
+        let exitStatus = pclose(pipe)
+        let exitCode = (exitStatus >> 8) & 0xFF  // WEXITSTATUS
+        B("pclose exitStatus=\(exitStatus) exitCode=\(exitCode)")
+
+        // Trim and format
+        if output.hasSuffix("\n") { output = String(output.dropLast()) }
+        if output.isEmpty { output = "(no output)" }
+        if exitCode != 0 && exitCode != 255 {  // 255 = signal, not meaningful
+            output += "\n[exit code: \(exitCode)]"
+        }
+        if output.count > 20_000 {
+            output = String(output.prefix(20_000)) + "\n[truncated — \(output.count) total chars]"
+        }
+        return output
+    }
+
+    // MARK: - Tier 2: posix_spawn — direct in-process
+
+    /// Try executing command via posix_spawn. Returns output string or nil on failure.
+    private func tryPosixSpawn(command: String) -> String? {
+        let B = FileToolsExecutor.breadcrumb
+
+        let tmpOut = "/tmp/.claude_spawn_\(ProcessInfo.processInfo.processIdentifier)"
+
+        // Set up file actions to redirect stdout/stderr to temp file
+        var fileActions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+        // Create output file
+        let outFd = open(tmpOut, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard outFd >= 0 else {
+            B("TIER2: can't create output file")
+            return nil
+        }
+        close(outFd)
+
+        // Redirect stdout and stderr to the temp file
+        posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, tmpOut,
+                                          O_WRONLY | O_TRUNC, 0o644)
+        posix_spawn_file_actions_adddup2(&fileActions, STDOUT_FILENO, STDERR_FILENO)
+
+        // Set up spawn attributes
+        var spawnAttr: posix_spawnattr_t?
+        posix_spawnattr_init(&spawnAttr)
+        defer { posix_spawnattr_destroy(&spawnAttr) }
+
+        // Spawn /bin/sh -c "command"
+        var pid: pid_t = 0
+        let argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup("/bin/sh"),
+            strdup("-c"),
+            strdup(command),
+            nil
+        ]
+        defer { for a in argv { if let a = a { free(a) } } }
+
+        // Environment — pass through minimal env
+        let envp: [UnsafeMutablePointer<CChar>?] = [
+            strdup("PATH=/usr/bin:/bin:/usr/sbin:/sbin"),
+            strdup("HOME=/var/mobile"),
+            strdup("TMPDIR=/tmp"),
+            nil
+        ]
+        defer { for e in envp { if let e = e { free(e) } } }
+
+        B("BEFORE posix_spawn(/bin/sh)")
+        let spawnRet = posix_spawn(&pid, "/bin/sh", &fileActions, &spawnAttr,
+                                     argv, envp)
+        B("AFTER posix_spawn = \(spawnRet) pid=\(pid)")
+
+        guard spawnRet == 0 else {
+            B("posix_spawn failed: \(spawnRet) (\(String(cString: strerror(spawnRet))))")
+            unlink(tmpOut)
+            return nil
+        }
+
+        // Wait for child
+        var status: Int32 = 0
+        B("BEFORE waitpid(\(pid))")
+        waitpid(pid, &status, 0)
+        B("AFTER waitpid status=\(status)")
+
+        let exitCode = (status >> 8) & 0xFF
+
+        // Read output
+        guard let data = FileManager.default.contents(atPath: tmpOut),
+              var output = String(data: data, encoding: .utf8) else {
+            unlink(tmpOut)
+            return "(no output, exit code \(exitCode))"
+        }
+        unlink(tmpOut)
+
+        if output.hasSuffix("\n") { output = String(output.dropLast()) }
+        if output.isEmpty { output = "(no output)" }
+        if exitCode != 0 {
+            output += "\n[exit code: \(exitCode)]"
+        }
+        if output.count > 20_000 {
+            output = String(output.prefix(20_000)) + "\n[truncated — \(output.count) total chars]"
+        }
+        return output
+    }
+
+    // MARK: - Tier 3/4: remote_call (with or without MIG bypass)
+
+    /// Try executing command via init_remote_call → system() in target process.
+    /// Returns output string or nil if init_remote_call fails.
+    private func tryRemoteCall(command: String, useMigBypass: Bool,
+                                startTime: CFAbsoluteTime) async -> String? {
+        let B = FileToolsExecutor.breadcrumb
+        let tier = useMigBypass ? "TIER4" : "TIER3"
         let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"
 
-        return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
-            let once = OnceResume(cont)
+        // Check kernel r/w health first
+        B("\(tier): BEFORE proc_self()")
+        let selfProc = proc_self()
+        B("\(tier): AFTER proc_self() = 0x\(String(selfProc, radix: 16))")
+        guard selfProc != 0 else {
+            B("\(tier): proc_self=0, kernel r/w dead")
+            return nil
+        }
 
-            // Timeout
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 30) {
-                B("TIMEOUT 30s")
-                once.resume("Error: bash_exec timed out after 30s")
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let once = OnceResumeOptional(cont)
+
+            // Timeout — 20s for non-MIG, 30s for MIG
+            let timeout: Double = useMigBypass ? 30 : 20
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) {
+                B("\(tier): TIMEOUT \(timeout)s")
+                once.resume(nil)
             }
 
-            // Serialize all remote_call access
             FileToolsExecutor.remoteCallQueue.async { [self] in
-                B("Serial queue acquired")
+                B("\(tier): Serial queue acquired")
 
-                // ── init_remote_call (THIS IS THE LIKELY KERNEL PANIC POINT) ──
-                B("BEFORE init_remote_call(\(targetProcess), migFilter=true)")
-                let initRet = init_remote_call(targetProcess, true)
-                B("AFTER init_remote_call(\(targetProcess)) = \(initRet)")
+                // Try mediaserverd first, then backboardd
+                for target in ["mediaserverd", "backboardd"] {
+                    B("\(tier): BEFORE init_remote_call(\(target), migFilter=\(useMigBypass))")
+                    let initRet = init_remote_call(target, useMigBypass)
+                    B("\(tier): AFTER init_remote_call(\(target)) = \(initRet)")
 
-                guard initRet == 0 else {
-                    // Fallback to backboardd
-                    B("BEFORE init_remote_call(backboardd, migFilter=true)")
-                    let initRet2 = init_remote_call("backboardd", true)
-                    B("AFTER init_remote_call(backboardd) = \(initRet2)")
-
-                    guard initRet2 == 0 else {
-                        B("BOTH FAILED: mediaserverd=\(initRet) backboardd=\(initRet2)")
-                        once.resume("Error: could not attach to any daemon (mediaserverd=\(initRet), backboardd=\(initRet2)). Is sandbox escape active?")
-                        return
-                    }
-                    defer {
-                        B("BEFORE destroy_remote_call (backboardd)")
-                        destroy_remote_call()
-                        B("AFTER destroy_remote_call (backboardd)")
+                    guard initRet == 0 else {
+                        B("\(tier): \(target) failed with \(initRet)")
+                        continue
                     }
 
+                    // Success — execute command
                     let trojanAddr = g_RC_trojanMem
-                    B("g_RC_trojanMem (backboardd) = 0x\(String(trojanAddr, radix: 16))")
+                    B("\(tier): g_RC_trojanMem = 0x\(String(trojanAddr, radix: 16))")
+
                     guard trojanAddr != 0 else {
-                        once.resume("Error: trojan memory null after backboardd init")
+                        B("\(tier): trojan memory null, destroying")
+                        destroy_remote_call()
+                        continue
+                    }
+
+                    let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
+                    guard wrappedCmd.utf8.count < 4096 else {
+                        destroy_remote_call()
+                        B("\(tier): command too long")
+                        once.resume("Error: command too long (\(wrappedCmd.utf8.count) bytes)")
                         return
                     }
 
-                    self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once, startTime: startTime)
-                    return
-                }
+                    B("\(tier): BEFORE remote_writeStr")
+                    guard remote_writeStr(trojanAddr, wrappedCmd) else {
+                        destroy_remote_call()
+                        B("\(tier): remote_writeStr failed")
+                        continue
+                    }
+                    B("\(tier): AFTER remote_writeStr OK")
 
-                defer {
-                    B("BEFORE destroy_remote_call (\(targetProcess))")
+                    B("\(tier): BEFORE do_remote_call_stable(system)")
+                    let result = do_remote_call_stable(10000, "system",
+                                                        trojanAddr, 0, 0, 0, 0, 0, 0, 0)
+                    B("\(tier): AFTER do_remote_call_stable = \(result)")
+
                     destroy_remote_call()
-                    B("AFTER destroy_remote_call (\(targetProcess))")
-                }
+                    B("\(tier): destroy_remote_call done")
 
-                let trojanAddr = g_RC_trojanMem
-                B("g_RC_trojanMem = 0x\(String(trojanAddr, radix: 16)) pageAligned=\((trojanAddr & 0xFFF) == 0)")
-                guard trojanAddr != 0 else {
-                    once.resume("Error: trojan memory null after init. init_remote_call succeeded but shared memory is null.")
+                    usleep(100_000) // 100ms for output
+
+                    // Read output
+                    let output = self.readCommandOutput(tmpOut: tmpOut, systemResult: result,
+                                                         startTime: startTime, tier: tier)
+                    once.resume(output)
                     return
                 }
 
-                B("All checks passed, calling executeViaRemoteCall")
-                self.executeViaRemoteCall(command: command, tmpOut: tmpOut, once: once, startTime: startTime)
+                // Both targets failed
+                B("\(tier): all targets failed")
+                once.resume(nil)
             }
         }
+    }
+
+    /// Read command output from temp file (shared by remote_call tiers).
+    private func readCommandOutput(tmpOut: String, systemResult: UInt64,
+                                     startTime: CFAbsoluteTime, tier: String) -> String {
+        let B = FileToolsExecutor.breadcrumb
+
+        if FileManager.default.fileExists(atPath: tmpOut),
+           let data = FileManager.default.contents(atPath: tmpOut),
+           let raw = String(data: data, encoding: .utf8) {
+            try? FileManager.default.removeItem(atPath: tmpOut)
+
+            var lines = raw.components(separatedBy: "\n")
+            var exitCode = "?"
+            while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
+                lines.removeLast()
+            }
+            if let last = lines.last, last.allSatisfy({ $0.isNumber }) {
+                exitCode = last
+                lines.removeLast()
+            }
+
+            var text = lines.joined(separator: "\n")
+            if !text.isEmpty && exitCode != "0" {
+                text += "\n[exit code: \(exitCode)]"
+            }
+            if text.isEmpty { text = "(no output, exit code \(exitCode))" }
+            if text.count > 20_000 {
+                text = String(text.prefix(20_000)) + "\n[truncated]"
+            }
+
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            B("\(tier) DONE: \(text.count)ch exit=\(exitCode) \(String(format: "%.2f", elapsed))s")
+            DebugLog.log("[bashExec] ✓ \(tier) exit=\(exitCode) \(text.count)ch \(String(format: "%.2f", elapsed))s")
+            return text
+        }
+
+        // POSIX fallback
+        let fd = open(tmpOut, O_RDONLY)
+        if fd >= 0 {
+            var buf = [UInt8](repeating: 0, count: 20_001)
+            let n = read(fd, &buf, 20_000)
+            close(fd)
+            unlink(tmpOut)
+            if n > 0 {
+                let text = String(bytes: buf[0..<n], encoding: .utf8) ?? "(binary output, \(n) bytes)"
+                B("\(tier) DONE via POSIX: \(n) bytes")
+                return text
+            }
+        }
+
+        B("\(tier): no output file, system()=\(systemResult)")
+        return "Command executed (system() returned \(systemResult)). No output captured."
     }
 
     /// Thread-safe "resume exactly once" wrapper for CheckedContinuation.
@@ -380,6 +649,21 @@ final class FileToolsExecutor {
         private let cont: CheckedContinuation<String, Never>
         init(_ cont: CheckedContinuation<String, Never>) { self.cont = cont }
         func resume(_ value: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !resumed else { return }
+            resumed = true
+            cont.resume(returning: value)
+        }
+    }
+
+    /// Same as OnceResume but for optional String (used by tryRemoteCall tiers).
+    private final class OnceResumeOptional {
+        private let lock = NSLock()
+        private var resumed = false
+        private let cont: CheckedContinuation<String?, Never>
+        init(_ cont: CheckedContinuation<String?, Never>) { self.cont = cont }
+        func resume(_ value: String?) {
             lock.lock()
             defer { lock.unlock() }
             guard !resumed else { return }
@@ -662,6 +946,15 @@ final class FileToolsExecutor {
             lines.append("Battery: \(Int(level * 100))%")
         }
 
+        // Exec tier status
+        let tierStatus = [
+            "popen": FileToolsExecutor.popenWorks.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
+            "posix_spawn": FileToolsExecutor.spawnWorks.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
+            "remote (no MIG)": FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
+            "remote (MIG)": FileToolsExecutor.remoteMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
+        ]
+        lines.append("Exec tiers: " + tierStatus.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
+
         // Crash breadcrumbs from previous run (survives kernel panics)
         let crumbs = FileToolsExecutor.readBreadcrumbs()
         if crumbs != "(no breadcrumbs)" {
@@ -754,9 +1047,13 @@ final class FileToolsExecutor {
                     }
                 }
 
-                // Step 1: init — Mach task port attachment + thread hijacking
-                DebugLog.log("  → remote_call: init_remote_call(\(localProcess))...")
-                let initRet = init_remote_call(localProcess, true)
+                // Step 1: init — try WITHOUT MIG bypass first (safer on iOS 18+)
+                DebugLog.log("  → remote_call: init_remote_call(\(localProcess), migFilter=false)...")
+                var initRet = init_remote_call(localProcess, false)
+                if initRet != 0 {
+                    DebugLog.log("  → remote_call: no-MIG failed (\(initRet)), trying with MIG bypass...")
+                    initRet = init_remote_call(localProcess, true)
+                }
                 guard initRet == 0 else {
                     DebugLog.log("  → remote_call: init failed with \(initRet)")
                     safeResume("Error: failed to attach to process '\(localProcess)' (code \(initRet)). Make sure the process is running and the sandbox escape is active.")
@@ -1058,7 +1355,7 @@ final class FileToolsExecutor {
             }
 
             DispatchQueue.global(qos: .userInitiated).async {
-                DebugLog.log("[MemDump] Attaching to \(process)…")
+                DebugLog.log("[MemDump] Attaching to \(process) (no MIG bypass)…")
                 let initRet = init_remote_call(process, false)
                 guard initRet == 0 else {
                     DebugLog.log("[MemDump] init_remote_call failed: \(initRet)")
@@ -1174,7 +1471,11 @@ final class FileToolsExecutor {
             // Try launching via SpringBoard's private API
             let launched = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let initRet = init_remote_call("SpringBoard", true)
+                    // Try without MIG bypass first (safer on iOS 18+)
+                    var initRet = init_remote_call("SpringBoard", false)
+                    if initRet != 0 {
+                        initRet = init_remote_call("SpringBoard", true)
+                    }
                     guard initRet == 0 else {
                         cont.resume(returning: false)
                         return

@@ -475,15 +475,13 @@ final class FileToolsExecutor {
 
     /// Safely extract process name from kinfo_proc's p_comm tuple
     private func extractProcName(_ info: inout kinfo_proc) -> String {
-        let commSize = MemoryLayout.size(ofValue: info.kp_proc.p_comm)
         return withUnsafeBytes(of: &info.kp_proc.p_comm) { rawBuf in
-            // Ensure null-terminated within the buffer
-            let bytes = rawBuf.bindMemory(to: CChar.self)
-            // Find the null terminator or use the whole buffer
-            var len = 0
-            while len < commSize && bytes[len] != 0 { len += 1 }
-            if len == 0 { return "?" }
-            return String(cString: bytes.baseAddress!)
+            guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: CChar.self) else {
+                return "?"
+            }
+            // String(cString:) reads until the null terminator,
+            // which is guaranteed within the p_comm buffer.
+            return String(cString: base)
         }
     }
 

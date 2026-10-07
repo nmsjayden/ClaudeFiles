@@ -2,9 +2,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <unistd.h>
+#include <spawn.h>
+
+// iOS default PATH for popen — ensures common binaries are found
+#define IOS_PATH "PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
 
 char *shell_exec(const char *command, int *exit_code) {
     if (!command) return NULL;
+
+    // Set PATH before running (popen inherits the app's empty env)
+    setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", 0);
 
     // Redirect stderr to stdout
     size_t cmdLen = strlen(command) + 16;

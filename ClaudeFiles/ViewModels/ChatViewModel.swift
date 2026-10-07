@@ -395,16 +395,39 @@ final class ChatViewModel: ObservableObject {
         currentTask = Task { await runTurn(convId: convId) }
     }
 
-    /// Remove oldest messages when conversation exceeds maxMessages limit
+    /// Remove oldest messages when conversation exceeds maxMessages limit.
+    /// Trims on group boundaries so tool_use / tool_result pairs stay intact.
     private func trimConversation(_ convId: UUID) {
         let limit = SettingsStore.shared.maxMessages
         guard limit > 0 else { return } // 0 = unlimited
         store.mutateById(convId) { conv in
             guard conv.messages.count > limit else { return }
             let excess = conv.messages.count - limit
-            // Remove from the front, but keep at least the most recent messages
-            conv.messages.removeFirst(excess)
-            DebugLog.log("[Trim] Removed \(excess) old messages (limit=\(limit), now=\(conv.messages.count))")
+            // Find a safe cut point at or after `excess` that doesn't split a
+            // tool_use / tool_result group. Walk forward from `excess` until we
+            // land on a message that is NOT an orphaned tool_result.
+            var cutAt = excess
+            while cutAt < conv.messages.count && conv.messages[cutAt].toolUseId != nil {
+                cutAt += 1
+            }
+            // Also skip past any assistant message whose tool_results we'd be
+            // cutting into — if the message right before cutAt is an assistant
+            // with tool_use blocks, we should include it in the removal too
+            // (its results were already removed or will be orphaned).
+            if cutAt > 0 && cutAt < conv.messages.count {
+                // Make sure we start on a user (non-tool-result) message
+                let first = conv.messages[cutAt]
+                if first.role == "assistant" {
+                    // Check if any following tool_results belong to it
+                    // If so, keep this assistant + its results — back up to before it
+                    // Actually, starting on an assistant is fine; messagesToAPI
+                    // will strip it if it's at the beginning. Just make sure
+                    // we don't start on a tool_result.
+                }
+            }
+            guard cutAt > 0 else { return }
+            conv.messages.removeFirst(cutAt)
+            DebugLog.log("[Trim] Removed \(cutAt) old messages (limit=\(limit), now=\(conv.messages.count))")
         }
     }
 
@@ -685,18 +708,36 @@ final class ChatViewModel: ObservableObject {
         }
 
         // ── Phase 3: Final cleanup ──
-        // Remove consecutive same-role messages (can happen after stripping)
+        // Ensure every tool_result references a tool_use_id that actually
+        // appears in the preceding assistant message, and enforce alternation.
         var cleaned: [ChatMessage] = []
+
         for msg in result {
-            if let last = cleaned.last, last.role == msg.role {
-                // Skip consecutive same-role (shouldn't happen often after Phase 2)
-                // But keep user messages by merging conceptually
-                if msg.role == .user {
-                    cleaned.append(msg)  // API allows consecutive user only via tool_result
+            if msg.role == .user {
+                // If this user message contains tool_result(s), verify each one
+                // has a matching tool_use in the most recent assistant message.
+                if case .toolResult(let tid, _) = msg.content {
+                    if !assistantHasToolUse(cleaned, toolUseId: tid) { continue }
+                } else if case .toolResults(let trs) = msg.content {
+                    let valid = trs.filter { assistantHasToolUse(cleaned, toolUseId: $0.toolUseId) }
+                    if valid.isEmpty { continue }
+                    if valid.count != trs.count {
+                        // Re-wrap with only the valid ones
+                        if valid.count == 1 {
+                            cleaned.append(ChatMessage(role: .user, content: .toolResult(
+                                toolUseId: valid[0].toolUseId, result: valid[0].result)))
+                        } else {
+                            cleaned.append(ChatMessage(role: .user, content: .toolResults(valid)))
+                        }
+                        continue
+                    }
                 }
-                continue
+                cleaned.append(msg)
+            } else {
+                // Assistant — skip if consecutive with previous assistant
+                if let last = cleaned.last, last.role == .assistant { continue }
+                cleaned.append(msg)
             }
-            cleaned.append(msg)
         }
 
         // Must start with user message
@@ -710,6 +751,24 @@ final class ChatViewModel: ObservableObject {
         }
 
         return cleaned
+    }
+
+    /// Check if the most recent assistant message in `history` contains
+    /// a tool_use block with the given ID. Tool_result messages must reference
+    /// a tool_use in the preceding assistant turn (which may have multiple
+    /// tool_result user messages following it).
+    private func assistantHasToolUse(_ history: [ChatMessage], toolUseId: String) -> Bool {
+        // Walk backwards past any user messages (earlier tool_results from the
+        // same assistant turn) to find the assistant message they belong to.
+        for msg in history.reversed() {
+            if msg.role == .assistant {
+                if case .blocks(let blocks) = msg.content {
+                    return blocks.contains { $0.type == "tool_use" && $0.id == toolUseId }
+                }
+                return false
+            }
+        }
+        return false
     }
 
     // MARK: - Tool execution

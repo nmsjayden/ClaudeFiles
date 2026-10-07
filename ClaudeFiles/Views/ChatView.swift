@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import PhotosUI
+import UniformTypeIdentifiers
 
 // MARK: - Entry point
 
@@ -417,12 +418,13 @@ private struct InputBar: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
     @State private var photoSelection: [PhotosPickerItem] = []
+    @State private var showingAttachMenu = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // Image preview strip
-            if !vm.pendingImages.isEmpty {
-                pendingImageStrip
+            // Attachment preview strip (images + files)
+            if !vm.pendingImages.isEmpty || !vm.pendingFiles.isEmpty {
+                pendingAttachmentStrip
             }
             HStack(alignment: .bottom, spacing: 8) {
                 attachButton
@@ -430,7 +432,7 @@ private struct InputBar: View {
                 actionButton
             }
             .padding(.horizontal, 12)
-            .padding(.top, vm.pendingImages.isEmpty ? 10 : 6)
+            .padding(.top, (vm.pendingImages.isEmpty && vm.pendingFiles.isEmpty) ? 10 : 6)
             .padding(.bottom, 12)
         }
         .background(Color(.systemBackground))
@@ -438,11 +440,24 @@ private struct InputBar: View {
             vm.addImages(from: items)
             photoSelection = []
         }
+        .fileImporter(
+            isPresented: $vm.showingFilePicker,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls { vm.addFile(from: url) }
+            case .failure(let err):
+                vm.error = "File import failed: \(err.localizedDescription)"
+            }
+        }
     }
 
-    private var pendingImageStrip: some View {
+    private var pendingAttachmentStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                // Image thumbnails
                 ForEach(vm.pendingImages) { img in
                     ZStack(alignment: .topTrailing) {
                         Image(uiImage: img.thumbnail)
@@ -452,15 +467,31 @@ private struct InputBar: View {
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                             .overlay(RoundedRectangle(cornerRadius: 10)
                                 .stroke(Color(.separator), lineWidth: 0.5))
-                        Button {
-                            withAnimation(.easeOut(duration: 0.15)) { vm.removeImage(img) }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 18))
-                                .foregroundStyle(.white, Color(.darkGray))
-                                .shadow(radius: 2)
+                        removeButton { withAnimation { vm.removeImage(img) } }
+                    }
+                }
+                // File chips
+                ForEach(vm.pendingFiles) { file in
+                    ZStack(alignment: .topTrailing) {
+                        VStack(spacing: 4) {
+                            Image(systemName: file.icon)
+                                .font(.system(size: 20))
+                                .foregroundStyle(Color.accentColor)
+                            Text(file.fileName)
+                                .font(.system(size: 9, weight: .medium))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                                .foregroundStyle(.primary)
+                            Text(file.sizeString)
+                                .font(.system(size: 8))
+                                .foregroundStyle(.secondary)
                         }
-                        .offset(x: 6, y: -6)
+                        .frame(width: 72, height: 64)
+                        .background(Color(.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color(.separator), lineWidth: 0.5))
+                        removeButton { withAnimation { vm.removeFile(file) } }
                     }
                 }
             }
@@ -470,9 +501,28 @@ private struct InputBar: View {
         }
     }
 
+    private func removeButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 18))
+                .foregroundStyle(.white, Color(.darkGray))
+                .shadow(radius: 2)
+        }
+        .offset(x: 6, y: -6)
+    }
+
     private var attachButton: some View {
-        PhotosPicker(selection: $photoSelection, maxSelectionCount: 4,
-                     matching: .images) {
+        Menu {
+            PhotosPicker(selection: $photoSelection, maxSelectionCount: 4,
+                         matching: .images) {
+                Label("Photo Library", systemImage: "photo.on.rectangle")
+            }
+            Button {
+                vm.showingFilePicker = true
+            } label: {
+                Label("Choose File", systemImage: "doc")
+            }
+        } label: {
             Image(systemName: "plus.circle.fill")
                 .font(.system(size: 28))
                 .foregroundStyle(Color.accentColor, Color(.secondarySystemBackground))
@@ -516,6 +566,7 @@ private struct InputBar: View {
         } else {
             let canSend = !vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                           || !vm.pendingImages.isEmpty
+                          || !vm.pendingFiles.isEmpty
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 vm.send()

@@ -236,19 +236,23 @@ final class FileToolsExecutor {
         }
         NSLog("[bashExec] Sandbox escape confirmed")
 
-        // Pre-flight: verify target process exists before calling init_remote_call
-        // (init_remote_call does proc_find_by_name via kernel r/w — if that returns 0
-        //  and the code reads from near-zero address, we get a hard crash)
+        // Pre-flight: try to verify target process exists via sysctl.
+        // NOTE: sysctl(KERN_PROC_ALL) from a sandboxed app usually CANNOT see system
+        // daemons like mediaserverd — the sandbox restricts process visibility.
+        // So this is a soft check (log only). init_remote_call finds the process
+        // through kernel r/w which bypasses sysctl visibility restrictions.
         let targetProcess: String
-        if let _ = findPid(byName: "mediaserverd") {
+        if let pid = findPid(byName: "mediaserverd") {
             targetProcess = "mediaserverd"
-            NSLog("[bashExec] Pre-flight: mediaserverd found via sysctl")
-        } else if let _ = findPid(byName: "backboardd") {
+            NSLog("[bashExec] Pre-flight: mediaserverd found via sysctl (pid %d)", pid)
+        } else if let pid = findPid(byName: "backboardd") {
             targetProcess = "backboardd"
-            NSLog("[bashExec] Pre-flight: mediaserverd NOT found, backboardd found via sysctl")
+            NSLog("[bashExec] Pre-flight: backboardd found via sysctl (pid %d)", pid)
         } else {
-            NSLog("[bashExec] ABORT: neither mediaserverd nor backboardd found in process list")
-            return "Error: target daemon not running. Neither mediaserverd nor backboardd found in process list."
+            // Can't see them via sysctl — expected from sandbox. Proceed anyway;
+            // init_remote_call uses kernel r/w to find the process.
+            targetProcess = "mediaserverd"
+            NSLog("[bashExec] Pre-flight: daemons not visible via sysctl (sandbox). Proceeding with mediaserverd via kernel r/w.")
         }
 
         let tmpOut = "/tmp/.claude_cmd_\(ProcessInfo.processInfo.processIdentifier)"

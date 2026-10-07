@@ -49,7 +49,7 @@ final class ChatViewModel: ObservableObject {
             )
         }
 
-        private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+        static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
             let size = image.size
             guard max(size.width, size.height) > maxDimension else { return image }
             let scale = maxDimension / max(size.width, size.height)
@@ -79,15 +79,6 @@ final class ChatViewModel: ObservableObject {
                 }
             }
         }
-    }
-
-    private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
-        let size = image.size
-        guard max(size.width, size.height) > maxDimension else { return image }
-        let scale = maxDimension / max(size.width, size.height)
-        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
-        let renderer = UIGraphicsImageRenderer(size: newSize)
-        return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
     }
 
     func removeImage(_ image: PendingImage) {

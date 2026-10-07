@@ -848,13 +848,11 @@ struct ToolCallCard: View {
         }
     }
     private var pathArg: String? {
-        tool.input["path"]?.string
-        ?? tool.input["directory"]?.string
-        ?? tool.input["command"]?.string
-        ?? tool.input["process"]?.string
-        ?? tool.input["database"]?.string
-        ?? tool.input["bundle_id"]?.string
-        ?? tool.input["source"]?.string
+        let keys = ["path", "directory", "command", "process", "database", "bundle_id", "source"]
+        for key in keys {
+            if let val = tool.input[key]?.string { return val }
+        }
+        return nil
     }
     private func valueStr(_ v: AnyJSON?) -> String {
         guard let v else { return "" }

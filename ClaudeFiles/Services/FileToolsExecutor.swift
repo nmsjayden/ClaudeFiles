@@ -245,11 +245,9 @@ final class FileToolsExecutor {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - bash_exec (tiered: popen → posix_spawn → remote_call)
+    // MARK: - bash_exec (remote_call with safe MIG-bypass fallback)
 
     /// Track which execution method works so we don't retry failed ones.
-    private static var popenWorks: Bool? = nil       // nil = untested
-    private static var spawnWorks: Bool? = nil        // nil = untested
     private static var remoteNoMig: Bool? = nil       // nil = untested
     private static var remoteMig: Bool? = nil         // nil = untested
 
@@ -264,7 +262,7 @@ final class FileToolsExecutor {
         }
 
         let startTime = CFAbsoluteTimeGetCurrent()
-        let B = FileToolsExecutor.breadcrumb  // shorthand
+        let B = FileToolsExecutor.breadcrumb
 
         B("═══ bashExec START cmd=\(command.prefix(200))")
 
@@ -287,203 +285,48 @@ final class FileToolsExecutor {
         B("Sandbox: \(sandboxStatus.label)")
 
         // ════════════════════════════════════════════════════════
-        // TIER 1: popen() — in-process, ZERO kernel manipulation
-        // If sandbox escape patched our extensions, this may just work.
-        // ════════════════════════════════════════════════════════
-        if FileToolsExecutor.popenWorks != false {
-            B("TIER1: trying popen()")
-            let popenResult = tryPopen(command: command)
-            if let output = popenResult {
-                FileToolsExecutor.popenWorks = true
-                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                B("TIER1 SUCCESS via popen in \(String(format: "%.2f", elapsed))s")
-                DebugLog.log("[bashExec] ✓ popen() worked! \(output.count)ch \(String(format: "%.2f", elapsed))s")
-                return output
-            } else {
-                FileToolsExecutor.popenWorks = false
-                B("TIER1 FAILED: popen returned nil (errno=\(errno) \(String(cString: strerror(errno))))")
-                DebugLog.log("[bashExec] popen() failed: errno=\(errno) \(String(cString: strerror(errno)))")
-            }
-        }
-
-        // ════════════════════════════════════════════════════════
-        // TIER 2: posix_spawn — in-process, no kernel manipulation
-        // ════════════════════════════════════════════════════════
-        if FileToolsExecutor.spawnWorks != false {
-            B("TIER2: trying posix_spawn")
-            let spawnResult = tryPosixSpawn(command: command)
-            if let output = spawnResult {
-                FileToolsExecutor.spawnWorks = true
-                let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-                B("TIER2 SUCCESS via posix_spawn in \(String(format: "%.2f", elapsed))s")
-                DebugLog.log("[bashExec] ✓ posix_spawn() worked! \(output.count)ch \(String(format: "%.2f", elapsed))s")
-                return output
-            } else {
-                FileToolsExecutor.spawnWorks = false
-                B("TIER2 FAILED: posix_spawn failed")
-                DebugLog.log("[bashExec] posix_spawn() failed")
-            }
-        }
-
-        // ════════════════════════════════════════════════════════
-        // TIER 3: remote_call WITHOUT MIG filter bypass
-        // Avoids the code path that causes kernel panics on iOS 18+
+        // TIER 1: remote_call WITHOUT MIG filter bypass
+        // The MIG bypass (mig_bypass_resume/pause) is what causes
+        // kernel panics on iOS 18+. Try without it first.
         // ════════════════════════════════════════════════════════
         if FileToolsExecutor.remoteNoMig != false {
-            B("TIER3: trying remote_call WITHOUT MIG bypass")
+            B("TIER1: trying remote_call WITHOUT MIG bypass (safe)")
             let result = await tryRemoteCall(command: command, useMigBypass: false, startTime: startTime)
             if let output = result {
                 FileToolsExecutor.remoteNoMig = true
                 return output
             } else {
                 FileToolsExecutor.remoteNoMig = false
-                B("TIER3 FAILED")
+                B("TIER1 FAILED")
             }
         }
 
         // ════════════════════════════════════════════════════════
-        // TIER 4: remote_call WITH MIG filter bypass (DANGEROUS on iOS 18+)
-        // This is the path that causes kernel panics. Last resort only.
+        // TIER 2: remote_call WITH MIG filter bypass (DANGEROUS)
+        // This causes kernel panics on iOS 18+. Last resort only.
         // ════════════════════════════════════════════════════════
         if FileToolsExecutor.remoteMig != false {
-            B("TIER4: trying remote_call WITH MIG bypass (DANGEROUS)")
+            B("TIER2: trying remote_call WITH MIG bypass (DANGEROUS on iOS 18+)")
             let result = await tryRemoteCall(command: command, useMigBypass: true, startTime: startTime)
             if let output = result {
                 FileToolsExecutor.remoteMig = true
                 return output
             } else {
                 FileToolsExecutor.remoteMig = false
-                B("TIER4 FAILED")
+                B("TIER2 FAILED")
             }
         }
 
         B("ALL TIERS FAILED")
-        let summary = """
+        return """
         Error: all execution methods failed.
-        • popen(): \(FileToolsExecutor.popenWorks == false ? "FAILED (AMFI/sandbox blocks fork+exec)" : "untested")
-        • posix_spawn(): \(FileToolsExecutor.spawnWorks == false ? "FAILED" : "untested")
-        • remote_call (no MIG): \(FileToolsExecutor.remoteNoMig == false ? "FAILED" : "untested")
-        • remote_call (MIG bypass): \(FileToolsExecutor.remoteMig == false ? "FAILED/SKIPPED (kernel panic risk)" : "untested")
-
-        The sandbox escape patches filesystem extensions but may not patch AMFI process execution policies.
+        • remote_call (no MIG bypass): \(FileToolsExecutor.remoteNoMig == false ? "FAILED" : "untested")
+        • remote_call (MIG bypass): \(FileToolsExecutor.remoteMig == false ? "FAILED/DANGEROUS" : "untested")
+        Note: iOS blocks popen/posix_spawn from apps. Shell execution requires remote_call into a system daemon.
         """
-        return summary
     }
 
-    // MARK: - Tier 1: popen() — direct in-process shell
-
-    /// Try executing command via popen(). Returns output string or nil if popen fails.
-    private func tryPopen(command: String) -> String? {
-        let B = FileToolsExecutor.breadcrumb
-
-        // popen calls fork+exec internally — if sandbox blocks this, it returns NULL
-        let wrappedCmd = "(\(command)) 2>&1"
-        B("BEFORE popen()")
-        guard let pipe = popen(wrappedCmd, "r") else {
-            B("AFTER popen() = NULL errno=\(errno)")
-            return nil
-        }
-        B("AFTER popen() = OK (pipe open)")
-
-        // Read output
-        var output = ""
-        var buf = [CChar](repeating: 0, count: 4096)
-        while fgets(&buf, Int32(buf.count), pipe) != nil {
-            output += String(cString: buf)
-        }
-
-        let exitStatus = pclose(pipe)
-        let exitCode = (exitStatus >> 8) & 0xFF  // WEXITSTATUS
-        B("pclose exitStatus=\(exitStatus) exitCode=\(exitCode)")
-
-        // Trim and format
-        if output.hasSuffix("\n") { output = String(output.dropLast()) }
-        if output.isEmpty { output = "(no output)" }
-        if exitCode != 0 && exitCode != 255 {  // 255 = signal, not meaningful
-            output += "\n[exit code: \(exitCode)]"
-        }
-        if output.count > 20_000 {
-            output = String(output.prefix(20_000)) + "\n[truncated — \(output.count) total chars]"
-        }
-        return output
-    }
-
-    // MARK: - Tier 2: posix_spawn — direct in-process
-
-    /// Try executing command via posix_spawn. Returns output string or nil on failure.
-    private func tryPosixSpawn(command: String) -> String? {
-        let B = FileToolsExecutor.breadcrumb
-
-        let tmpOut = "/tmp/.claude_spawn_\(ProcessInfo.processInfo.processIdentifier)"
-
-        // Redirect output: command > tmpOut 2>&1
-        let wrappedCmd = "(\(command)) > \(tmpOut) 2>&1; echo $? >> \(tmpOut)"
-
-        // Use C-level posix_spawn with proper Swift bridging
-        let shPath = "/bin/sh"
-        let shArg = "-c"
-
-        var pid: pid_t = 0
-
-        B("BEFORE posix_spawn(/bin/sh)")
-
-        let spawnRet = shPath.withCString { pathPtr in
-            shArg.withCString { argPtr in
-                wrappedCmd.withCString { cmdPtr in
-                    // Build argv: ["/bin/sh", "-c", wrappedCmd, NULL]
-                    let mutPath = UnsafeMutablePointer(mutating: pathPtr)
-                    let mutArg = UnsafeMutablePointer(mutating: argPtr)
-                    let mutCmd = UnsafeMutablePointer(mutating: cmdPtr)
-                    var argv: [UnsafeMutablePointer<CChar>?] = [mutPath, mutArg, mutCmd, nil]
-
-                    return posix_spawn(&pid, pathPtr, nil, nil, &argv, nil)
-                }
-            }
-        }
-
-        B("AFTER posix_spawn = \(spawnRet) pid=\(pid)")
-
-        guard spawnRet == 0 else {
-            B("posix_spawn failed: \(spawnRet) (\(String(cString: strerror(spawnRet))))")
-            return nil
-        }
-
-        // Wait for child
-        var status: Int32 = 0
-        B("BEFORE waitpid(\(pid))")
-        waitpid(pid, &status, 0)
-        B("AFTER waitpid status=\(status)")
-
-        // Read output (same format as remote_call: output + exit code on last line)
-        guard let data = FileManager.default.contents(atPath: tmpOut),
-              let raw = String(data: data, encoding: .utf8) else {
-            unlink(tmpOut)
-            return "(command ran but no output file)"
-        }
-        unlink(tmpOut)
-
-        var lines = raw.components(separatedBy: "\n")
-        var exitCode = "?"
-        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty {
-            lines.removeLast()
-        }
-        if let last = lines.last, last.allSatisfy({ $0.isNumber }) {
-            exitCode = last
-            lines.removeLast()
-        }
-
-        var text = lines.joined(separator: "\n")
-        if !text.isEmpty && exitCode != "0" {
-            text += "\n[exit code: \(exitCode)]"
-        }
-        if text.isEmpty { text = "(no output, exit code \(exitCode))" }
-        if text.count > 20_000 {
-            text = String(text.prefix(20_000)) + "\n[truncated]"
-        }
-        return text
-    }
-
-    // MARK: - Tier 3/4: remote_call (with or without MIG bypass)
+    // MARK: - remote_call execution (with or without MIG bypass)
 
     /// Try executing command via init_remote_call → system() in target process.
     /// Returns output string or nil if init_remote_call fails.
@@ -934,13 +777,9 @@ final class FileToolsExecutor {
         }
 
         // Exec tier status
-        let tierStatus = [
-            "popen": FileToolsExecutor.popenWorks.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
-            "posix_spawn": FileToolsExecutor.spawnWorks.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
-            "remote (no MIG)": FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested",
-            "remote (MIG)": FileToolsExecutor.remoteMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
-        ]
-        lines.append("Exec tiers: " + tierStatus.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
+        let noMigStatus = FileToolsExecutor.remoteNoMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
+        let migStatus = FileToolsExecutor.remoteMig.map { $0 ? "✓ works" : "✗ failed" } ?? "untested"
+        lines.append("Exec: remote(noMIG)=\(noMigStatus) remote(MIG)=\(migStatus)")
 
         // Crash breadcrumbs from previous run (survives kernel panics)
         let crumbs = FileToolsExecutor.readBreadcrumbs()

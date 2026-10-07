@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import PhotosUI
 
 // MARK: - Entry point
 
@@ -415,16 +416,68 @@ private struct MessageList: View {
 private struct InputBar: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
+    @State private var photoSelection: [PhotosPickerItem] = []
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            textField
-            actionButton
+        VStack(spacing: 0) {
+            // Image preview strip
+            if !vm.pendingImages.isEmpty {
+                pendingImageStrip
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                attachButton
+                textField
+                actionButton
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, vm.pendingImages.isEmpty ? 10 : 6)
+            .padding(.bottom, 12)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
-        .padding(.bottom, 12)
         .background(Color(.systemBackground))
+        .onChange(of: photoSelection) { items in
+            vm.addImages(from: items)
+            photoSelection = []
+        }
+    }
+
+    private var pendingImageStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(vm.pendingImages) { img in
+                    ZStack(alignment: .topTrailing) {
+                        Image(uiImage: img.thumbnail)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: 64, height: 64)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color(.separator), lineWidth: 0.5))
+                        Button {
+                            withAnimation(.easeOut(duration: 0.15)) { vm.removeImage(img) }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.white, Color(.darkGray))
+                                .shadow(radius: 2)
+                        }
+                        .offset(x: 6, y: -6)
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+        }
+    }
+
+    private var attachButton: some View {
+        PhotosPicker(selection: $photoSelection, maxSelectionCount: 4,
+                     matching: .images) {
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: 28))
+                .foregroundStyle(Color.accentColor, Color(.secondarySystemBackground))
+        }
+        .padding(.bottom, 4)
     }
 
     private var textField: some View {
@@ -461,20 +514,22 @@ private struct InputBar: View {
                 }
             }
         } else {
+            let canSend = !vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || !vm.pendingImages.isEmpty
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 vm.send()
             } label: {
                 ZStack {
                     Circle()
-                        .fill(vm.inputText.isEmpty ? Color(.systemGray4) : Color.accentColor)
+                        .fill(canSend ? Color.accentColor : Color(.systemGray4))
                         .frame(width: 36, height: 36)
                     Image(systemName: "arrow.up")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(.white)
                 }
             }
-            .disabled(vm.inputText.isEmpty)
+            .disabled(!canSend)
         }
     }
 }
@@ -495,19 +550,37 @@ struct MessageBubble: View {
     private var userBubble: some View {
         HStack {
             Spacer(minLength: 48)
-            Text(message.text)
-                .padding(.horizontal, 14).padding(.vertical, 10)
-                .background(Color.accentColor)
-                .foregroundStyle(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 20))
-                .textSelection(.enabled)
-                .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = message.text
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
+            VStack(alignment: .trailing, spacing: 6) {
+                // Image thumbnails
+                if !message.attachments.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(Array(message.attachments.enumerated()), id: \.offset) { _, att in
+                            if let data = att.imageData, let uiImage = UIImage(data: data) {
+                                Image(uiImage: uiImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: 80, height: 80)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }
+                        }
                     }
                 }
+                if !message.text.isEmpty {
+                    Text(message.text)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(Color.accentColor)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 20))
+                        .textSelection(.enabled)
+                }
+            }
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = message.text
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
         }
     }
 
@@ -677,34 +750,60 @@ struct ToolCallCard: View {
 
     private var iconName: String {
         switch tool.name {
-        case "read_file":      return "doc.text"
-        case "write_file":     return "pencil.and.outline"
-        case "list_directory": return "folder"
-        case "search_files":   return "magnifyingglass"
-        case "get_file_info":  return "info.circle"
-        case "bash_exec":      return "terminal"
-        case "grep_search":    return "text.magnifyingglass"
-        case "head_file":      return "text.line.first.and.arrowtriangle.forward"
-        case "tail_file":      return "text.line.last.and.arrowtriangle.forward"
-        default:               return "wrench.and.screwdriver"
+        case "read_file":       return "doc.text"
+        case "write_file":      return "pencil.and.outline"
+        case "list_directory":  return "folder"
+        case "search_files":    return "magnifyingglass"
+        case "get_file_info":   return "info.circle"
+        case "bash_exec":       return "terminal"
+        case "grep_search":     return "text.magnifyingglass"
+        case "head_file":       return "text.line.first.and.arrowtriangle.forward"
+        case "tail_file":       return "text.line.last.and.arrowtriangle.forward"
+        case "process_list":    return "list.number"
+        case "device_info":     return "iphone"
+        case "open_url":        return "safari"
+        case "remote_call":     return "bolt.horizontal"
+        case "sqlite_query":    return "cylinder.split.1x2"
+        case "installed_apps":  return "apps.iphone"
+        case "read_plist":      return "doc.badge.gearshape"
+        case "memory_dump":     return "memorychip"
+        case "app_control":     return "power"
+        case "copy_move_file":  return "doc.on.doc"
+        default:                return "wrench.and.screwdriver"
         }
     }
     private var humanName: String {
         switch tool.name {
-        case "read_file":      return "Read"
-        case "write_file":     return "Write"
-        case "list_directory": return "List"
-        case "search_files":   return "Search"
-        case "get_file_info":  return "Info"
-        case "bash_exec":      return "Shell"
-        case "grep_search":    return "Grep"
-        case "head_file":      return "Head"
-        case "tail_file":      return "Tail"
-        default:               return tool.name
+        case "read_file":       return "Read"
+        case "write_file":      return "Write"
+        case "list_directory":  return "List"
+        case "search_files":    return "Search"
+        case "get_file_info":   return "Info"
+        case "bash_exec":       return "Shell"
+        case "grep_search":     return "Grep"
+        case "head_file":       return "Head"
+        case "tail_file":       return "Tail"
+        case "process_list":    return "Processes"
+        case "device_info":     return "Device"
+        case "open_url":        return "Open URL"
+        case "remote_call":     return "RemoteCall"
+        case "sqlite_query":    return "SQLite"
+        case "installed_apps":  return "Apps"
+        case "read_plist":      return "Plist"
+        case "memory_dump":     return "Memory"
+        case "app_control":     return "App Control"
+        case "copy_move_file":  return "Copy/Move"
+        default:                return tool.name
         }
     }
     private var pathArg: String? {
-        tool.input["path"]?.string ?? tool.input["directory"]?.string ?? tool.input["command"]?.string
+        tool.input["path"]?.string
+        ?? tool.input["directory"]?.string
+        ?? tool.input["command"]?.string
+        ?? tool.input["process"]?.string
+        ?? tool.input["database"]?.string
+        ?? tool.input["bundle_id"]?.string
+        ?? tool.input["source"]?.string
     }
     private func valueStr(_ v: AnyJSON?) -> String {
         guard let v else { return "" }
@@ -1079,6 +1178,7 @@ struct SettingsSheet: View {
             Form {
                 modelSection
                 permissionsSection
+                conversationSection
                 appearanceSection
                 sandboxSection
                 aboutSection
@@ -1133,6 +1233,28 @@ struct SettingsSheet: View {
             Text("Permissions")
         } footer: {
             Text("When enabled, file writes are executed immediately without the approval dialog.")
+        }
+    }
+
+    private var conversationSection: some View {
+        Section {
+            HStack {
+                Image(systemName: "text.bubble")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Max messages per chat")
+                    Text(settings.maxMessages == 0 ? "Unlimited" : "\(settings.maxMessages) messages")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Stepper("", value: $settings.maxMessages, in: 0...500, step: 25)
+                    .labelsHidden()
+            }
+        } header: {
+            Text("Conversation")
+        } footer: {
+            Text("Oldest messages are trimmed when a chat exceeds this limit. Set to 0 for unlimited. Server-side compaction also manages context automatically.")
         }
     }
 

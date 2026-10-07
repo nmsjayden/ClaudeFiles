@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import PhotosUI
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -7,6 +8,9 @@ final class ChatViewModel: ObservableObject {
     @Published var isSending:    Bool   = false
     @Published var error:        String?
     @Published var pendingWrite: PendingWrite?
+
+    // Image attachments pending send
+    @Published var pendingImages: [PendingImage] = []
 
     // Live streaming state — keyed by block index so updates apply in-place
     @Published var streamingText:         String = ""
@@ -22,6 +26,72 @@ final class ChatViewModel: ObservableObject {
 
     init(store: ConversationStore) {
         self.store = store
+    }
+
+    // MARK: - Image handling
+
+    struct PendingImage: Identifiable {
+        let id = UUID()
+        let data: Data
+        let mimeType: String
+        let thumbnail: UIImage
+
+        /// Convert to a StoredAttachment with resized base64 data
+        func toAttachment() -> StoredAttachment {
+            // Resize to max 1024px and compress as JPEG for API efficiency
+            let image = UIImage(data: data) ?? thumbnail
+            let resized = Self.resize(image, maxDimension: 1536)
+            let jpegData = resized.jpegData(compressionQuality: 0.7) ?? data
+            return StoredAttachment(
+                mimeType: "image/jpeg",
+                base64Data: jpegData.base64EncodedString(),
+                fileName: nil
+            )
+        }
+
+        private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+            let size = image.size
+            guard max(size.width, size.height) > maxDimension else { return image }
+            let scale = maxDimension / max(size.width, size.height)
+            let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+            let renderer = UIGraphicsImageRenderer(size: newSize)
+            return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
+        }
+    }
+
+    func addImages(from results: [PhotosPickerItem]) {
+        Task {
+            for item in results {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    let mimeType: String
+                    if let uti = item.supportedContentTypes.first {
+                        if uti.conforms(to: .png) { mimeType = "image/png" }
+                        else if uti.conforms(to: .gif) { mimeType = "image/gif" }
+                        else if uti.conforms(to: .webP) { mimeType = "image/webp" }
+                        else { mimeType = "image/jpeg" }
+                    } else {
+                        mimeType = "image/jpeg"
+                    }
+                    if let uiImage = UIImage(data: data) {
+                        let thumb = PendingImage.resize(uiImage, maxDimension: 120)
+                        pendingImages.append(PendingImage(data: data, mimeType: mimeType, thumbnail: thumb))
+                    }
+                }
+            }
+        }
+    }
+
+    private static func resize(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+        let size = image.size
+        guard max(size.width, size.height) > maxDimension else { return image }
+        let scale = maxDimension / max(size.width, size.height)
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: newSize)
+        return renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: newSize)) }
+    }
+
+    func removeImage(_ image: PendingImage) {
+        pendingImages.removeAll { $0.id == image.id }
     }
 
     // MARK: - System prompt
@@ -116,7 +186,8 @@ final class ChatViewModel: ObservableObject {
             }
 
             let role: ChatMessage.Role = (m.role == "user") ? .user : .assistant
-            out.append(DisplayMessage(role: role, text: m.text, toolCalls: toolCalls))
+            out.append(DisplayMessage(role: role, text: m.text, toolCalls: toolCalls,
+                                       attachments: m.attachments ?? []))
         }
         return out
     }
@@ -136,24 +207,53 @@ final class ChatViewModel: ObservableObject {
 
     func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
+        let images = pendingImages
+        guard !text.isEmpty || !images.isEmpty, !isSending else { return }
         guard let convId = store.selectedId else { return }
 
         inputText = ""
+        pendingImages = []
         isSending = true
         error = nil
         streamingText = ""
         streamingToolCalls = [:]
         activeStreamingConvId = convId
 
+        // Convert pending images to stored attachments
+        let attachments: [StoredAttachment]? = images.isEmpty ? nil : images.map { $0.toAttachment() }
+
         // Append user message + maybe set title
         store.mutateById(convId) { conv in
             conv.messages.append(StoredMessage(role: "user", text: text,
-                                               apiBlocks: nil, toolUseId: nil, toolResult: nil))
-            if conv.title == "New chat" { conv.title = String(text.prefix(50)) }
+                                               apiBlocks: nil, toolUseId: nil, toolResult: nil,
+                                               attachments: attachments))
+            if conv.title == "New chat" {
+                conv.title = String((text.isEmpty ? "Image chat" : text).prefix(50))
+            }
         }
 
+        // Trim conversation if over limit
+        trimConversation(convId)
+
         currentTask = Task { await runTurn(convId: convId) }
+    }
+
+    /// Remove oldest messages when conversation exceeds maxMessages limit
+    private func trimConversation(_ convId: UUID) {
+        let limit = SettingsStore.shared.maxMessages
+        guard limit > 0 else { return } // 0 = unlimited
+        store.mutateById(convId) { conv in
+            guard conv.messages.count > limit else { return }
+            let excess = conv.messages.count - limit
+            // Remove from the front, but keep at least the most recent messages
+            conv.messages.removeFirst(excess)
+            DebugLog.log("[Trim] Removed \(excess) old messages (limit=\(limit), now=\(conv.messages.count))")
+        }
+    }
+
+    /// Current message count for the selected conversation
+    var messageCount: Int {
+        store.selected?.messages.count ?? 0
     }
 
     func stopGenerating() {
@@ -340,7 +440,11 @@ final class ChatViewModel: ObservableObject {
             }
 
             if m.role == "user" {
-                groups.append(ChatMessage(role: .user, content: .text(m.text)))
+                if let attachments = m.attachments, !attachments.isEmpty {
+                    groups.append(ChatMessage(role: .user, content: .textWithImages(m.text, attachments)))
+                } else {
+                    groups.append(ChatMessage(role: .user, content: .text(m.text)))
+                }
                 i += 1
                 continue
             }

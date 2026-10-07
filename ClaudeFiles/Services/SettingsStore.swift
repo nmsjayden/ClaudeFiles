@@ -8,7 +8,8 @@ final class SettingsStore: ObservableObject {
     @AppStorage("selectedModel") var selectedModel: String = ModelOption.sonnet55.id
     @AppStorage("autoApproveWrites") var autoApproveWrites: Bool = false
     @AppStorage("appTheme") var appTheme: String = "system"  // "system", "dark", "light"
-    @AppStorage("appVersion") var appVersion: String = "1.2.0"
+    @AppStorage("appVersion") var appVersion: String = "1.3.0"
+    @AppStorage("maxMessages") var maxMessages: Int = 150     // per conversation, 0 = unlimited
 
     private init() {}
 

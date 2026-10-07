@@ -24,6 +24,17 @@ struct ChatMessage: Encodable, Identifiable {
         case .toolResults(let results):
             let blocks = results.map { ToolResultBlock(type: "tool_result", toolUseId: $0.toolUseId, content: $0.result) }
             try c.encode(blocks, forKey: .content)
+        case .textWithImages(let text, let images):
+            var blocks: [ImageAPIContent] = []
+            for img in images {
+                blocks.append(.image(ImageContentBlock(
+                    source: ImageSource(mediaType: img.mimeType, data: img.base64Data)
+                )))
+            }
+            if !text.isEmpty {
+                blocks.append(.text(TextContentBlock(text: text)))
+            }
+            try c.encode(blocks, forKey: .content)
         }
     }
 }
@@ -33,6 +44,57 @@ enum MessageContent {
     case blocks([APIBlock])
     case toolResult(toolUseId: String, result: String)
     case toolResults([(toolUseId: String, result: String)])
+    case textWithImages(String, [StoredAttachment])
+}
+
+// MARK: - Image content blocks for API
+
+enum ImageAPIContent: Encodable {
+    case image(ImageContentBlock)
+    case text(TextContentBlock)
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case .image(let block): try block.encode(to: encoder)
+        case .text(let block):  try block.encode(to: encoder)
+        }
+    }
+}
+
+struct ImageContentBlock: Encodable {
+    let type = "image"
+    let source: ImageSource
+}
+
+struct ImageSource: Encodable {
+    let type = "base64"
+    let mediaType: String
+    let data: String
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case mediaType = "media_type"
+        case data
+    }
+}
+
+struct TextContentBlock: Encodable {
+    let type = "text"
+    let text: String
+}
+
+// MARK: - Stored attachment (persisted on disk)
+
+struct StoredAttachment: Codable, Equatable {
+    let mimeType:   String   // "image/jpeg", "image/png", "image/gif", "image/webp"
+    let base64Data: String   // base64-encoded image data
+    let fileName:   String?  // optional display name
+
+    /// Decode the base64 data back into a UIKit-compatible Data object
+    var imageData: Data? { Data(base64Encoded: base64Data) }
+
+    /// Approximate size in bytes of the base64-encoded data
+    var estimatedBytes: Int { base64Data.count * 3 / 4 }
 }
 
 // Encodable block for API messages — omits nil fields explicitly
@@ -78,4 +140,5 @@ struct DisplayMessage: Identifiable {
     var text     : String
     var toolCalls: [ToolCallInfo] = []
     var isLoading: Bool = false
+    var attachments: [StoredAttachment] = []
 }

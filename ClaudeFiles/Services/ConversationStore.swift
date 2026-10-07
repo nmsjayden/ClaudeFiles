@@ -27,6 +27,8 @@ struct StoredMessage: Codable {
     // Optional tool result (when role == user carrying a tool result)
     var toolUseId:     String?
     var toolResult:    String?
+    // Optional image attachments (for user messages with images)
+    var attachments:   [StoredAttachment]?
 }
 
 struct StoredBlock: Codable {

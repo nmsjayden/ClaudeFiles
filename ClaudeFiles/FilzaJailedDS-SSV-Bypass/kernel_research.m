@@ -531,9 +531,11 @@ char *kresearch_swap_sandbox_profile(void) {
         }
     }
 
+    // Get launchd proc for comparisons (used in Test A and Test F)
+    uint64_t ld_proc = proc_find(1);
+
     // Compare with launchd's proc_ro
     buf_append("\nlaunchd proc_ro comparison:\n");
-    uint64_t ld_proc = proc_find(1);
     if (ld_proc && is_kaddr_valid(ld_proc)) {
         uint64_t ld_pro = kread_ptr(ld_proc + off_proc_p_proc_ro);
         if (ld_pro && is_kaddr_valid(ld_pro)) {

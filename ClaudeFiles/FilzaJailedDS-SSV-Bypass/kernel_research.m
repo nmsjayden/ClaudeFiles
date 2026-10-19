@@ -534,447 +534,400 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     bc_init();
-    bc("[SWAP] v12 starting\n");
+    bc("[SWAP] v13 starting\n");
     buf_init();
-    buf_append("=== EXEC BYPASS v12 - XPC EXPLOITATION ===\n");
-    buf_append("v11 confirmed:\n");
-    buf_append("  JIT: DEAD (SPTM tracks page write history, blocks exec forever)\n");
-    buf_append("  SBS Launch: ret=9 (not entitled)\n");
-    buf_append("  XPC connections: ALL SUCCEED (SB, runningboard, installd)\n");
-    buf_append("  Custom dylib: wrong platform tag in Mach-O\n");
-    buf_append("  posix_spawn: still EPERM\n");
-    buf_append("v12: Exploit live XPC connections, ObjC runtime, launch services.\n");
-    buf_append("FIX: Uses <xpc/xpc.h> types directly. Only dlsym for private APIs.\n\n");
+    buf_append("=== EXEC BYPASS v13 - REGISTER + LAUNCH ===\n");
+    buf_append("v12 confirmed:\n");
+    buf_append("  XPC messaging: Connection interrupted (entitlement check)\n");
+    buf_append("  openApplicationWithBundleID: WORKS (launched Safari!)\n");
+    buf_append("  registerApplicationDictionary: responds YES\n");
+    buf_append("  registerApplication: responds YES\n");
+    buf_append("  installApplication: responds YES\n");
+    buf_append("  FBSSystemService openApplication: exists\n");
+    buf_append("  NSTask: exists (38 methods) but uses posix_spawn internally\n");
+    buf_append("  posix_spawn: all variants EPERM\n");
+    buf_append("v13: Register a fake app, then launch it via SpringBoard.\n");
+    buf_append("SpringBoard does the spawn with ITS entitlements, not ours.\n\n");
 
     // ══════════════════════════════════════════════════════════════
-    // TEST A: Send XPC messages to system services
-    // xpc_connection_create_mach_service is unavailable in the iOS
-    // SDK headers, but exists at runtime. ALL xpc_connection_*
-    // functions are resolved via dlsym to bypass SDK availability
-    // checks. Uses void* throughout to avoid ARC issues.
+    // TEST A: Register a fake app with LaunchServices
+    // registerApplicationDictionary: takes an NSDictionary mimicking
+    // an Info.plist. If accepted, the "app" appears in the LS
+    // database and can be launched via openApplicationWithBundleID:.
+    // SpringBoard does the actual posix_spawn — not us.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test A: XPC messaging\n");
-    buf_append("-- Test A: XPC messaging to system services --\n");
+    bc("[SWAP] Test A: registerApplicationDictionary\n");
+    buf_append("-- Test A: Register fake app via LaunchServices --\n");
     {
-        // Resolve xpc_connection functions via dlsym (unavailable in iOS SDK)
-        void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-        typedef void *(*xpc_conn_create_fn)(const char *, void *, uint64_t);
-        typedef void (*xpc_conn_set_handler_fn)(void *, id);
-        typedef void (*xpc_conn_resume_fn)(void *);
-        typedef void *(*xpc_conn_send_sync_fn)(void *, void *);
-        typedef void *(*xpc_dict_create_fn)(const void *, const void *, size_t);
-        typedef void (*xpc_dict_set_int64_fn)(void *, const char *, int64_t);
-        typedef void (*xpc_dict_set_string_fn)(void *, const char *, const char *);
-        typedef void (*xpc_dict_set_bool_fn)(void *, const char *, _Bool);
-        typedef char *(*xpc_copy_desc_fn)(void *);
-
-        xpc_conn_create_fn    fn_create  = NULL;
-        xpc_conn_set_handler_fn fn_handler = NULL;
-        xpc_conn_resume_fn    fn_resume  = NULL;
-        xpc_conn_send_sync_fn fn_send    = NULL;
-        xpc_dict_create_fn    fn_dcreate = NULL;
-        xpc_dict_set_int64_fn fn_dint64  = NULL;
-        xpc_dict_set_string_fn fn_dstr   = NULL;
-        xpc_dict_set_bool_fn  fn_dbool   = NULL;
-        xpc_copy_desc_fn      fn_desc    = NULL;
-
-        if (xpc_h) {
-            fn_create  = (xpc_conn_create_fn)dlsym(xpc_h, "xpc_connection_create_mach_service");
-            fn_handler = (xpc_conn_set_handler_fn)dlsym(xpc_h, "xpc_connection_set_event_handler");
-            fn_resume  = (xpc_conn_resume_fn)dlsym(xpc_h, "xpc_connection_resume");
-            fn_send    = (xpc_conn_send_sync_fn)dlsym(xpc_h, "xpc_connection_send_message_with_reply_sync");
-            fn_dcreate = (xpc_dict_create_fn)dlsym(xpc_h, "xpc_dictionary_create");
-            fn_dint64  = (xpc_dict_set_int64_fn)dlsym(xpc_h, "xpc_dictionary_set_int64");
-            fn_dstr    = (xpc_dict_set_string_fn)dlsym(xpc_h, "xpc_dictionary_set_string");
-            fn_dbool   = (xpc_dict_set_bool_fn)dlsym(xpc_h, "xpc_dictionary_set_bool");
-            fn_desc    = (xpc_copy_desc_fn)dlsym(xpc_h, "xpc_copy_description");
-        }
-
-        buf_append("  dlsym results:\n");
-        buf_append("    create_mach_service: %p\n", fn_create);
-        buf_append("    set_event_handler:   %p\n", fn_handler);
-        buf_append("    resume:              %p\n", fn_resume);
-        buf_append("    send_sync:           %p\n", fn_send);
-        buf_append("    dict_create:         %p\n", fn_dcreate);
-
-        if (!fn_create || !fn_handler || !fn_resume || !fn_send || !fn_dcreate) {
-            buf_append("  MISSING critical XPC symbols, skipping A1-A3\n");
-        } else {
-            // Helper block for noop event handler
-            id noop_handler = ^(id event) { (void)event; };
-
-            // ── Test A1: Talk to com.apple.runningboard ──
-            bc("[SWAP] A1: runningboard XPC\n");
-            buf_append("\n  A1: com.apple.runningboard\n");
-            {
-                void *conn = fn_create("com.apple.runningboard", NULL, 0);
-                if (conn) {
-                    fn_handler(conn, noop_handler);
-                    fn_resume(conn);
-
-                    void *msg = fn_dcreate(NULL, NULL, 0);
-                    if (fn_dint64) fn_dint64(msg, "type", 1);
-                    if (fn_dstr)   fn_dstr(msg, "process", "com.apple.mobilesafari");
-                    if (fn_dbool)  fn_dbool(msg, "suspended", false);
-
-                    bc("[SWAP] A1: sending to runningboard\n");
-                    void *reply = fn_send(conn, msg);
-                    if (reply && fn_desc) {
-                        char *desc = fn_desc(reply);
-                        if (desc) {
-                            buf_append("  Reply: %.500s\n", desc);
-                            free(desc);
-                        }
-                    } else {
-                        buf_append("  Reply: NULL\n");
-                    }
-                } else {
-                    buf_append("  conn: NULL\n");
-                }
-            }
-
-            // ── Test A2: Talk to com.apple.springboard.services ──
-            bc("[SWAP] A2: springboard XPC\n");
-            buf_append("\n  A2: com.apple.springboard.services\n");
-            {
-                void *conn = fn_create("com.apple.springboard.services", NULL, 0);
-                if (conn) {
-                    fn_handler(conn, noop_handler);
-                    fn_resume(conn);
-
-                    void *msg = fn_dcreate(NULL, NULL, 0);
-                    if (fn_dstr)   fn_dstr(msg, "bundleId", "com.apple.mobilesafari");
-                    if (fn_dint64) fn_dint64(msg, "action", 0);
-
-                    bc("[SWAP] A2: sending to SB\n");
-                    void *reply = fn_send(conn, msg);
-                    if (reply && fn_desc) {
-                        char *desc = fn_desc(reply);
-                        if (desc) {
-                            buf_append("  Reply: %.500s\n", desc);
-                            free(desc);
-                        }
-                    } else {
-                        buf_append("  Reply: NULL\n");
-                    }
-                } else {
-                    buf_append("  conn: NULL\n");
-                }
-            }
-
-            // ── Test A3: Talk to com.apple.mobile.installd ──
-            bc("[SWAP] A3: installd XPC\n");
-            buf_append("\n  A3: com.apple.mobile.installd\n");
-            {
-                void *conn = fn_create("com.apple.mobile.installd", NULL, 0);
-                if (conn) {
-                    fn_handler(conn, noop_handler);
-                    fn_resume(conn);
-
-                    void *msg = fn_dcreate(NULL, NULL, 0);
-                    if (fn_dstr) fn_dstr(msg, "Command", "Lookup");
-                    if (fn_dstr) fn_dstr(msg, "ClientOptions", "");
-
-                    bc("[SWAP] A3: sending to installd\n");
-                    void *reply = fn_send(conn, msg);
-                    if (reply && fn_desc) {
-                        char *desc = fn_desc(reply);
-                        if (desc) {
-                            buf_append("  Reply: %.500s\n", desc);
-                            free(desc);
-                        }
-                    } else {
-                        buf_append("  Reply: NULL\n");
-                    }
-                } else {
-                    buf_append("  conn: NULL\n");
-                }
-            }
-        }
-
-        // ── Test A4: xpc_pipe_routine — REMOVED ──
-        // xpc_pipe_create(NULL, 0) crashes from sandboxed apps.
-        // The bootstrap pipe accessor triggers a fault before
-        // returning. A1-A3 connection-based XPC works fine.
-        buf_append("\n  A4: xpc_pipe_routine — SKIPPED (crashes from sandbox)\n");
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST B: ObjC Runtime — LSApplicationWorkspace & FrontBoard
-    // Use NSClassFromString to instantiate private framework classes
-    // that manage app launching. These go through different code
-    // paths than SBS — possibly different entitlement checks.
-    // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test B: ObjC runtime launch\n");
-    buf_append("\n-- Test B: ObjC runtime app launching --\n");
-    {
-        // Load LaunchServices framework
         void *ls = dlopen("/System/Library/PrivateFrameworks/"
             "MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
         if (!ls) ls = dlopen("/System/Library/Frameworks/"
             "CoreServices.framework/CoreServices", RTLD_LAZY);
 
         Class lsws = NSClassFromString(@"LSApplicationWorkspace");
-        buf_append("  LSApplicationWorkspace class: %p\n", lsws);
-
-        if (lsws) {
-            SEL defWSSel = NSSelectorFromString(@"defaultWorkspace");
+        SEL defWSSel = NSSelectorFromString(@"defaultWorkspace");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id workspace = [lsws performSelector:defWSSel];
+        id workspace = lsws ? [lsws performSelector:defWSSel] : nil;
 #pragma clang diagnostic pop
-            buf_append("  defaultWorkspace: %p\n", workspace);
+        buf_append("  workspace: %p\n", workspace);
 
-            if (workspace) {
-                // List ALL interesting methods on the workspace
-                unsigned int count = 0;
-                Method *methods = class_copyMethodList(
-                    object_getClass(workspace), &count);
-                buf_append("  LSApplicationWorkspace methods (%u total):\n", count);
-                int printed = 0;
-                for (unsigned int i = 0; i < count; i++) {
-                    const char *name = sel_getName(
-                        method_getName(methods[i]));
-                    if (strstr(name, "open") || strstr(name, "launch") ||
-                        strstr(name, "exec") || strstr(name, "install") ||
-                        strstr(name, "run") || strstr(name, "spawn") ||
-                        strstr(name, "register") || strstr(name, "plugin") ||
-                        strstr(name, "URL") || strstr(name, "application")) {
-                        buf_append("    - %s\n", name);
-                        printed++;
-                    }
+        if (workspace) {
+            // Our app's container path — we can write here
+            NSString *docsDir = NSSearchPathForDirectoriesInDomains(
+                NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *fakeAppDir = [docsDir
+                stringByAppendingPathComponent:@"FakeApp.app"];
+            NSString *fakeBin = [fakeAppDir
+                stringByAppendingPathComponent:@"fakebin"];
+
+            // Create the fake .app directory
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:fakeAppDir
+                withIntermediateDirectories:YES attributes:nil error:nil];
+
+            // Create a minimal shell script as the "binary"
+            NSString *script = @"#!/bin/sh\necho JAILBREAK_EXEC_SUCCESS\n"
+                "id > /tmp/jb_exec_test.txt\n"
+                "date >> /tmp/jb_exec_test.txt\n";
+            [script writeToFile:fakeBin atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
+            chmod([fakeBin UTF8String], 0755);
+
+            buf_append("  Fake app dir: %s\n", [fakeAppDir UTF8String]);
+            buf_append("  Fake binary: %s\n", [fakeBin UTF8String]);
+            buf_append("  Binary exists: %s\n",
+                [fm fileExistsAtPath:fakeBin] ? "YES" : "NO");
+
+            // Build Info.plist dictionary
+            NSString *fakeBundleID = @"com.jb.fakeapp";
+            NSDictionary *infoPlist = @{
+                @"ApplicationType": @"User",
+                @"CFBundleIdentifier": fakeBundleID,
+                @"CFBundleExecutable": @"fakebin",
+                @"CFBundleName": @"FakeApp",
+                @"CFBundleDisplayName": @"FakeApp",
+                @"CFBundleVersion": @"1.0",
+                @"CFBundleShortVersionString": @"1.0",
+                @"Path": fakeAppDir,
+                @"CFBundlePackageType": @"APPL",
+                @"MinimumOSVersion": @"15.0",
+                @"LSRequiresIPhoneOS": @YES,
+                @"DTPlatformName": @"iphoneos",
+            };
+            buf_append("  Info.plist keys: %lu\n",
+                (unsigned long)[infoPlist count]);
+
+            // ── A1: Try registerApplicationDictionary: ──
+            bc("[SWAP] A1: registerApplicationDictionary\n");
+            SEL regDictSel = NSSelectorFromString(
+                @"registerApplicationDictionary:");
+            buf_append("\n  A1: registerApplicationDictionary:\n");
+            if ([workspace respondsToSelector:regDictSel]) {
+                @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id result = [workspace performSelector:regDictSel
+                        withObject:infoPlist];
+#pragma clang diagnostic pop
+                    buf_append("  Result: %s\n",
+                        result ? [[result description] UTF8String] : "nil");
+                } @catch (NSException *e) {
+                    buf_append("  EXCEPTION: %s — %s\n",
+                        [[e name] UTF8String], [[e reason] UTF8String]);
                 }
-                buf_append("  (printed %d matching methods)\n", printed);
-                if (methods) free(methods);
+            }
 
-                // Check which selectors respond
-                SEL openSel = NSSelectorFromString(
-                    @"openApplicationWithBundleID:");
-                buf_append("  openApplicationWithBundleID: %s\n",
-                    [workspace respondsToSelector:openSel] ? "YES" : "NO");
-                // NOTE: v12 confirmed this WORKS — it launched Safari.
-                // Do NOT call it here — steals focus and kills the test.
-                buf_append("  >>> CONFIRMED WORKING (opened Safari in prev run) <<<\n");
+            // ── A2: Try registerApplication: with URL ──
+            bc("[SWAP] A2: registerApplication URL\n");
+            SEL regAppSel = NSSelectorFromString(@"registerApplication:");
+            buf_append("\n  A2: registerApplication:\n");
+            if ([workspace respondsToSelector:regAppSel]) {
+                NSURL *appURL = [NSURL fileURLWithPath:fakeAppDir];
+                @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id result = [workspace performSelector:regAppSel
+                        withObject:appURL];
+#pragma clang diagnostic pop
+                    buf_append("  Result: %s\n",
+                        result ? [[result description] UTF8String] : "nil");
+                } @catch (NSException *e) {
+                    buf_append("  EXCEPTION: %s — %s\n",
+                        [[e name] UTF8String], [[e reason] UTF8String]);
+                }
+            }
 
-                // Try with FAKE bundle ID — see error without stealing focus
-                bc("[SWAP] B: openApp with fake bundleID\n");
-                if ([workspace respondsToSelector:openSel]) {
+            // ── A3: Check if our app got registered ──
+            bc("[SWAP] A3: checking registration\n");
+            buf_append("\n  A3: Check if registered\n");
+            SEL appInstalledSel = NSSelectorFromString(
+                @"applicationIsInstalled:");
+            if ([workspace respondsToSelector:appInstalledSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id installed = [workspace performSelector:appInstalledSel
+                    withObject:fakeBundleID];
+#pragma clang diagnostic pop
+                buf_append("  applicationIsInstalled(%s): %s\n",
+                    [fakeBundleID UTF8String],
+                    installed ? "YES" : "NO");
+            }
+
+            // Also try to get the proxy for our fake app
+            SEL proxyForIdSel = NSSelectorFromString(
+                @"applicationProxyForIdentifier:");
+            if ([workspace respondsToSelector:proxyForIdSel]) {
+                bc("[SWAP] A3: getting proxy\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id proxy = [workspace performSelector:proxyForIdSel
+                    withObject:fakeBundleID];
+#pragma clang diagnostic pop
+                buf_append("  applicationProxy: %s\n",
+                    proxy ? [[proxy description] UTF8String] : "nil");
+            } else {
+                buf_append("  applicationProxyForIdentifier: NOT FOUND\n");
+            }
+
+            // ── A4: Try to launch the fake app ──
+            bc("[SWAP] A4: launching fake app\n");
+            buf_append("\n  A4: openApplicationWithBundleID (fake app)\n");
+            SEL openSel = NSSelectorFromString(
+                @"openApplicationWithBundleID:");
+            if ([workspace respondsToSelector:openSel]) {
+                @try {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                     id result = [workspace performSelector:openSel
-                        withObject:@"com.fake.nonexistent.app.xxxxx"];
+                        withObject:fakeBundleID];
 #pragma clang diagnostic pop
-                    buf_append("  openApp(fake): %s\n",
-                               result ? "returned non-nil" : "returned nil");
+                    buf_append("  Launch result: %s\n",
+                        result ? "returned non-nil" : "returned nil");
+                } @catch (NSException *e) {
+                    buf_append("  EXCEPTION: %s — %s\n",
+                        [[e name] UTF8String], [[e reason] UTF8String]);
                 }
+            }
 
-                // Check openURL:
-                SEL openURLSel = NSSelectorFromString(@"openURL:");
-                buf_append("  openURL: %s\n",
-                    [workspace respondsToSelector:openURLSel] ? "YES" : "NO");
-                // Don't call openURL — could also steal focus
+            // Check if exec test file was created
+            usleep(500000); // wait 500ms for potential launch
+            if ([fm fileExistsAtPath:@"/tmp/jb_exec_test.txt"]) {
+                NSString *content = [NSString
+                    stringWithContentsOfFile:@"/tmp/jb_exec_test.txt"
+                    encoding:NSUTF8StringEncoding error:nil];
+                buf_append("  >>> /tmp/jb_exec_test.txt EXISTS! <<<\n");
+                buf_append("  Content: %s\n",
+                    content ? [content UTF8String] : "(empty)");
+            } else {
+                buf_append("  /tmp/jb_exec_test.txt: not created\n");
+            }
 
-                // Check installApplication / uninstallApplication
-                SEL installSel = NSSelectorFromString(
-                    @"installApplication:withOptions:error:usingBlock:");
-                buf_append("  installApplication: %s\n",
-                    [workspace respondsToSelector:installSel] ? "YES" : "NO");
-
-                // List all installed apps (get bundle IDs)
-                SEL allAppsSel = NSSelectorFromString(
-                    @"allInstalledApplications");
-                if ([workspace respondsToSelector:allAppsSel]) {
-                    bc("[SWAP] B: listing installed apps\n");
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    id apps = [workspace performSelector:allAppsSel];
-#pragma clang diagnostic pop
-                    if ([apps isKindOfClass:[NSArray class]]) {
-                        NSArray *appArray = (NSArray *)apps;
-                        buf_append("  Installed apps: %lu total\n",
-                            (unsigned long)[appArray count]);
-                        // Show first 5
-                        for (NSUInteger i = 0; i < [appArray count] && i < 5; i++) {
-                            buf_append("    [%lu] %s\n", (unsigned long)i,
-                                [[appArray[i] description] UTF8String]);
+            // ── A5: Try installApplication: with local path ──
+            bc("[SWAP] A5: installApplication\n");
+            buf_append("\n  A5: installApplication:withOptions:\n");
+            SEL installSel = NSSelectorFromString(
+                @"installApplication:withOptions:");
+            if ([workspace respondsToSelector:installSel]) {
+                NSURL *appURL = [NSURL fileURLWithPath:fakeAppDir];
+                // Use NSInvocation for 2-arg selector
+                NSMethodSignature *sig = [workspace
+                    methodSignatureForSelector:installSel];
+                if (sig) {
+                    NSInvocation *inv = [NSInvocation
+                        invocationWithMethodSignature:sig];
+                    [inv setSelector:installSel];
+                    [inv setTarget:workspace];
+                    __unsafe_unretained NSURL *urlArg = appURL;
+                    __unsafe_unretained NSDictionary *opts =
+                        @{@"CFBundleIdentifier": fakeBundleID};
+                    [inv setArgument:&urlArg atIndex:2];
+                    [inv setArgument:&opts atIndex:3];
+                    @try {
+                        [inv invoke];
+                        BOOL ok = NO;
+                        if ([sig methodReturnLength] == sizeof(BOOL)) {
+                            [inv getReturnValue:&ok];
                         }
-                    } else {
-                        buf_append("  allInstalledApplications: %s\n",
-                            apps ? [[apps description] UTF8String] : "nil");
+                        buf_append("  installApplication: %s\n",
+                            ok ? "SUCCESS" : "returned NO");
+                    } @catch (NSException *e) {
+                        buf_append("  EXCEPTION: %s — %s\n",
+                            [[e name] UTF8String], [[e reason] UTF8String]);
                     }
                 } else {
-                    buf_append("  allInstalledApplications: NOT FOUND\n");
+                    buf_append("  Could not get method signature\n");
                 }
-
-                // Check allApplications
-                SEL allAppsSel2 = NSSelectorFromString(@"allApplications");
-                buf_append("  allApplications: %s\n",
-                    [workspace respondsToSelector:allAppsSel2] ? "YES" : "NO");
-
-                // Check registerApplication (could we register a fake app?)
-                SEL regSel = NSSelectorFromString(
-                    @"registerApplicationDictionary:");
-                buf_append("  registerApplicationDictionary: %s\n",
-                    [workspace respondsToSelector:regSel] ? "YES" : "NO");
-
-                SEL regSel2 = NSSelectorFromString(
-                    @"registerApplication:");
-                buf_append("  registerApplication: %s\n",
-                    [workspace respondsToSelector:regSel2] ? "YES" : "NO");
+            } else {
+                buf_append("  installApplication:withOptions: NOT FOUND\n");
             }
-        }
 
-        // Try FrontBoardServices
-        void *fbs = dlopen("/System/Library/PrivateFrameworks/"
-            "FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
-        buf_append("\n  FrontBoardServices: %s\n",
-                   fbs ? "LOADED" : "NOT FOUND");
-
-        if (fbs) {
-            Class fbsService = NSClassFromString(@"FBSSystemService");
-            buf_append("  FBSSystemService: %p\n", fbsService);
-            if (fbsService) {
-                SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
+            // Cleanup — unregister the fake app
+            SEL unregSel = NSSelectorFromString(@"unregisterApplication:");
+            if ([workspace respondsToSelector:unregSel]) {
+                NSURL *appURL = [NSURL fileURLWithPath:fakeAppDir];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id svc = [fbsService performSelector:sharedSvcSel];
+                [workspace performSelector:unregSel withObject:appURL];
 #pragma clang diagnostic pop
-                buf_append("  sharedService: %p\n", svc);
-                if (svc) {
-                    unsigned int count = 0;
-                    Method *methods = class_copyMethodList(
-                        [svc class], &count);
-                    buf_append("  FBS methods (%u):\n", count);
-                    int printed = 0;
-                    for (unsigned int i = 0; i < count && printed < 15; i++) {
-                        const char *name = sel_getName(
-                            method_getName(methods[i]));
-                        if (strstr(name, "open") || strstr(name, "launch") ||
-                            strstr(name, "create") || strstr(name, "process") ||
-                            strstr(name, "exec") || strstr(name, "app")) {
-                            buf_append("    - %s\n", name);
-                            printed++;
-                        }
-                    }
-                    if (methods) free(methods);
-                }
             }
-
-            Class fbsOpen = NSClassFromString(@"FBSOpenApplicationService");
-            buf_append("  FBSOpenApplicationService: %p\n", fbsOpen);
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST C: NSTask + posix_spawn variants
-    // system() and popen() use fork() internally — DANGEROUS on
-    // iOS, can crash the app. Instead check if NSTask exists and
-    // try posix_spawn with different flags/targets.
+    // TEST B: FBSSystemService openApplication
+    // FrontBoardServices has its own launch path. Try it with both
+    // a real app (Settings — won't steal as much focus) and our
+    // fake registered app.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test C: Process APIs (safe)\n");
-    buf_append("\n-- Test C: Process creation APIs (no fork) --\n");
+    bc("[SWAP] Test B: FBS launch\n");
+    buf_append("\n-- Test B: FBSSystemService launch --\n");
     {
-        // NSTask (may not exist on iOS — macOS API)
-        Class nsTask = NSClassFromString(@"NSTask");
-        buf_append("  NSTask class: %p\n", nsTask);
-        if (nsTask) {
-            buf_append("  >>> NSTask EXISTS on iOS! <<<\n");
-            unsigned int count = 0;
-            Method *methods = class_copyMethodList(nsTask, &count);
-            buf_append("  NSTask methods (%u):\n", count);
-            for (unsigned int i = 0; i < count && i < 15; i++) {
-                buf_append("    - %s\n",
-                    sel_getName(method_getName(methods[i])));
-            }
-            if (methods) free(methods);
+        void *fbs = dlopen("/System/Library/PrivateFrameworks/"
+            "FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
 
-            // Check NSTask capabilities without actually launching
-            // (launch may crash or hang the app on iOS)
-            bc("[SWAP] C: probing NSTask\n");
+        Class fbsService = NSClassFromString(@"FBSSystemService");
+        if (fbsService) {
+            SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id svc = [fbsService performSelector:sharedSvcSel];
+#pragma clang diagnostic pop
+            buf_append("  FBSSystemService: %p\n", svc);
+
+            if (svc) {
+                // List ALL methods for reference
+                unsigned int count = 0;
+                Method *methods = class_copyMethodList([svc class], &count);
+                buf_append("  Methods (%u):\n", count);
+                for (unsigned int i = 0; i < count && i < 30; i++) {
+                    buf_append("    - %s\n",
+                        sel_getName(method_getName(methods[i])));
+                }
+                if (methods) free(methods);
+
+                // Try createClientPort
+                SEL portSel = NSSelectorFromString(@"createClientPort");
+                if ([svc respondsToSelector:portSel]) {
+                    bc("[SWAP] B: createClientPort\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id port = [svc performSelector:portSel];
+#pragma clang diagnostic pop
+                    buf_append("  clientPort: %s\n",
+                        port ? [[port description] UTF8String] : "nil");
+                }
+
+                // Check FBSOpenApplicationService
+                Class fbsOpenClass = NSClassFromString(
+                    @"FBSOpenApplicationService");
+                buf_append("  FBSOpenApplicationService: %p\n", fbsOpenClass);
+                if (fbsOpenClass) {
+                    unsigned int mc = 0;
+                    Method *ms = class_copyMethodList(fbsOpenClass, &mc);
+                    buf_append("  FBSOpen instance methods (%u):\n", mc);
+                    for (unsigned int i = 0; i < mc && i < 15; i++) {
+                        buf_append("    - %s\n",
+                            sel_getName(method_getName(ms[i])));
+                    }
+                    if (ms) free(ms);
+
+                    // Also class methods
+                    mc = 0;
+                    ms = class_copyMethodList(
+                        object_getClass(fbsOpenClass), &mc);
+                    buf_append("  FBSOpen class methods (%u):\n", mc);
+                    for (unsigned int i = 0; i < mc && i < 15; i++) {
+                        buf_append("    + %s\n",
+                            sel_getName(method_getName(ms[i])));
+                    }
+                    if (ms) free(ms);
+                }
+            }
+        } else {
+            buf_append("  FBSSystemService: NOT FOUND\n");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST C: NSTask launch (with @try safety)
+    // NSTask exists on iOS with launchAndReturnError:. It might use
+    // a different code path than our direct posix_spawn. Worth
+    // trying once with /bin/sh to see the actual error.
+    // ══════════════════════════════════════════════════════════════
+    bc("[SWAP] Test C: NSTask launch\n");
+    buf_append("\n-- Test C: NSTask launch attempt --\n");
+    {
+        Class nsTask = NSClassFromString(@"NSTask");
+        buf_append("  NSTask: %p\n", nsTask);
+        if (nsTask) {
             @try {
                 id task = [[nsTask alloc] init];
                 SEL setExec = NSSelectorFromString(@"setExecutableURL:");
-                SEL launch  = NSSelectorFromString(@"launchAndReturnError:");
                 SEL setArgs = NSSelectorFromString(@"setArguments:");
-                buf_append("  setExecutableURL: %s\n",
-                    [task respondsToSelector:setExec] ? "YES" : "NO");
-                buf_append("  setArguments: %s\n",
-                    [task respondsToSelector:setArgs] ? "YES" : "NO");
-                buf_append("  launchAndReturnError: %s\n",
-                    [task respondsToSelector:launch] ? "YES" : "NO");
-                // Do NOT actually launch — previous runs show it
-                // may use posix_spawn/fork internally → EPERM/crash
+                SEL launch  = NSSelectorFromString(@"launchAndReturnError:");
+
+                if ([task respondsToSelector:setExec] &&
+                    [task respondsToSelector:launch]) {
+                    NSURL *sh = [NSURL fileURLWithPath:@"/bin/sh"];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    [task performSelector:setExec withObject:sh];
+                    if ([task respondsToSelector:setArgs]) {
+                        [task performSelector:setArgs
+                            withObject:@[@"-c", @"echo NSTask_SUCCESS > /tmp/nstask_test.txt"]];
+                    }
+#pragma clang diagnostic pop
+
+                    // launchAndReturnError: takes NSError** — use NSInvocation
+                    NSMethodSignature *sig = [task
+                        methodSignatureForSelector:launch];
+                    NSInvocation *inv = [NSInvocation
+                        invocationWithMethodSignature:sig];
+                    [inv setSelector:launch];
+                    [inv setTarget:task];
+                    __unsafe_unretained NSError *errArg = nil;
+                    [inv setArgument:&errArg atIndex:2];
+
+                    bc("[SWAP] C: invoking launchAndReturnError\n");
+                    [inv invoke];
+
+                    BOOL ok = NO;
+                    [inv getReturnValue:&ok];
+                    buf_append("  NSTask launch: %s\n",
+                        ok ? ">>> SUCCESS <<<" : "FAILED");
+                    if (errArg) {
+                        buf_append("  Error: %s\n",
+                            [[errArg localizedDescription] UTF8String]);
+                        buf_append("  Domain: %s code: %ld\n",
+                            [[errArg domain] UTF8String],
+                            (long)[errArg code]);
+                    }
+
+                    // Check for output file
+                    usleep(200000);
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    if ([fm fileExistsAtPath:@"/tmp/nstask_test.txt"]) {
+                        buf_append("  >>> /tmp/nstask_test.txt EXISTS! <<<\n");
+                    }
+                } else {
+                    buf_append("  Missing setExecutableURL or launch\n");
+                }
             } @catch (NSException *e) {
-                buf_append("  NSTask exception: %s\n",
-                    [[e reason] UTF8String]);
+                buf_append("  EXCEPTION: %s — %s\n",
+                    [[e name] UTF8String], [[e reason] UTF8String]);
             }
         }
-
-        // posix_spawn with file_actions
-        bc("[SWAP] C: spawn with file_actions\n");
-        posix_spawn_file_actions_t fa;
-        posix_spawn_file_actions_init(&fa);
-        posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-
-        posix_spawnattr_t attr;
-        posix_spawnattr_init(&attr);
-
-        // Default flags
-        short flags = 0;
-        posix_spawnattr_getflags(&attr, &flags);
-        buf_append("  spawnattr default flags: 0x%x\n", flags);
-
-        // Test 1: /bin/sh with file_actions
-        pid_t child = 0;
-        char *const argv[] = {(char *)"/bin/sh", (char *)"-c", (char *)"id", NULL};
-        char *const envp[] = {NULL};
-        int ret = posix_spawn(&child, "/bin/sh", &fa, &attr, argv, envp);
-        buf_append("  posix_spawn /bin/sh+file_actions: %d (%s)\n",
-                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
-
-        // Test 2: spawn our own binary (self-exec)
-        NSString *selfPath = [[NSBundle mainBundle] executablePath];
-        const char *selfCStr = [selfPath UTF8String];
-        child = 0;
-        char *argv2[] = {(char *)selfCStr, NULL};
-        ret = posix_spawn(&child, selfCStr, NULL, &attr, argv2, envp);
-        buf_append("  posix_spawn self (%s): %d (%s)\n",
-                   selfCStr, ret, ret == 0 ? "SUCCESS" : strerror(ret));
-
-        // Test 3: spawn with POSIX_SPAWN_START_SUSPENDED
-        bc("[SWAP] C: spawn SUSPENDED\n");
-#ifndef POSIX_SPAWN_START_SUSPENDED
-#define POSIX_SPAWN_START_SUSPENDED 0x0080
-#endif
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
-        child = 0;
-        ret = posix_spawn(&child, "/bin/sh", NULL, &attr, argv, envp);
-        buf_append("  posix_spawn+SUSPENDED: %d (%s)\n",
-                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
-        if (ret == 0 && child > 0) {
-            buf_append("  >>> SPAWNED PID %d (suspended)! <<<\n", child);
-            kill(child, SIGCONT);
-            int status = 0;
-            waitpid(child, &status, WNOHANG);
-            buf_append("  status: 0x%x\n", status);
-            kill(child, SIGKILL);
-        }
-
-        posix_spawn_file_actions_destroy(&fa);
-        posix_spawnattr_destroy(&attr);
-
-        buf_append("  execve: SKIPPED (would replace our process)\n");
-        buf_append("  system()/popen(): SKIPPED (use fork, may crash)\n");
     }
 
-    buf_append("\n-- v12 Analysis --\n");
-    buf_append("v12 TESTED:\n");
-    buf_append("  A: XPC messaging (runningboard, springboard, installd, launchd)\n");
-    buf_append("  B: ObjC runtime (LSApplicationWorkspace, FrontBoardServices)\n");
-    buf_append("  C: NSTask, posix_spawn variants (file_actions, self, SUSPENDED)\n");
-    buf_append("FOCUS: What do XPC replies contain? Which ObjC methods exist?\n");
+    buf_append("\n-- v13 Analysis --\n");
+    buf_append("v13 TESTED:\n");
+    buf_append("  A: registerApplicationDictionary + openApp (fake app)\n");
+    buf_append("  B: FBSSystemService + FBSOpenApplicationService\n");
+    buf_append("  C: NSTask launchAndReturnError\n");
+    buf_append("GOAL: Does SpringBoard launch our registered fake app?\n");
 
-    bc("[SWAP] v12 complete\n");
+    bc("[SWAP] v13 complete\n");
     bc_close();
     return buf_finish();
 }

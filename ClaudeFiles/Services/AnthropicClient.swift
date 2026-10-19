@@ -57,6 +57,9 @@ final class AnthropicClient {
     ) async throws {
         let model = SettingsStore.shared.selectedModel
 
+        // Haiku 4.5 doesn't support compact_20260112 context management
+        let supportsCompact = !model.contains("haiku")
+
         var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "beta", value: "true")]
         var req = URLRequest(url: components.url!)
@@ -66,8 +69,14 @@ final class AnthropicClient {
         req.setValue("application/json",                 forHTTPHeaderField: "Content-Type")
         req.setValue("text/event-stream",                forHTTPHeaderField: "Accept")
         req.setValue("2023-06-01",                       forHTTPHeaderField: "anthropic-version")
-        req.setValue("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,compact-2026-01-12,prompt-caching-scope-2026-01-05",
-                     forHTTPHeaderField: "anthropic-beta")
+
+        let betaFeatures: String
+        if supportsCompact {
+            betaFeatures = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,compact-2026-01-12,prompt-caching-scope-2026-01-05"
+        } else {
+            betaFeatures = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,prompt-caching-scope-2026-01-05"
+        }
+        req.setValue(betaFeatures, forHTTPHeaderField: "anthropic-beta")
         req.setValue("true",                             forHTTPHeaderField: "anthropic-dangerous-direct-browser-access")
         req.setValue("claude-cli/2.1.291 (external, cli)", forHTTPHeaderField: "User-Agent")
         req.setValue("cli",                               forHTTPHeaderField: "x-app")
@@ -87,10 +96,10 @@ final class AnthropicClient {
             SystemBlock(type: "text", text: system),
         ]
 
-        let contextMgmt = ContextManagement(edits: [
+        let contextMgmt: ContextManagement? = supportsCompact ? ContextManagement(edits: [
             CompactEdit(type: "compact_20260112",
                         trigger: CompactTrigger(type: "input_tokens", value: 100_000))
-        ])
+        ]) : nil
 
         let body = RequestBody(model: model, maxTokens: 8192, stream: true,
                                system: systemBlocks, messages: messages,

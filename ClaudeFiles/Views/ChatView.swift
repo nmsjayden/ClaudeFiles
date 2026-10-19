@@ -14,6 +14,7 @@ struct ChatView: View {
     @State private var showingSettings = false
     @State private var showingModels   = false
     @State private var showingBrowser  = false
+    @State private var showingResearch = false
 
     var body: some View {
         ChatContent(
@@ -21,7 +22,8 @@ struct ChatView: View {
             showingSidebar:  $showingSidebar,
             showingSettings: $showingSettings,
             showingModels:   $showingModels,
-            showingBrowser:  $showingBrowser
+            showingBrowser:  $showingBrowser,
+            showingResearch: $showingResearch
         )
         .environmentObject(auth)
     }
@@ -37,13 +39,15 @@ private struct ChatContent: View {
     @Binding var showingSettings: Bool
     @Binding var showingModels:   Bool
     @Binding var showingBrowser:  Bool
+    @Binding var showingResearch: Bool
     @EnvironmentObject var auth: AuthManager
     @StateObject private var vm: ChatViewModel
     @FocusState private var inputFocused: Bool
 
     init(store: ConversationStore, settings: SettingsStore, sandbox: SandboxManager,
          showingSidebar: Binding<Bool>, showingSettings: Binding<Bool>,
-         showingModels: Binding<Bool>, showingBrowser: Binding<Bool>) {
+         showingModels: Binding<Bool>, showingBrowser: Binding<Bool>,
+         showingResearch: Binding<Bool>) {
         self.store    = store
         self.settings = settings
         self.sandbox  = sandbox
@@ -51,6 +55,7 @@ private struct ChatContent: View {
         _showingSettings = showingSettings
         _showingModels   = showingModels
         _showingBrowser  = showingBrowser
+        _showingResearch = showingResearch
         _vm = StateObject(wrappedValue: ChatViewModel(store: store))
     }
 
@@ -68,6 +73,7 @@ private struct ChatContent: View {
         .sheet(isPresented: $showingSettings) { SettingsSheet(settings: settings, sandbox: sandbox) }
         .sheet(isPresented: $showingModels)   { ModelPickerSheet(settings: settings) }
         .sheet(isPresented: $showingBrowser)  { FileBrowserView() }
+        .sheet(isPresented: $showingResearch) { ResearchView() }
         .sheet(item: $vm.pendingWrite)        { WriteApprovalSheet(write: $0) }
         .sheet(isPresented: errorBinding) {
             ErrorSheet(message: vm.error ?? "", onDismiss: { vm.error = nil })
@@ -126,6 +132,9 @@ private struct ChatContent: View {
                 Divider()
                 Button { showingBrowser = true } label: {
                     Label("File browser", systemImage: "folder.badge.gearshape")
+                }
+                Button { showingResearch = true } label: {
+                    Label("Research", systemImage: "memorychip")
                 }
                 Button { showingModels = true } label: {
                     Label("Change model", systemImage: "cpu")

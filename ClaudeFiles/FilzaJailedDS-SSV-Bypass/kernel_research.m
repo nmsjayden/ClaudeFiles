@@ -25,6 +25,7 @@
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
 #define SANDBOX_FILTER_PATH          (1 << 0)
 #define SANDBOX_CHECK_NO_REPORT      (1 << 9)
+#define SANDBOX_FILTER_GLOBAL_NAME   (1 << 1)
 #define SANDBOX_FILTER_NONE          0
 
 // ── Helpers ──
@@ -459,7 +460,7 @@ char *kresearch_dump_sandbox_profile(void) {
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
     buf_append("=== SANDBOX DIAGNOSTIC v6 (READ-ONLY) ===\n");
-    buf_append("(v5 crashed. v6 does ZERO kernel writes — pure diagnostics.)\n\n");
+    buf_append("(v5 crashed. v6 does ZERO kernel writes - pure diagnostics.)\n\n");
 
     // ── Step 1: proc_self ──
     fprintf(stderr, "[SWAP] Step 1: proc_self()\n");

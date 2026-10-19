@@ -548,165 +548,186 @@ char *kresearch_swap_sandbox_profile(void) {
 
     // ══════════════════════════════════════════════════════════════
     // TEST A: Send XPC messages to system services
-    // v11 showed we can CONNECT — now send actual messages and
-    // see what replies we get. Uses <xpc/xpc.h> types directly.
-    // Only private APIs (xpc_pipe_*) use dlsym.
+    // xpc_connection_create_mach_service is unavailable in the iOS
+    // SDK headers, but exists at runtime. ALL xpc_connection_*
+    // functions are resolved via dlsym to bypass SDK availability
+    // checks. Uses void* throughout to avoid ARC issues.
     // ══════════════════════════════════════════════════════════════
     bc("[SWAP] Test A: XPC messaging\n");
     buf_append("-- Test A: XPC messaging to system services --\n");
     {
-        // ── Test A1: Talk to com.apple.runningboard ──
-        bc("[SWAP] A1: runningboard XPC\n");
-        buf_append("\n  A1: com.apple.runningboard\n");
-        {
-            xpc_connection_t conn = xpc_connection_create_mach_service(
-                "com.apple.runningboard", NULL, 0);
-            if (conn) {
-                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
-                    (void)event;
-                });
-                xpc_connection_resume(conn);
+        // Resolve xpc_connection functions via dlsym (unavailable in iOS SDK)
+        void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+        typedef void *(*xpc_conn_create_fn)(const char *, void *, uint64_t);
+        typedef void (*xpc_conn_set_handler_fn)(void *, id);
+        typedef void (*xpc_conn_resume_fn)(void *);
+        typedef void *(*xpc_conn_send_sync_fn)(void *, void *);
+        typedef void *(*xpc_dict_create_fn)(const void *, const void *, size_t);
+        typedef void (*xpc_dict_set_int64_fn)(void *, const char *, int64_t);
+        typedef void (*xpc_dict_set_string_fn)(void *, const char *, const char *);
+        typedef void (*xpc_dict_set_bool_fn)(void *, const char *, _Bool);
+        typedef char *(*xpc_copy_desc_fn)(void *);
 
-                // Send a simple query
-                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
-                xpc_dictionary_set_int64(msg, "type", 1);
-                xpc_dictionary_set_string(msg, "process",
-                    "com.apple.mobilesafari");
-                xpc_dictionary_set_bool(msg, "suspended", false);
+        xpc_conn_create_fn    fn_create  = NULL;
+        xpc_conn_set_handler_fn fn_handler = NULL;
+        xpc_conn_resume_fn    fn_resume  = NULL;
+        xpc_conn_send_sync_fn fn_send    = NULL;
+        xpc_dict_create_fn    fn_dcreate = NULL;
+        xpc_dict_set_int64_fn fn_dint64  = NULL;
+        xpc_dict_set_string_fn fn_dstr   = NULL;
+        xpc_dict_set_bool_fn  fn_dbool   = NULL;
+        xpc_copy_desc_fn      fn_desc    = NULL;
 
-                bc("[SWAP] A1: sending to runningboard\n");
-                xpc_object_t reply =
-                    xpc_connection_send_message_with_reply_sync(conn, msg);
-                if (reply) {
-                    char *desc = xpc_copy_description(reply);
-                    if (desc) {
-                        buf_append("  Reply: %.500s\n", desc);
-                        free(desc);
-                    }
-                    if (reply == XPC_ERROR_CONNECTION_INVALID) {
-                        buf_append("  (connection invalid)\n");
-                    } else if (reply == XPC_ERROR_CONNECTION_INTERRUPTED) {
-                        buf_append("  (connection interrupted)\n");
+        if (xpc_h) {
+            fn_create  = (xpc_conn_create_fn)dlsym(xpc_h, "xpc_connection_create_mach_service");
+            fn_handler = (xpc_conn_set_handler_fn)dlsym(xpc_h, "xpc_connection_set_event_handler");
+            fn_resume  = (xpc_conn_resume_fn)dlsym(xpc_h, "xpc_connection_resume");
+            fn_send    = (xpc_conn_send_sync_fn)dlsym(xpc_h, "xpc_connection_send_message_with_reply_sync");
+            fn_dcreate = (xpc_dict_create_fn)dlsym(xpc_h, "xpc_dictionary_create");
+            fn_dint64  = (xpc_dict_set_int64_fn)dlsym(xpc_h, "xpc_dictionary_set_int64");
+            fn_dstr    = (xpc_dict_set_string_fn)dlsym(xpc_h, "xpc_dictionary_set_string");
+            fn_dbool   = (xpc_dict_set_bool_fn)dlsym(xpc_h, "xpc_dictionary_set_bool");
+            fn_desc    = (xpc_copy_desc_fn)dlsym(xpc_h, "xpc_copy_description");
+        }
+
+        buf_append("  dlsym results:\n");
+        buf_append("    create_mach_service: %p\n", fn_create);
+        buf_append("    set_event_handler:   %p\n", fn_handler);
+        buf_append("    resume:              %p\n", fn_resume);
+        buf_append("    send_sync:           %p\n", fn_send);
+        buf_append("    dict_create:         %p\n", fn_dcreate);
+
+        if (!fn_create || !fn_handler || !fn_resume || !fn_send || !fn_dcreate) {
+            buf_append("  MISSING critical XPC symbols, skipping A1-A3\n");
+        } else {
+            // Helper block for noop event handler
+            id noop_handler = ^(id event) { (void)event; };
+
+            // ── Test A1: Talk to com.apple.runningboard ──
+            bc("[SWAP] A1: runningboard XPC\n");
+            buf_append("\n  A1: com.apple.runningboard\n");
+            {
+                void *conn = fn_create("com.apple.runningboard", NULL, 0);
+                if (conn) {
+                    fn_handler(conn, noop_handler);
+                    fn_resume(conn);
+
+                    void *msg = fn_dcreate(NULL, NULL, 0);
+                    if (fn_dint64) fn_dint64(msg, "type", 1);
+                    if (fn_dstr)   fn_dstr(msg, "process", "com.apple.mobilesafari");
+                    if (fn_dbool)  fn_dbool(msg, "suspended", false);
+
+                    bc("[SWAP] A1: sending to runningboard\n");
+                    void *reply = fn_send(conn, msg);
+                    if (reply && fn_desc) {
+                        char *desc = fn_desc(reply);
+                        if (desc) {
+                            buf_append("  Reply: %.500s\n", desc);
+                            free(desc);
+                        }
+                    } else {
+                        buf_append("  Reply: NULL\n");
                     }
                 } else {
-                    buf_append("  Reply: NULL\n");
+                    buf_append("  conn: NULL\n");
                 }
-                xpc_connection_cancel(conn);
-            } else {
-                buf_append("  conn: NULL\n");
+            }
+
+            // ── Test A2: Talk to com.apple.springboard.services ──
+            bc("[SWAP] A2: springboard XPC\n");
+            buf_append("\n  A2: com.apple.springboard.services\n");
+            {
+                void *conn = fn_create("com.apple.springboard.services", NULL, 0);
+                if (conn) {
+                    fn_handler(conn, noop_handler);
+                    fn_resume(conn);
+
+                    void *msg = fn_dcreate(NULL, NULL, 0);
+                    if (fn_dstr)   fn_dstr(msg, "bundleId", "com.apple.mobilesafari");
+                    if (fn_dint64) fn_dint64(msg, "action", 0);
+
+                    bc("[SWAP] A2: sending to SB\n");
+                    void *reply = fn_send(conn, msg);
+                    if (reply && fn_desc) {
+                        char *desc = fn_desc(reply);
+                        if (desc) {
+                            buf_append("  Reply: %.500s\n", desc);
+                            free(desc);
+                        }
+                    } else {
+                        buf_append("  Reply: NULL\n");
+                    }
+                } else {
+                    buf_append("  conn: NULL\n");
+                }
+            }
+
+            // ── Test A3: Talk to com.apple.mobile.installd ──
+            bc("[SWAP] A3: installd XPC\n");
+            buf_append("\n  A3: com.apple.mobile.installd\n");
+            {
+                void *conn = fn_create("com.apple.mobile.installd", NULL, 0);
+                if (conn) {
+                    fn_handler(conn, noop_handler);
+                    fn_resume(conn);
+
+                    void *msg = fn_dcreate(NULL, NULL, 0);
+                    if (fn_dstr) fn_dstr(msg, "Command", "Lookup");
+                    if (fn_dstr) fn_dstr(msg, "ClientOptions", "");
+
+                    bc("[SWAP] A3: sending to installd\n");
+                    void *reply = fn_send(conn, msg);
+                    if (reply && fn_desc) {
+                        char *desc = fn_desc(reply);
+                        if (desc) {
+                            buf_append("  Reply: %.500s\n", desc);
+                            free(desc);
+                        }
+                    } else {
+                        buf_append("  Reply: NULL\n");
+                    }
+                } else {
+                    buf_append("  conn: NULL\n");
+                }
             }
         }
 
-        // ── Test A2: Talk to com.apple.springboard.services ──
-        bc("[SWAP] A2: springboard XPC\n");
-        buf_append("\n  A2: com.apple.springboard.services\n");
-        {
-            xpc_connection_t conn = xpc_connection_create_mach_service(
-                "com.apple.springboard.services", NULL, 0);
-            if (conn) {
-                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
-                    (void)event;
-                });
-                xpc_connection_resume(conn);
-
-                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
-                xpc_dictionary_set_string(msg, "bundleId",
-                    "com.apple.mobilesafari");
-                xpc_dictionary_set_int64(msg, "action", 0);
-
-                bc("[SWAP] A2: sending to SB\n");
-                xpc_object_t reply =
-                    xpc_connection_send_message_with_reply_sync(conn, msg);
-                if (reply) {
-                    char *desc = xpc_copy_description(reply);
-                    if (desc) {
-                        buf_append("  Reply: %.500s\n", desc);
-                        free(desc);
-                    }
-                } else {
-                    buf_append("  Reply: NULL\n");
-                }
-                xpc_connection_cancel(conn);
-            } else {
-                buf_append("  conn: NULL\n");
-            }
-        }
-
-        // ── Test A3: Talk to com.apple.mobile.installd ──
-        bc("[SWAP] A3: installd XPC\n");
-        buf_append("\n  A3: com.apple.mobile.installd\n");
-        {
-            xpc_connection_t conn = xpc_connection_create_mach_service(
-                "com.apple.mobile.installd", NULL, 0);
-            if (conn) {
-                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
-                    (void)event;
-                });
-                xpc_connection_resume(conn);
-
-                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
-                xpc_dictionary_set_string(msg, "Command", "Lookup");
-                xpc_dictionary_set_string(msg, "ClientOptions", "");
-
-                bc("[SWAP] A3: sending to installd\n");
-                xpc_object_t reply =
-                    xpc_connection_send_message_with_reply_sync(conn, msg);
-                if (reply) {
-                    char *desc = xpc_copy_description(reply);
-                    if (desc) {
-                        buf_append("  Reply: %.500s\n", desc);
-                        free(desc);
-                    }
-                } else {
-                    buf_append("  Reply: NULL\n");
-                }
-                xpc_connection_cancel(conn);
-            } else {
-                buf_append("  conn: NULL\n");
-            }
-        }
-
-        // ── Test A4: xpc_pipe_routine to launchd (PRIVATE API — dlsym) ──
+        // ── Test A4: xpc_pipe_routine to launchd (PRIVATE API) ──
         bc("[SWAP] A4: xpc_pipe_routine\n");
         buf_append("\n  A4: xpc_pipe_routine to launchd\n");
         {
-            void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-            // Use void* for private API types to avoid ARC ownership
-            // qualifier issues with xpc_object_t* parameters
             typedef int (*xpc_pipe_routine_fn)(void *, void *, void **);
             typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
 
             xpc_pipe_routine_fn xpr = NULL;
             xpc_pipe_create_fn xppc = NULL;
             if (xpc_h) {
-                xpr  = (xpc_pipe_routine_fn)dlsym(xpc_h,
-                    "xpc_pipe_routine");
-                xppc = (xpc_pipe_create_fn)dlsym(xpc_h,
-                    "xpc_pipe_create");
+                xpr  = (xpc_pipe_routine_fn)dlsym(xpc_h, "xpc_pipe_routine");
+                xppc = (xpc_pipe_create_fn)dlsym(xpc_h, "xpc_pipe_create");
             }
             buf_append("  xpc_pipe_routine: %p\n", xpr);
             buf_append("  xpc_pipe_create: %p\n", xppc);
 
-            if (xpr) {
+            if (xpr && fn_dcreate) {
                 void *pipe = NULL;
                 if (xppc) {
                     pipe = xppc(NULL, 0);
                     buf_append("  pipe to launchd: %p\n", pipe);
                 }
                 if (pipe) {
-                    // launchd protocol: subsystem + routine
-                    xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
-                    xpc_dictionary_set_int64(msg, "subsystem", 3);
-                    xpc_dictionary_set_int64(msg, "routine", 815);
-                    xpc_dictionary_set_int64(msg, "type", 1);
+                    void *msg = fn_dcreate(NULL, NULL, 0);
+                    if (fn_dint64) {
+                        fn_dint64(msg, "subsystem", 3);
+                        fn_dint64(msg, "routine", 815);
+                        fn_dint64(msg, "type", 1);
+                    }
 
                     void *reply_raw = NULL;
                     bc("[SWAP] A4: calling xpc_pipe_routine\n");
-                    int ret = xpr(pipe, (__bridge void *)msg, &reply_raw);
+                    int ret = xpr(pipe, msg, &reply_raw);
                     buf_append("  xpc_pipe_routine: ret=%d\n", ret);
-                    if (reply_raw) {
-                        xpc_object_t reply = (__bridge xpc_object_t)reply_raw;
-                        char *desc = xpc_copy_description(reply);
+                    if (reply_raw && fn_desc) {
+                        char *desc = fn_desc(reply_raw);
                         if (desc) {
                             buf_append("  Reply: %.800s\n", desc);
                             free(desc);
@@ -714,21 +735,23 @@ char *kresearch_swap_sandbox_profile(void) {
                     }
 
                     // Try submit job
-                    xpc_object_t msg2 = xpc_dictionary_create(
-                        NULL, NULL, 0);
-                    xpc_dictionary_set_int64(msg2, "subsystem", 3);
-                    xpc_dictionary_set_int64(msg2, "routine", 800);
-                    xpc_dictionary_set_int64(msg2, "type", 1);
-                    xpc_dictionary_set_string(msg2, "label", "com.test.jb");
-                    xpc_dictionary_set_string(msg2, "program", "/bin/sh");
+                    void *msg2 = fn_dcreate(NULL, NULL, 0);
+                    if (fn_dint64) {
+                        fn_dint64(msg2, "subsystem", 3);
+                        fn_dint64(msg2, "routine", 800);
+                        fn_dint64(msg2, "type", 1);
+                    }
+                    if (fn_dstr) {
+                        fn_dstr(msg2, "label", "com.test.jb");
+                        fn_dstr(msg2, "program", "/bin/sh");
+                    }
 
                     reply_raw = NULL;
                     bc("[SWAP] A4: submitting job\n");
-                    ret = xpr(pipe, (__bridge void *)msg2, &reply_raw);
+                    ret = xpr(pipe, msg2, &reply_raw);
                     buf_append("  submit job: ret=%d\n", ret);
-                    if (reply_raw) {
-                        xpc_object_t reply2 = (__bridge xpc_object_t)reply_raw;
-                        char *desc = xpc_copy_description(reply2);
+                    if (reply_raw && fn_desc) {
+                        char *desc = fn_desc(reply_raw);
                         if (desc) {
                             buf_append("  Reply: %.500s\n", desc);
                             free(desc);
@@ -758,8 +781,11 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("  LSApplicationWorkspace class: %p\n", lsws);
 
         if (lsws) {
-            id workspace = [lsws performSelector:
-                @selector(defaultWorkspace)];
+            SEL defWSSel = NSSelectorFromString(@"defaultWorkspace");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id workspace = [lsws performSelector:defWSSel];
+#pragma clang diagnostic pop
             buf_append("  defaultWorkspace: %p\n", workspace);
 
             if (workspace) {
@@ -824,8 +850,11 @@ char *kresearch_swap_sandbox_profile(void) {
             Class fbsService = NSClassFromString(@"FBSSystemService");
             buf_append("  FBSSystemService: %p\n", fbsService);
             if (fbsService) {
-                id svc = [fbsService performSelector:
-                    @selector(sharedService)];
+                SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id svc = [fbsService performSelector:sharedSvcSel];
+#pragma clang diagnostic pop
                 buf_append("  sharedService: %p\n", svc);
                 if (svc) {
                     unsigned int count = 0;
@@ -941,8 +970,8 @@ char *kresearch_swap_sandbox_profile(void) {
 
         // Test 1: /bin/sh with file_actions
         pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "id", NULL};
-        char *envp[] = {NULL};
+        char *const argv[] = {(char *)"/bin/sh", (char *)"-c", (char *)"id", NULL};
+        char *const envp[] = {NULL};
         int ret = posix_spawn(&child, "/bin/sh", &fa, &attr, argv, envp);
         buf_append("  posix_spawn /bin/sh+file_actions: %d (%s)\n",
                    ret, ret == 0 ? "SUCCESS" : strerror(ret));
@@ -958,6 +987,9 @@ char *kresearch_swap_sandbox_profile(void) {
 
         // Test 3: spawn with POSIX_SPAWN_START_SUSPENDED
         bc("[SWAP] C: spawn SUSPENDED\n");
+#ifndef POSIX_SPAWN_START_SUSPENDED
+#define POSIX_SPAWN_START_SUSPENDED 0x0080
+#endif
         posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
         child = 0;
         ret = posix_spawn(&child, "/bin/sh", NULL, &attr, argv, envp);

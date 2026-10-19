@@ -27,7 +27,7 @@ struct ResearchView: View {
 
                         Section {
                             commandGroup(title: "Active Tests", icon: "bolt.fill", color: .orange, commands: [
-                                ("swap_profile",  "Run Research (v13)", "Register fake app + launch via SpringBoard"),
+                                ("swap_profile",  "Run Research (v14)", "FBSOpenApp, NSTask self, SBS, openURL, kernel"),
                                 ("exec_ext",      "Add Exec Extension", "Add process-exec sandbox ext"),
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),
                             ])
@@ -205,7 +205,7 @@ final class ResearchRunner: ObservableObject {
             "compare": "Compare Creds",
             "sandbox_ops": "Sandbox Ops",
             "sandbox_profile": "Sandbox Profile",
-            "swap_profile": "Research v13",
+            "swap_profile": "Research v14",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",
             "breadcrumbs": "Breadcrumbs",

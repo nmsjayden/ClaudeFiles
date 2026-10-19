@@ -205,7 +205,7 @@ final class ResearchRunner: ObservableObject {
             "compare": "Compare Creds",
             "sandbox_ops": "Sandbox Ops",
             "sandbox_profile": "Sandbox Profile",
-            "swap_profile": "Research v11",
+            "swap_profile": "Research v12",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",
             "breadcrumbs": "Breadcrumbs",

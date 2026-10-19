@@ -22,11 +22,11 @@
 #import <errno.h>
 #import <dlfcn.h>
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
 #import <objc/runtime.h>
 #import <fcntl.h>
+#import <xpc/xpc.h>
 
 // mach_vm.h is not available in iOS SDK.
 // We resolve mach_vm_allocate/protect/deallocate via dlsym at runtime
@@ -543,211 +543,192 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("  XPC connections: ALL SUCCEED (SB, runningboard, installd)\n");
     buf_append("  Custom dylib: wrong platform tag in Mach-O\n");
     buf_append("  posix_spawn: still EPERM\n");
-    buf_append("v12: Exploit live XPC connections, ObjC runtime, launch services.\n\n");
+    buf_append("v12: Exploit live XPC connections, ObjC runtime, launch services.\n");
+    buf_append("FIX: Uses <xpc/xpc.h> types directly. Only dlsym for private APIs.\n\n");
 
     // ══════════════════════════════════════════════════════════════
     // TEST A: Send XPC messages to system services
     // v11 showed we can CONNECT — now send actual messages and
-    // see what replies we get. Focus on services that manage
-    // process lifecycle.
+    // see what replies we get. Uses <xpc/xpc.h> types directly.
+    // Only private APIs (xpc_pipe_*) use dlsym.
     // ══════════════════════════════════════════════════════════════
     bc("[SWAP] Test A: XPC messaging\n");
     buf_append("-- Test A: XPC messaging to system services --\n");
     {
-        // Resolve XPC functions via dlsym
-        void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-        if (!xpc_h) {
-            buf_append("  dlopen libxpc: FAILED\n");
-        } else {
-            typedef void *(*xpc_conn_create_fn)(const char *, void *, uint64_t);
-            typedef void (*xpc_conn_set_handler_fn)(void *, void *);
-            typedef void (*xpc_conn_resume_fn)(void *);
-            typedef void *(*xpc_conn_send_sync_fn)(void *, void *);
-            typedef void *(*xpc_dict_create_fn)(const char *const *,
-                const void *const *, size_t);
-            typedef void (*xpc_dict_set_string_fn)(void *, const char *,
-                const char *);
-            typedef void (*xpc_dict_set_int64_fn)(void *, const char *, int64_t);
-            typedef void (*xpc_dict_set_bool_fn)(void *, const char *, _Bool);
-            typedef const char *(*xpc_dict_get_string_fn)(void *, const char *);
-            typedef int64_t (*xpc_dict_get_int64_fn)(void *, const char *);
-            typedef void *(*xpc_copy_desc_fn)(void *);
-            typedef const char *(*xpc_type_get_name_fn)(void *);
-            typedef void *(*xpc_get_type_fn)(void *);
+        // ── Test A1: Talk to com.apple.runningboard ──
+        bc("[SWAP] A1: runningboard XPC\n");
+        buf_append("\n  A1: com.apple.runningboard\n");
+        {
+            xpc_connection_t conn = xpc_connection_create_mach_service(
+                "com.apple.runningboard", NULL, 0);
+            if (conn) {
+                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
+                    (void)event;
+                });
+                xpc_connection_resume(conn);
 
-            xpc_conn_create_fn    xcc  = dlsym(xpc_h, "xpc_connection_create_mach_service");
-            xpc_conn_set_handler_fn xsh = dlsym(xpc_h, "xpc_connection_set_event_handler");
-            xpc_conn_resume_fn    xcr  = dlsym(xpc_h, "xpc_connection_resume");
-            xpc_conn_send_sync_fn xss  = dlsym(xpc_h, "xpc_connection_send_message_with_reply_sync");
-            xpc_dict_create_fn    xdc  = dlsym(xpc_h, "xpc_dictionary_create");
-            xpc_dict_set_string_fn xdss = dlsym(xpc_h, "xpc_dictionary_set_string");
-            xpc_dict_set_int64_fn xdsi = dlsym(xpc_h, "xpc_dictionary_set_int64");
-            xpc_dict_set_bool_fn xdsb  = dlsym(xpc_h, "xpc_dictionary_set_bool");
-            xpc_copy_desc_fn     xcd  = dlsym(xpc_h, "xpc_copy_description");
-            xpc_type_get_name_fn xtn  = dlsym(xpc_h, "xpc_type_get_name");
-            xpc_get_type_fn      xgt  = dlsym(xpc_h, "xpc_get_type");
+                // Send a simple query
+                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+                xpc_dictionary_set_int64(msg, "type", 1);
+                xpc_dictionary_set_string(msg, "process",
+                    "com.apple.mobilesafari");
+                xpc_dictionary_set_bool(msg, "suspended", false);
 
-            // Also need the error type pointer for comparison
-            void **xpc_error_conn_invalid = dlsym(xpc_h, "_xpc_error_connection_invalid");
-            void **xpc_error_conn_interrupted = dlsym(xpc_h, "_xpc_error_connection_interrupted");
+                bc("[SWAP] A1: sending to runningboard\n");
+                xpc_object_t reply =
+                    xpc_connection_send_message_with_reply_sync(conn, msg);
+                if (reply) {
+                    char *desc = xpc_copy_description(reply);
+                    if (desc) {
+                        buf_append("  Reply: %.500s\n", desc);
+                        free(desc);
+                    }
+                    if (reply == XPC_ERROR_CONNECTION_INVALID) {
+                        buf_append("  (connection invalid)\n");
+                    } else if (reply == XPC_ERROR_CONNECTION_INTERRUPTED) {
+                        buf_append("  (connection interrupted)\n");
+                    }
+                } else {
+                    buf_append("  Reply: NULL\n");
+                }
+                xpc_connection_cancel(conn);
+            } else {
+                buf_append("  conn: NULL\n");
+            }
+        }
 
-            bc("[SWAP] XPC symbols resolved\n");
-            buf_append("  XPC symbols: create=%p send_sync=%p dict=%p\n",
-                       xcc, xss, xdc);
+        // ── Test A2: Talk to com.apple.springboard.services ──
+        bc("[SWAP] A2: springboard XPC\n");
+        buf_append("\n  A2: com.apple.springboard.services\n");
+        {
+            xpc_connection_t conn = xpc_connection_create_mach_service(
+                "com.apple.springboard.services", NULL, 0);
+            if (conn) {
+                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
+                    (void)event;
+                });
+                xpc_connection_resume(conn);
 
-            if (xcc && xss && xdc && xcr && xsh) {
-                // ── Test A1: Talk to com.apple.runningboard ──
-                bc("[SWAP] A1: runningboard XPC\n");
-                buf_append("\n  A1: com.apple.runningboard\n");
-                {
-                    void *conn = xcc("com.apple.runningboard", NULL, 0);
-                    if (conn) {
-                        // Must set handler and resume before sending
-                        xsh(conn, ^(void *event) { (void)event; });
-                        xcr(conn);
+                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+                xpc_dictionary_set_string(msg, "bundleId",
+                    "com.apple.mobilesafari");
+                xpc_dictionary_set_int64(msg, "action", 0);
 
-                        // Send a simple ping / identity query
-                        void *msg = xdc(NULL, NULL, 0);
-                        xdsi(msg, "type", 1);  // query type
-                        xdss(msg, "process", "com.apple.mobilesafari");
-                        xdsb(msg, "suspended", false);
+                bc("[SWAP] A2: sending to SB\n");
+                xpc_object_t reply =
+                    xpc_connection_send_message_with_reply_sync(conn, msg);
+                if (reply) {
+                    char *desc = xpc_copy_description(reply);
+                    if (desc) {
+                        buf_append("  Reply: %.500s\n", desc);
+                        free(desc);
+                    }
+                } else {
+                    buf_append("  Reply: NULL\n");
+                }
+                xpc_connection_cancel(conn);
+            } else {
+                buf_append("  conn: NULL\n");
+            }
+        }
 
-                        bc("[SWAP] A1: sending to runningboard\n");
-                        void *reply = xss(conn, msg);
-                        if (reply) {
-                            char *desc = xcd(reply);
-                            if (desc) {
-                                buf_append("  Reply: %.500s\n", desc);
-                                free(desc);
-                            }
-                            // Check if it's an error
-                            if (xpc_error_conn_invalid && reply == *xpc_error_conn_invalid) {
-                                buf_append("  (connection invalid)\n");
-                            } else if (xpc_error_conn_interrupted && reply == *xpc_error_conn_interrupted) {
-                                buf_append("  (connection interrupted)\n");
-                            }
-                        } else {
-                            buf_append("  Reply: NULL\n");
+        // ── Test A3: Talk to com.apple.mobile.installd ──
+        bc("[SWAP] A3: installd XPC\n");
+        buf_append("\n  A3: com.apple.mobile.installd\n");
+        {
+            xpc_connection_t conn = xpc_connection_create_mach_service(
+                "com.apple.mobile.installd", NULL, 0);
+            if (conn) {
+                xpc_connection_set_event_handler(conn, ^(xpc_object_t event) {
+                    (void)event;
+                });
+                xpc_connection_resume(conn);
+
+                xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+                xpc_dictionary_set_string(msg, "Command", "Lookup");
+                xpc_dictionary_set_string(msg, "ClientOptions", "");
+
+                bc("[SWAP] A3: sending to installd\n");
+                xpc_object_t reply =
+                    xpc_connection_send_message_with_reply_sync(conn, msg);
+                if (reply) {
+                    char *desc = xpc_copy_description(reply);
+                    if (desc) {
+                        buf_append("  Reply: %.500s\n", desc);
+                        free(desc);
+                    }
+                } else {
+                    buf_append("  Reply: NULL\n");
+                }
+                xpc_connection_cancel(conn);
+            } else {
+                buf_append("  conn: NULL\n");
+            }
+        }
+
+        // ── Test A4: xpc_pipe_routine to launchd (PRIVATE API — dlsym) ──
+        bc("[SWAP] A4: xpc_pipe_routine\n");
+        buf_append("\n  A4: xpc_pipe_routine to launchd\n");
+        {
+            void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+            typedef int (*xpc_pipe_routine_fn)(void *, xpc_object_t,
+                xpc_object_t *);
+            typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
+
+            xpc_pipe_routine_fn xpr = NULL;
+            xpc_pipe_create_fn xppc = NULL;
+            if (xpc_h) {
+                xpr  = (xpc_pipe_routine_fn)dlsym(xpc_h,
+                    "xpc_pipe_routine");
+                xppc = (xpc_pipe_create_fn)dlsym(xpc_h,
+                    "xpc_pipe_create");
+            }
+            buf_append("  xpc_pipe_routine: %p\n", xpr);
+            buf_append("  xpc_pipe_create: %p\n", xppc);
+
+            if (xpr) {
+                void *pipe = NULL;
+                if (xppc) {
+                    pipe = xppc(NULL, 0);
+                    buf_append("  pipe to launchd: %p\n", pipe);
+                }
+                if (pipe) {
+                    // launchd protocol: subsystem + routine
+                    xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+                    xpc_dictionary_set_int64(msg, "subsystem", 3);
+                    xpc_dictionary_set_int64(msg, "routine", 815);
+                    xpc_dictionary_set_int64(msg, "type", 1);
+
+                    xpc_object_t reply = NULL;
+                    bc("[SWAP] A4: calling xpc_pipe_routine\n");
+                    int ret = xpr(pipe, msg, &reply);
+                    buf_append("  xpc_pipe_routine: ret=%d\n", ret);
+                    if (reply) {
+                        char *desc = xpc_copy_description(reply);
+                        if (desc) {
+                            buf_append("  Reply: %.800s\n", desc);
+                            free(desc);
                         }
                     }
-                }
 
-                // ── Test A2: Talk to com.apple.springboard.services ──
-                bc("[SWAP] A2: springboard XPC\n");
-                buf_append("\n  A2: com.apple.springboard.services\n");
-                {
-                    void *conn = xcc("com.apple.springboard.services", NULL, 0);
-                    if (conn) {
-                        xsh(conn, ^(void *event) { (void)event; });
-                        xcr(conn);
+                    // Try submit job
+                    xpc_object_t msg2 = xpc_dictionary_create(
+                        NULL, NULL, 0);
+                    xpc_dictionary_set_int64(msg2, "subsystem", 3);
+                    xpc_dictionary_set_int64(msg2, "routine", 800);
+                    xpc_dictionary_set_int64(msg2, "type", 1);
+                    xpc_dictionary_set_string(msg2, "label", "com.test.jb");
+                    xpc_dictionary_set_string(msg2, "program", "/bin/sh");
 
-                        // SBS uses XPC internally. Try sending an
-                        // openApplication message directly.
-                        void *msg = xdc(NULL, NULL, 0);
-                        xdss(msg, "bundleId", "com.apple.mobilesafari");
-                        xdsi(msg, "action", 0);  // open
-
-                        bc("[SWAP] A2: sending to SB\n");
-                        void *reply = xss(conn, msg);
-                        if (reply) {
-                            char *desc = xcd(reply);
-                            if (desc) {
-                                buf_append("  Reply: %.500s\n", desc);
-                                free(desc);
-                            }
-                        } else {
-                            buf_append("  Reply: NULL\n");
-                        }
-                    }
-                }
-
-                // ── Test A3: Talk to com.apple.mobile.installd ──
-                bc("[SWAP] A3: installd XPC\n");
-                buf_append("\n  A3: com.apple.mobile.installd\n");
-                {
-                    void *conn = xcc("com.apple.mobile.installd", NULL, 0);
-                    if (conn) {
-                        xsh(conn, ^(void *event) { (void)event; });
-                        xcr(conn);
-
-                        // Ask installd to list installed apps
-                        void *msg = xdc(NULL, NULL, 0);
-                        xdss(msg, "Command", "Lookup");
-                        xdss(msg, "ClientOptions", "");
-
-                        bc("[SWAP] A3: sending to installd\n");
-                        void *reply = xss(conn, msg);
-                        if (reply) {
-                            char *desc = xcd(reply);
-                            if (desc) {
-                                buf_append("  Reply: %.500s\n", desc);
-                                free(desc);
-                            }
-                        } else {
-                            buf_append("  Reply: NULL\n");
-                        }
-                    }
-                }
-
-                // ── Test A4: xpc_pipe_routine to launchd ──
-                bc("[SWAP] A4: xpc_pipe_routine\n");
-                buf_append("\n  A4: xpc_pipe_routine to launchd\n");
-                {
-                    // xpc_pipe_routine talks directly to launchd
-                    typedef int (*xpc_pipe_routine_fn)(void *, void *, void **);
-                    typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
-                    xpc_pipe_routine_fn xpr = dlsym(xpc_h, "xpc_pipe_routine");
-                    xpc_pipe_create_fn xpc = dlsym(xpc_h, "xpc_pipe_create");
-                    buf_append("  xpc_pipe_routine: %p\n", xpr);
-                    buf_append("  xpc_pipe_create: %p\n", xpc);
-
-                    if (xpr) {
-                        // Create a pipe to launchd (NULL name = launchd)
-                        void *pipe = NULL;
-                        if (xpc) {
-                            pipe = xpc(NULL, 0);
-                            buf_append("  pipe to launchd: %p\n", pipe);
-                        }
-
-                        if (pipe) {
-                            // Send "list" command (type 815 in launchd protocol)
-                            // launchd XPC protocol uses "subsystem" and "routine"
-                            void *msg = xdc(NULL, NULL, 0);
-                            xdsi(msg, "subsystem", 3);    // process subsystem
-                            xdsi(msg, "routine", 815);     // list jobs
-                            xdsi(msg, "type", 1);
-
-                            void *reply = NULL;
-                            bc("[SWAP] A4: calling xpc_pipe_routine\n");
-                            int ret = xpr(pipe, msg, &reply);
-                            buf_append("  xpc_pipe_routine: ret=%d\n", ret);
-                            if (reply) {
-                                char *desc = xcd(reply);
-                                if (desc) {
-                                    buf_append("  Reply: %.800s\n", desc);
-                                    free(desc);
-                                }
-                            }
-
-                            // Try "submit" command (submit a job to launchd)
-                            void *msg2 = xdc(NULL, NULL, 0);
-                            xdsi(msg2, "subsystem", 3);
-                            xdsi(msg2, "routine", 800);   // submit job
-                            xdsi(msg2, "type", 1);
-                            xdss(msg2, "label", "com.test.jb");
-                            xdss(msg2, "program", "/bin/sh");
-
-                            reply = NULL;
-                            bc("[SWAP] A4: submitting job\n");
-                            ret = xpr(pipe, msg2, &reply);
-                            buf_append("  submit job: ret=%d\n", ret);
-                            if (reply) {
-                                char *desc = xcd(reply);
-                                if (desc) {
-                                    buf_append("  Reply: %.500s\n", desc);
-                                    free(desc);
-                                }
-                            }
+                    reply = NULL;
+                    bc("[SWAP] A4: submitting job\n");
+                    ret = xpr(pipe, msg2, &reply);
+                    buf_append("  submit job: ret=%d\n", ret);
+                    if (reply) {
+                        char *desc = xpc_copy_description(reply);
+                        if (desc) {
+                            buf_append("  Reply: %.500s\n", desc);
+                            free(desc);
                         }
                     }
                 }
@@ -770,12 +751,10 @@ char *kresearch_swap_sandbox_profile(void) {
         if (!ls) ls = dlopen("/System/Library/Frameworks/"
             "CoreServices.framework/CoreServices", RTLD_LAZY);
 
-        // Try LSApplicationWorkspace
         Class lsws = NSClassFromString(@"LSApplicationWorkspace");
         buf_append("  LSApplicationWorkspace class: %p\n", lsws);
 
         if (lsws) {
-            // [LSApplicationWorkspace defaultWorkspace]
             id workspace = [lsws performSelector:
                 @selector(defaultWorkspace)];
             buf_append("  defaultWorkspace: %p\n", workspace);
@@ -796,7 +775,6 @@ char *kresearch_swap_sandbox_profile(void) {
                 } else {
                     buf_append("  openApplicationWithBundleID: NOT FOUND\n");
 
-                    // List all methods to find what's available
                     unsigned int count = 0;
                     Method *methods = class_copyMethodList(
                         object_getClass(workspace), &count);
@@ -805,7 +783,6 @@ char *kresearch_swap_sandbox_profile(void) {
                     for (unsigned int i = 0; i < count && printed < 20; i++) {
                         const char *name = sel_getName(
                             method_getName(methods[i]));
-                        // Only show open/launch/exec related methods
                         if (strstr(name, "open") || strstr(name, "launch") ||
                             strstr(name, "exec") || strstr(name, "install") ||
                             strstr(name, "run")) {
@@ -816,7 +793,7 @@ char *kresearch_swap_sandbox_profile(void) {
                     if (methods) free(methods);
                 }
 
-                // Try openURL: — this can launch apps via URL schemes
+                // Try openURL: — launch apps via URL schemes
                 SEL openURLSel = NSSelectorFromString(@"openURL:");
                 if ([workspace respondsToSelector:openURLSel]) {
                     NSURL *url = [NSURL URLWithString:@"tel://"];
@@ -848,7 +825,6 @@ char *kresearch_swap_sandbox_profile(void) {
                     @selector(sharedService)];
                 buf_append("  sharedService: %p\n", svc);
                 if (svc) {
-                    // List available methods
                     unsigned int count = 0;
                     Method *methods = class_copyMethodList(
                         [svc class], &count);
@@ -868,105 +844,25 @@ char *kresearch_swap_sandbox_profile(void) {
                 }
             }
 
-            // Try FBSOpenApplicationService
             Class fbsOpen = NSClassFromString(@"FBSOpenApplicationService");
             buf_append("  FBSOpenApplicationService: %p\n", fbsOpen);
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST C: UIApplication openURL (from within our own app)
-    // UIApplication.shared.open() goes through SpringBoard but
-    // uses a different entitlement path than SBS direct calls.
+    // TEST C: NSTask + posix_spawn variants
+    // system() and popen() use fork() internally — DANGEROUS on
+    // iOS, can crash the app. Instead check if NSTask exists and
+    // try posix_spawn with different flags/targets.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test C: UIApplication openURL\n");
-    buf_append("\n-- Test C: UIApplication openURL --\n");
+    bc("[SWAP] Test C: Process APIs (safe)\n");
+    buf_append("\n-- Test C: Process creation APIs (no fork) --\n");
     {
-        // Must call on main thread
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block BOOL openResult = NO;
-
-        if ([NSThread isMainThread]) {
-            NSURL *url = [NSURL URLWithString:@"app-settings:"];
-            openResult = [[UIApplication sharedApplication] canOpenURL:url];
-            buf_append("  canOpenURL app-settings: %s\n",
-                       openResult ? "YES" : "NO");
-
-            NSURL *safari = [NSURL URLWithString:@"https://apple.com"];
-            openResult = [[UIApplication sharedApplication]
-                canOpenURL:safari];
-            buf_append("  canOpenURL https: %s\n",
-                       openResult ? "YES" : "NO");
-
-            // Actually try opening (async)
-            [[UIApplication sharedApplication] openURL:safari
-                options:@{} completionHandler:^(BOOL success) {
-                buf_append("  openURL https: %s\n",
-                           success ? "OPENED" : "FAILED");
-                dispatch_semaphore_signal(sem);
-            }];
-            dispatch_semaphore_wait(sem,
-                dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-        } else {
-            __block BOOL canOpen1 = NO, canOpen2 = NO;
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                NSURL *url = [NSURL URLWithString:@"app-settings:"];
-                canOpen1 = [[UIApplication sharedApplication] canOpenURL:url];
-                NSURL *safari = [NSURL URLWithString:@"https://apple.com"];
-                canOpen2 = [[UIApplication sharedApplication]
-                    canOpenURL:safari];
-
-                [[UIApplication sharedApplication] openURL:safari
-                    options:@{} completionHandler:^(BOOL success) {
-                    buf_append("  openURL https: %s\n",
-                               success ? "OPENED" : "FAILED");
-                    dispatch_semaphore_signal(sem);
-                }];
-            });
-            buf_append("  canOpenURL app-settings: %s\n",
-                       canOpen1 ? "YES" : "NO");
-            buf_append("  canOpenURL https: %s\n",
-                       canOpen2 ? "YES" : "NO");
-            dispatch_semaphore_wait(sem,
-                dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST D: NSTask / NSProcess (if available on iOS)
-    // These are macOS APIs but some parts may exist in the iOS
-    // shared cache. Also try system() and popen().
-    // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test D: Process APIs\n");
-    buf_append("\n-- Test D: Process creation APIs --\n");
-    {
-        // system() — simplest possible exec
-        bc("[SWAP] D: system()\n");
-        int ret = system("echo jb_test");
-        buf_append("  system('echo jb_test'): ret=%d errno=%d (%s)\n",
-                   ret, errno, strerror(errno));
-
-        // popen()
-        bc("[SWAP] D: popen()\n");
-        FILE *fp = popen("echo jb_popen", "r");
-        if (fp) {
-            char line[256] = {0};
-            if (fgets(line, sizeof(line), fp)) {
-                buf_append("  popen output: %s", line);
-            }
-            int pc = pclose(fp);
-            buf_append("  popen: WORKED! exit=%d\n", pc);
-        } else {
-            buf_append("  popen: FAILED errno=%d (%s)\n",
-                       errno, strerror(errno));
-        }
-
-        // NSTask (may not exist on iOS)
+        // NSTask (may not exist on iOS — macOS API)
         Class nsTask = NSClassFromString(@"NSTask");
         buf_append("  NSTask class: %p\n", nsTask);
         if (nsTask) {
             buf_append("  >>> NSTask EXISTS on iOS! <<<\n");
-            // List its methods
             unsigned int count = 0;
             Method *methods = class_copyMethodList(nsTask, &count);
             buf_append("  NSTask methods (%u):\n", count);
@@ -975,10 +871,59 @@ char *kresearch_swap_sandbox_profile(void) {
                     sel_getName(method_getName(methods[i])));
             }
             if (methods) free(methods);
+
+            // Try to use NSTask if it exists
+            bc("[SWAP] C: trying NSTask launch\n");
+            @try {
+                id task = [[nsTask alloc] init];
+                SEL setExec = NSSelectorFromString(@"setExecutableURL:");
+                SEL launch  = NSSelectorFromString(@"launchAndReturnError:");
+                if ([task respondsToSelector:setExec]) {
+                    NSURL *sh = [NSURL fileURLWithPath:@"/bin/sh"];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    [task performSelector:setExec withObject:sh];
+#pragma clang diagnostic pop
+                    SEL setArgs = NSSelectorFromString(@"setArguments:");
+                    if ([task respondsToSelector:setArgs]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        [task performSelector:setArgs
+                            withObject:@[@"-c", @"echo nstask_test"]];
+#pragma clang diagnostic pop
+                    }
+                    if ([task respondsToSelector:launch]) {
+                        NSMethodSignature *sig = [task
+                            methodSignatureForSelector:launch];
+                        NSInvocation *inv = [NSInvocation
+                            invocationWithMethodSignature:sig];
+                        [inv setSelector:launch];
+                        [inv setTarget:task];
+                        __unsafe_unretained NSError *errArg = nil;
+                        [inv setArgument:&errArg atIndex:2];
+                        [inv invoke];
+                        BOOL ok = NO;
+                        [inv getReturnValue:&ok];
+                        buf_append("  NSTask launch: %s\n",
+                                   ok ? "SUCCESS" : "FAILED");
+                        if (errArg) {
+                            buf_append("  NSTask error: %s\n",
+                                [[errArg localizedDescription] UTF8String]);
+                        }
+                    } else {
+                        buf_append("  launchAndReturnError: NOT FOUND\n");
+                    }
+                } else {
+                    buf_append("  setExecutableURL: NOT FOUND\n");
+                }
+            } @catch (NSException *e) {
+                buf_append("  NSTask exception: %s\n",
+                    [[e reason] UTF8String]);
+            }
         }
 
-        // Check for posix_spawn_file_actions tricks
-        bc("[SWAP] D: spawn with file actions\n");
+        // posix_spawn with file_actions
+        bc("[SWAP] C: spawn with file_actions\n");
         posix_spawn_file_actions_t fa;
         posix_spawn_file_actions_init(&fa);
         posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
@@ -986,23 +931,57 @@ char *kresearch_swap_sandbox_profile(void) {
         posix_spawnattr_t attr;
         posix_spawnattr_init(&attr);
 
+        // Default flags
+        short flags = 0;
+        posix_spawnattr_getflags(&attr, &flags);
+        buf_append("  spawnattr default flags: 0x%x\n", flags);
+
+        // Test 1: /bin/sh with file_actions
         pid_t child = 0;
         char *argv[] = {"/bin/sh", "-c", "id", NULL};
         char *envp[] = {NULL};
-        ret = posix_spawn(&child, "/bin/sh", &fa, &attr, argv, envp);
-        buf_append("  posix_spawn with file_actions: %d (%s)\n",
+        int ret = posix_spawn(&child, "/bin/sh", &fa, &attr, argv, envp);
+        buf_append("  posix_spawn /bin/sh+file_actions: %d (%s)\n",
                    ret, ret == 0 ? "SUCCESS" : strerror(ret));
+
+        // Test 2: spawn our own binary (self-exec)
+        NSString *selfPath = [[NSBundle mainBundle] executablePath];
+        const char *selfCStr = [selfPath UTF8String];
+        child = 0;
+        char *argv2[] = {(char *)selfCStr, NULL};
+        ret = posix_spawn(&child, selfCStr, NULL, &attr, argv2, envp);
+        buf_append("  posix_spawn self (%s): %d (%s)\n",
+                   selfCStr, ret, ret == 0 ? "SUCCESS" : strerror(ret));
+
+        // Test 3: spawn with POSIX_SPAWN_START_SUSPENDED
+        bc("[SWAP] C: spawn SUSPENDED\n");
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+        child = 0;
+        ret = posix_spawn(&child, "/bin/sh", NULL, &attr, argv, envp);
+        buf_append("  posix_spawn+SUSPENDED: %d (%s)\n",
+                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
+        if (ret == 0 && child > 0) {
+            buf_append("  >>> SPAWNED PID %d (suspended)! <<<\n", child);
+            kill(child, SIGCONT);
+            int status = 0;
+            waitpid(child, &status, WNOHANG);
+            buf_append("  status: 0x%x\n", status);
+            kill(child, SIGKILL);
+        }
+
         posix_spawn_file_actions_destroy(&fa);
         posix_spawnattr_destroy(&attr);
+
+        buf_append("  execve: SKIPPED (would replace our process)\n");
+        buf_append("  system()/popen(): SKIPPED (use fork, may crash)\n");
     }
 
     buf_append("\n-- v12 Analysis --\n");
     buf_append("v12 TESTED:\n");
     buf_append("  A: XPC messaging (runningboard, springboard, installd, launchd)\n");
     buf_append("  B: ObjC runtime (LSApplicationWorkspace, FrontBoardServices)\n");
-    buf_append("  C: UIApplication openURL\n");
-    buf_append("  D: system(), popen(), NSTask, posix_spawn+file_actions\n");
-    buf_append("FOCUS: Which XPC replies are we getting? Which ObjC methods exist?\n");
+    buf_append("  C: NSTask, posix_spawn variants (file_actions, self, SUSPENDED)\n");
+    buf_append("FOCUS: What do XPC replies contain? Which ObjC methods exist?\n");
 
     bc("[SWAP] v12 complete\n");
     bc_close();

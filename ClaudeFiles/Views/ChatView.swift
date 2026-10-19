@@ -337,6 +337,13 @@ private struct MessageList: View {
                     }
                 }
                 .scrollDismissesKeyboard(.interactively)
+                .onAppear {
+                    // Scroll to bottom when chat is first opened
+                    autoScroll = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
+                }
                 .onTapGesture { inputFocused = false }
                 // When keyboard opens/closes, scroll to bottom if we were following
                 .onReceive(
@@ -368,9 +375,7 @@ private struct MessageList: View {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         autoScroll = true
-                        withAnimation(.easeOut(duration: 0.25)) {
-                            proxy.scrollTo("bottom", anchor: .bottom)
-                        }
+                        scrollToBottom(proxy)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 14, weight: .bold))
@@ -404,9 +409,16 @@ private struct MessageList: View {
         scrollToBottom(proxy)
     }
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+        // First scroll attempt with short delay for layout pass
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             withAnimation(.easeOut(duration: 0.15)) {
                 proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            // Second attempt after LazyVStack finishes loading off-screen items
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                withAnimation(.easeOut(duration: 0.1)) {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
             }
         }
     }

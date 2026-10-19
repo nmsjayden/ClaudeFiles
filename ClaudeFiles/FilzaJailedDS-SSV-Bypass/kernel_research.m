@@ -726,54 +726,101 @@ char *kresearch_swap_sandbox_profile(void) {
             buf_append("  defaultWorkspace: %p\n", workspace);
 
             if (workspace) {
-                // Try openApplicationWithBundleID:
+                // List ALL interesting methods on the workspace
+                unsigned int count = 0;
+                Method *methods = class_copyMethodList(
+                    object_getClass(workspace), &count);
+                buf_append("  LSApplicationWorkspace methods (%u total):\n", count);
+                int printed = 0;
+                for (unsigned int i = 0; i < count; i++) {
+                    const char *name = sel_getName(
+                        method_getName(methods[i]));
+                    if (strstr(name, "open") || strstr(name, "launch") ||
+                        strstr(name, "exec") || strstr(name, "install") ||
+                        strstr(name, "run") || strstr(name, "spawn") ||
+                        strstr(name, "register") || strstr(name, "plugin") ||
+                        strstr(name, "URL") || strstr(name, "application")) {
+                        buf_append("    - %s\n", name);
+                        printed++;
+                    }
+                }
+                buf_append("  (printed %d matching methods)\n", printed);
+                if (methods) free(methods);
+
+                // Check which selectors respond
                 SEL openSel = NSSelectorFromString(
                     @"openApplicationWithBundleID:");
+                buf_append("  openApplicationWithBundleID: %s\n",
+                    [workspace respondsToSelector:openSel] ? "YES" : "NO");
+                // NOTE: v12 confirmed this WORKS — it launched Safari.
+                // Do NOT call it here — steals focus and kills the test.
+                buf_append("  >>> CONFIRMED WORKING (opened Safari in prev run) <<<\n");
+
+                // Try with FAKE bundle ID — see error without stealing focus
+                bc("[SWAP] B: openApp with fake bundleID\n");
                 if ([workspace respondsToSelector:openSel]) {
-                    bc("[SWAP] B: calling openApplicationWithBundleID\n");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                     id result = [workspace performSelector:openSel
-                        withObject:@"com.apple.mobilesafari"];
+                        withObject:@"com.fake.nonexistent.app.xxxxx"];
 #pragma clang diagnostic pop
-                    buf_append("  openApp Safari: %s\n",
+                    buf_append("  openApp(fake): %s\n",
                                result ? "returned non-nil" : "returned nil");
-                } else {
-                    buf_append("  openApplicationWithBundleID: NOT FOUND\n");
-
-                    unsigned int count = 0;
-                    Method *methods = class_copyMethodList(
-                        object_getClass(workspace), &count);
-                    buf_append("  Available methods (%u):\n", count);
-                    int printed = 0;
-                    for (unsigned int i = 0; i < count && printed < 20; i++) {
-                        const char *name = sel_getName(
-                            method_getName(methods[i]));
-                        if (strstr(name, "open") || strstr(name, "launch") ||
-                            strstr(name, "exec") || strstr(name, "install") ||
-                            strstr(name, "run")) {
-                            buf_append("    - %s\n", name);
-                            printed++;
-                        }
-                    }
-                    if (methods) free(methods);
                 }
 
-                // Try openURL: — launch apps via URL schemes
+                // Check openURL:
                 SEL openURLSel = NSSelectorFromString(@"openURL:");
-                if ([workspace respondsToSelector:openURLSel]) {
-                    NSURL *url = [NSURL URLWithString:@"tel://"];
-                    bc("[SWAP] B: calling openURL:\n");
+                buf_append("  openURL: %s\n",
+                    [workspace respondsToSelector:openURLSel] ? "YES" : "NO");
+                // Don't call openURL — could also steal focus
+
+                // Check installApplication / uninstallApplication
+                SEL installSel = NSSelectorFromString(
+                    @"installApplication:withOptions:error:usingBlock:");
+                buf_append("  installApplication: %s\n",
+                    [workspace respondsToSelector:installSel] ? "YES" : "NO");
+
+                // List all installed apps (get bundle IDs)
+                SEL allAppsSel = NSSelectorFromString(
+                    @"allInstalledApplications");
+                if ([workspace respondsToSelector:allAppsSel]) {
+                    bc("[SWAP] B: listing installed apps\n");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    id result = [workspace performSelector:openURLSel
-                        withObject:url];
+                    id apps = [workspace performSelector:allAppsSel];
 #pragma clang diagnostic pop
-                    buf_append("  openURL tel://: %s\n",
-                               result ? "returned non-nil" : "returned nil");
+                    if ([apps isKindOfClass:[NSArray class]]) {
+                        NSArray *appArray = (NSArray *)apps;
+                        buf_append("  Installed apps: %lu total\n",
+                            (unsigned long)[appArray count]);
+                        // Show first 5
+                        for (NSUInteger i = 0; i < [appArray count] && i < 5; i++) {
+                            buf_append("    [%lu] %s\n", (unsigned long)i,
+                                [[appArray[i] description] UTF8String]);
+                        }
+                    } else {
+                        buf_append("  allInstalledApplications: %s\n",
+                            apps ? [[apps description] UTF8String] : "nil");
+                    }
                 } else {
-                    buf_append("  openURL: NOT FOUND\n");
+                    buf_append("  allInstalledApplications: NOT FOUND\n");
                 }
+
+                // Check allApplications
+                SEL allAppsSel2 = NSSelectorFromString(@"allApplications");
+                buf_append("  allApplications: %s\n",
+                    [workspace respondsToSelector:allAppsSel2] ? "YES" : "NO");
+
+                // Check registerApplication (could we register a fake app?)
+                SEL regSel = NSSelectorFromString(
+                    @"registerApplicationDictionary:");
+                buf_append("  registerApplicationDictionary: %s\n",
+                    [workspace respondsToSelector:regSel] ? "YES" : "NO");
+
+                SEL regSel2 = NSSelectorFromString(
+                    @"registerApplication:");
+                buf_append("  registerApplication: %s\n",
+                    [workspace respondsToSelector:regSel2] ? "YES" : "NO");
             }
         }
 
@@ -841,50 +888,22 @@ char *kresearch_swap_sandbox_profile(void) {
             }
             if (methods) free(methods);
 
-            // Try to use NSTask if it exists
-            bc("[SWAP] C: trying NSTask launch\n");
+            // Check NSTask capabilities without actually launching
+            // (launch may crash or hang the app on iOS)
+            bc("[SWAP] C: probing NSTask\n");
             @try {
                 id task = [[nsTask alloc] init];
                 SEL setExec = NSSelectorFromString(@"setExecutableURL:");
                 SEL launch  = NSSelectorFromString(@"launchAndReturnError:");
-                if ([task respondsToSelector:setExec]) {
-                    NSURL *sh = [NSURL fileURLWithPath:@"/bin/sh"];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    [task performSelector:setExec withObject:sh];
-#pragma clang diagnostic pop
-                    SEL setArgs = NSSelectorFromString(@"setArguments:");
-                    if ([task respondsToSelector:setArgs]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                        [task performSelector:setArgs
-                            withObject:@[@"-c", @"echo nstask_test"]];
-#pragma clang diagnostic pop
-                    }
-                    if ([task respondsToSelector:launch]) {
-                        NSMethodSignature *sig = [task
-                            methodSignatureForSelector:launch];
-                        NSInvocation *inv = [NSInvocation
-                            invocationWithMethodSignature:sig];
-                        [inv setSelector:launch];
-                        [inv setTarget:task];
-                        __unsafe_unretained NSError *errArg = nil;
-                        [inv setArgument:&errArg atIndex:2];
-                        [inv invoke];
-                        BOOL ok = NO;
-                        [inv getReturnValue:&ok];
-                        buf_append("  NSTask launch: %s\n",
-                                   ok ? "SUCCESS" : "FAILED");
-                        if (errArg) {
-                            buf_append("  NSTask error: %s\n",
-                                [[errArg localizedDescription] UTF8String]);
-                        }
-                    } else {
-                        buf_append("  launchAndReturnError: NOT FOUND\n");
-                    }
-                } else {
-                    buf_append("  setExecutableURL: NOT FOUND\n");
-                }
+                SEL setArgs = NSSelectorFromString(@"setArguments:");
+                buf_append("  setExecutableURL: %s\n",
+                    [task respondsToSelector:setExec] ? "YES" : "NO");
+                buf_append("  setArguments: %s\n",
+                    [task respondsToSelector:setArgs] ? "YES" : "NO");
+                buf_append("  launchAndReturnError: %s\n",
+                    [task respondsToSelector:launch] ? "YES" : "NO");
+                // Do NOT actually launch — previous runs show it
+                // may use posix_spawn/fork internally → EPERM/crash
             } @catch (NSException *e) {
                 buf_append("  NSTask exception: %s\n",
                     [[e reason] UTF8String]);

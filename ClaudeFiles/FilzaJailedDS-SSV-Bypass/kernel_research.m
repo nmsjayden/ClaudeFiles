@@ -859,53 +859,46 @@ char *kresearch_swap_sandbox_profile(void) {
 #pragma clang diagnostic pop
 
         if (workspace) {
-            // D1: openURL: with a custom URL scheme
-            bc("[SWAP] D1: openURL\n");
-            buf_append("\n  D1: openURL:\n");
+            // D1: openURL: — CONFIRMED WORKS (opened Settings in earlier run)
+            // Do NOT call it — it steals focus and kills our test.
+            // Just probe method availability.
+            bc("[SWAP] D1: openURL probe\n");
+            buf_append("\n  D1: openURL: (PROBE ONLY — calling steals focus)\n");
             SEL openURLSel = NSSelectorFromString(@"openURL:");
-            if ([workspace respondsToSelector:openURLSel]) {
-                // Use a safe URL — prefs: opens Settings
-                NSURL *prefsURL = [NSURL URLWithString:
-                    @"App-Prefs:root=General"];
+            buf_append("  openURL: responds: %s\n",
+                [workspace respondsToSelector:openURLSel] ? "YES" : "NO");
+            buf_append("  >>> CONFIRMED WORKING in prior test (opened Settings) <<<\n");
+
+            // Also check canOpenURL:
+            SEL canOpenSel = NSSelectorFromString(@"canOpenURL:");
+            buf_append("  canOpenURL: responds: %s\n",
+                [workspace respondsToSelector:canOpenSel] ? "YES" : "NO");
+            if ([workspace respondsToSelector:canOpenSel]) {
+                // Test with a fake custom scheme — won't open anything
+                NSURL *fakeURL = [NSURL URLWithString:
+                    @"jbexec://run"];
                 @try {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    id result = [workspace performSelector:openURLSel
-                        withObject:prefsURL];
+                    id result = [workspace performSelector:canOpenSel
+                        withObject:fakeURL];
 #pragma clang diagnostic pop
-                    buf_append("  openURL(prefs): %s\n",
-                        result ? "returned non-nil" : "returned nil");
+                    buf_append("  canOpenURL(jbexec://run): %s\n",
+                        result ? "YES" : "NO");
                 } @catch (NSException *e) {
-                    buf_append("  EXCEPTION: %s — %s\n",
-                        [[e name] UTF8String], [[e reason] UTF8String]);
+                    buf_append("  EXCEPTION: %s\n",
+                        [[e name] UTF8String]);
                 }
-            } else {
-                buf_append("  selector not found\n");
             }
 
-            // D2: openSensitiveURL:withOptions:
+            // D2: openSensitiveURL:withOptions: — probe only
             bc("[SWAP] D2: openSensitiveURL\n");
             buf_append("\n  D2: openSensitiveURL:withOptions:\n");
             SEL sensURLSel = NSSelectorFromString(
                 @"openSensitiveURL:withOptions:");
             buf_append("  responds: %s\n",
                 [workspace respondsToSelector:sensURLSel] ? "YES" : "NO");
-            if ([workspace respondsToSelector:sensURLSel]) {
-                NSURL *testURL = [NSURL URLWithString:
-                    @"tel:5551234567"]; // safe test URL
-                @try {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    id result = [workspace performSelector:sensURLSel
-                        withObject:testURL withObject:nil];
-#pragma clang diagnostic pop
-                    buf_append("  result: %s\n",
-                        result ? "non-nil" : "nil");
-                } @catch (NSException *e) {
-                    buf_append("  EXCEPTION: %s — %s\n",
-                        [[e name] UTF8String], [[e reason] UTF8String]);
-                }
-            }
+            // NOT calling — tel: would open Phone app
 
             // D3: Enumerate URL-related methods
             buf_append("\n  D3: URL-related methods on workspace:\n");

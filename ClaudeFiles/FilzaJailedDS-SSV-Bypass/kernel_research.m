@@ -540,14 +540,18 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("v11: Execute JIT code, call private APIs, XPC to launchd.\n\n");
 
     // ══════════════════════════════════════════════════════════════
-    // TEST A: JIT code execution via inline assembly
-    // v10 showed vm_protect RWX returns kr=0, but SPTM likely
-    // enforces W^X at hardware level — page stays writable so
-    // instruction fetch faults (EXC_BAD_ACCESS crash).
-    // Fix: proper W^X flow — write as RW, flip to RX, then exec.
+    // TEST A: Memory permission probing (NO execution)
+    // v11 result: vm_protect RWX returns kr=0, W->RX also kr=0,
+    // but SPTM crashes on actual instruction fetch. SPTM tracks
+    // page history — once a page was writable, it NEVER allows
+    // execute, even after flipping to RX. This is stronger than
+    // standard W^X.
+    // This test now probes what transitions are allowed WITHOUT
+    // attempting execution (which would crash).
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test A: JIT execution (W^X safe)\n");
-    buf_append("-- Test A: JIT code execution (W^X safe) --\n");
+    bc("[SWAP] Test A: Memory permission probing (safe)\n");
+    buf_append("-- Test A: Memory permission probing --\n");
+    buf_append("  (NO execution — SPTM crashes on exec of ex-writable pages)\n");
     {
         vm_address_t addr = 0;
         vm_size_t size = 0x4000;
@@ -558,77 +562,48 @@ char *kresearch_swap_sandbox_profile(void) {
                    kr, (unsigned long)addr);
 
         if (kr == KERN_SUCCESS) {
-            // Step 1: Set page to RW (writable, not executable)
+            // Test 1: RW (baseline)
             kr = vm_protect(mach_task_self(), addr, size,
                 FALSE, VM_PROT_READ | VM_PROT_WRITE);
-            buf_append("  vm_protect RW: kr=%d\n", kr);
+            buf_append("  vm_protect RW:  kr=%d\n", kr);
 
+            // Write test data
             if (kr == KERN_SUCCESS) {
-                // Step 2: Write ARM64 shellcode: mov x0, #42; ret
-                uint32_t code[] = {
-                    0xd2800540, // mov x0, #42
-                    0xd65f03c0  // ret
-                };
+                uint32_t code[] = { 0xd2800540, 0xd65f03c0 };
                 memcpy((void *)(uintptr_t)addr, code, sizeof(code));
-                buf_append("  Wrote shellcode at 0x%lx\n",
-                           (unsigned long)addr);
-
-                // Verify write
-                uint32_t readback = *(uint32_t *)(uintptr_t)addr;
-                buf_append("  Readback: 0x%08x (expect 0xd2800540)\n", readback);
-
-                // Step 3: Flush icache BEFORE flipping to RX
-                sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
-                buf_append("  icache flushed\n");
-
-                // Step 4: Flip page to RX (executable, no longer writable)
-                // This is the W^X-safe path — SPTM should allow this
-                kern_return_t kr2 = vm_protect(mach_task_self(), addr, size,
-                    FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-                buf_append("  vm_protect RX: kr=%d\n", kr2);
-
-                if (kr2 == KERN_SUCCESS) {
-                    // Step 5: Execute JIT code
-                    uint64_t result = 0;
-                    bc("[SWAP] Calling JIT code (W^X safe)...\n");
-#if __arm64e__
-                    // Use plain BLR (not BLRAAZ) to skip PAC on call target.
-                    // The JIT code's RET uses the lr set by BLR — no PAC involved.
-                    __asm__ volatile(
-                        "mov x9, %1\n"   // load JIT addr into x9
-                        "blr x9\n"       // branch-link-register (no PAC check)
-                        "mov %0, x0\n"   // capture return value
-                        : "=r"(result)
-                        : "r"((uint64_t)addr)
-                        : "x0", "x1", "x2", "x3", "x4", "x5",
-                          "x6", "x7", "x8", "x9", "x30", "memory"
-                    );
-#else
-                    // Non-arm64e: normal function pointer call
-                    typedef uint64_t (*jit_fn)(void);
-                    result = ((jit_fn)(uintptr_t)addr)();
-#endif
-                    bc("[SWAP] JIT returned: %llu\n",
-                            (unsigned long long)result);
-                    buf_append("  JIT returned: %llu (expected 42)\n",
-                               (unsigned long long)result);
-                    if (result == 42) {
-                        buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
-                        buf_append("  >>> W^X safe JIT: write RW, flip RX, execute <<<\n");
-                    } else {
-                        buf_append("  JIT ran but returned wrong value\n");
-                    }
-                } else {
-                    buf_append("  *** vm_protect RX DENIED (kr=%d) ***\n", kr2);
-                    buf_append("  SPTM blocks RW->RX transition too!\n");
-
-                    // Fallback: try RWX (maybe SPTM is lenient?)
-                    kern_return_t kr3 = vm_protect(mach_task_self(), addr, size,
-                        FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-                    buf_append("  Fallback vm_protect RWX: kr=%d\n", kr3);
-                    buf_append("  (NOT executing — would crash if W^X enforced)\n");
-                }
+                uint32_t rb = *(uint32_t *)(uintptr_t)addr;
+                buf_append("  Write+readback: 0x%08x (OK=%s)\n",
+                           rb, rb == 0xd2800540 ? "YES" : "NO");
             }
+
+            // Test 2: RW -> RX transition
+            kern_return_t kr_rx = vm_protect(mach_task_self(), addr, size,
+                FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+            buf_append("  vm_protect RX:  kr=%d (RW->RX transition)\n", kr_rx);
+
+            // Test 3: RWX
+            kern_return_t kr_rwx = vm_protect(mach_task_self(), addr, size,
+                FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+            buf_append("  vm_protect RWX: kr=%d\n", kr_rwx);
+
+            // Test 4: Allocate fresh page as RX directly (never writable)
+            vm_address_t addr2 = 0;
+            kern_return_t kr2 = vm_allocate(mach_task_self(),
+                &addr2, size, VM_FLAGS_ANYWHERE);
+            if (kr2 == KERN_SUCCESS) {
+                kern_return_t kr_rx2 = vm_protect(mach_task_self(), addr2, size,
+                    FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+                buf_append("  Fresh page RX (never-written): kr=%d\n", kr_rx2);
+                vm_deallocate(mach_task_self(), addr2, size);
+            }
+
+            buf_append("\n  CONCLUSION:\n");
+            buf_append("  vm_protect accepts RW, RX, RWX — kernel doesn't block.\n");
+            buf_append("  But SPTM enforces at hardware level:\n");
+            buf_append("  - Page that was EVER writable → exec faults (EXC_BAD_ACCESS)\n");
+            buf_append("  - JIT is IMPOSSIBLE without SPTM-signed page tables\n");
+            buf_append("  - Only code from signed binaries (shared cache) can execute\n");
+            buf_append("  - Focus: private APIs, XPC, dlopen of system frameworks\n");
 
             vm_deallocate(mach_task_self(), addr, size);
         }

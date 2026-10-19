@@ -1015,14 +1015,535 @@ char *kresearch_swap_sandbox_profile(void) {
 
     buf_append("\n-- v14 Analysis --\n");
     buf_append("v14 TESTED:\n");
-    buf_append("  A: FBSOpenApplicationService (service handles)\n");
-    buf_append("  B: NSTask with own binary + container script\n");
-    buf_append("  C: SBS C functions (SBSLaunchApplication etc)\n");
-    buf_append("  D: URL-based launch (openURL, openSensitiveURL)\n");
-    buf_append("  E: BKSSystemService (BackBoard)\n");
-    buf_append("  F: Kernel sandbox_label structure probe\n");
+    buf_append("  A: FBSOpenApplicationService — got service, canOpen=YES\n");
+    buf_append("  B: NSTask — path not accessible for self+script\n");
+    buf_append("  C: SBS — port 0x17303 valid, launch returned 9\n");
+    buf_append("  D: URL — openURL confirms YES, canOpenURL=NO\n");
+    buf_append("  E: BKS — sharedService nil from sandbox\n");
+    buf_append("  F: sandbox_label — 128b dumped, profile ptr+ext chain found\n");
 
     bc("[SWAP] v14 complete\n");
+
+    // ═══════════════════════════════════════════════════════
+    // v15: DEEP SANDBOX STRUCTURE + SBS LAUNCH VARIANTS
+    // ═══════════════════════════════════════════════════════
+    bc("[SWAP] v15 starting\n");
+    buf_append("\n\n");
+    buf_append("═══════════════════════════════════════════\n");
+    buf_append("  v15: DEEP SANDBOX + SBS LAUNCH VARIANTS\n");
+    buf_append("═══════════════════════════════════════════\n\n");
+
+    buf_append("v14 key findings:\n");
+    buf_append("  - SBSSpringBoardServerPort = valid (0x17303)\n");
+    buf_append("  - SBSLaunchApplication(calculator) = 9 (not 0, not negative)\n");
+    buf_append("  - SBSLaunchApplicationForDebugging resolved\n");
+    buf_append("  - sandbox_label has profile ptr at +00, ext at +10\n");
+    buf_append("  - openURL: CONFIRMED, openSensitiveURL: responds YES\n");
+    buf_append("  - privateURLSchemes / publicURLSchemes methods exist\n\n");
+
+    // Gather our own proc_info for v15 tests
+    proc_info_t self_info;
+    gather_proc_info(proc_self(), &self_info);
+
+    // ── Test G: Deep sandbox comparison (us vs launchd) ──
+    bc("[SWAP] Test G: sandbox compare\n");
+    buf_append("-- Test G: Sandbox Structure Comparison --\n");
+
+    proc_info_t launchd_info;
+    uint64_t launchd_proc = kread_ptr(proc_self() + off_proc_p_list_le_prev);
+    // Walk up to find PID 1
+    for (int i = 0; i < 500; i++) {
+        if (!kaddr_ok(launchd_proc)) break;
+        pid_t check_pid = (pid_t)kread32(launchd_proc + off_proc_p_pid);
+        if (check_pid == 1) break;
+        launchd_proc = kread_ptr(launchd_proc + off_proc_p_list_le_prev);
+    }
+
+    int have_launchd = 0;
+    if (kaddr_ok(launchd_proc)) {
+        pid_t check = (pid_t)kread32(launchd_proc + off_proc_p_pid);
+        if (check == 1) {
+            gather_proc_info(launchd_proc, &launchd_info);
+            have_launchd = 1;
+        }
+    }
+
+    buf_append("\n  G1: Our sandbox structure detail:\n");
+    buf_append("    sandbox ptr: 0x%llx\n", self_info.sandbox);
+    buf_append("    sandbox_profile (sandbox+0x00): 0x%llx\n",
+        self_info.sandbox_profile);
+    buf_append("    extension_set   (sandbox+0x10): 0x%llx\n",
+        self_info.extension_set);
+
+    // Read 256 bytes of our sandbox for deeper analysis
+    if (kaddr_ok(self_info.sandbox)) {
+        uint8_t sb_data[256];
+        kreadbuf(self_info.sandbox, sb_data, 256);
+
+        // Extract key fields
+        uint64_t field_00 = *(uint64_t*)(sb_data + 0x00);
+        uint64_t field_08 = *(uint64_t*)(sb_data + 0x08);
+        uint64_t field_10 = *(uint64_t*)(sb_data + 0x10);
+        uint64_t field_18 = *(uint64_t*)(sb_data + 0x18);
+        uint64_t field_20 = *(uint64_t*)(sb_data + 0x20);
+        uint64_t field_28 = *(uint64_t*)(sb_data + 0x28);
+        uint64_t field_30 = *(uint64_t*)(sb_data + 0x30);
+        uint64_t field_38 = *(uint64_t*)(sb_data + 0x38);
+        uint64_t field_40 = *(uint64_t*)(sb_data + 0x40);
+        uint64_t field_48 = *(uint64_t*)(sb_data + 0x48);
+        uint64_t field_50 = *(uint64_t*)(sb_data + 0x50);
+        uint64_t field_58 = *(uint64_t*)(sb_data + 0x58);
+        // Second half mirrors
+        uint64_t field_80 = *(uint64_t*)(sb_data + 0x80);
+        uint64_t field_88 = *(uint64_t*)(sb_data + 0x88);
+        uint64_t field_90 = *(uint64_t*)(sb_data + 0x90);
+        uint64_t field_98 = *(uint64_t*)(sb_data + 0x98);
+        uint64_t field_a0 = *(uint64_t*)(sb_data + 0xa0);
+        uint64_t field_a8 = *(uint64_t*)(sb_data + 0xa8);
+        uint64_t field_b0 = *(uint64_t*)(sb_data + 0xb0);
+        uint64_t field_b8 = *(uint64_t*)(sb_data + 0xb8);
+        uint64_t field_c0 = *(uint64_t*)(sb_data + 0xc0);
+
+        buf_append("    Full 256b field map:\n");
+        for (int i = 0; i < 256; i += 8) {
+            uint64_t val = *(uint64_t*)(sb_data + i);
+            if (val != 0) {
+                buf_append("      +%02x: 0x%016llx", i,
+                    (unsigned long long)val);
+                if (kaddr_ok(val))
+                    buf_append(" [ptr]");
+                else if (val < 0x10000)
+                    buf_append(" [small]");
+                buf_append("\n");
+            }
+        }
+
+        // Follow the profile pointer chain at +00
+        bc("[SWAP] G2: profile chain\n");
+        buf_append("\n  G2: Profile pointer chain (sandbox+0x00):\n");
+        uint64_t profile_ptr = field_00;
+        if (kaddr_ok(profile_ptr)) {
+            buf_append("    profile_ptr: 0x%llx\n", (unsigned long long)profile_ptr);
+            // Read 64 bytes of what profile points to
+            uint8_t prof_data[64];
+            kreadbuf(profile_ptr, prof_data, 64);
+            buf_append("    profile data:\n");
+            for (int i = 0; i < 64; i += 16) {
+                buf_append("      +%02x:", i);
+                for (int j = 0; j < 16; j++)
+                    buf_append(" %02x", prof_data[i + j]);
+                buf_append("\n");
+            }
+
+            // The first pointer in the profile might be the bytecode/ops table
+            uint64_t prof_field0 = *(uint64_t*)(prof_data + 0x00);
+            uint64_t prof_field8 = *(uint64_t*)(prof_data + 0x08);
+            uint64_t prof_field10 = *(uint64_t*)(prof_data + 0x10);
+            buf_append("    profile+0x00: 0x%llx%s\n",
+                (unsigned long long)prof_field0,
+                kaddr_ok(prof_field0) ? " [ptr]" : "");
+            buf_append("    profile+0x08: 0x%llx%s\n",
+                (unsigned long long)prof_field8,
+                kaddr_ok(prof_field8) ? " [ptr]" : "");
+            buf_append("    profile+0x10: 0x%llx%s\n",
+                (unsigned long long)prof_field10,
+                kaddr_ok(prof_field10) ? " [ptr]" : "");
+
+            // If profile+0x00 is a ptr, follow one more level
+            if (kaddr_ok(prof_field0)) {
+                uint8_t deep[32];
+                kreadbuf(prof_field0, deep, 32);
+                buf_append("    profile->+0x00 data:\n      ");
+                for (int i = 0; i < 32; i++)
+                    buf_append("%02x ", deep[i]);
+                buf_append("\n");
+            }
+        } else {
+            buf_append("    profile_ptr: 0x%llx (not a valid ptr)\n",
+                (unsigned long long)profile_ptr);
+        }
+
+        // Probe the data at +30 (was all 0xFF in v14)
+        bc("[SWAP] G3: sandbox+30 probe\n");
+        buf_append("\n  G3: Pointer at sandbox+0x30:\n");
+        if (kaddr_ok(field_30)) {
+            uint8_t f30_data[64];
+            kreadbuf(field_30, f30_data, 64);
+            buf_append("    target: 0x%llx\n", (unsigned long long)field_30);
+            buf_append("    data:\n");
+            for (int i = 0; i < 64; i += 16) {
+                buf_append("      +%02x:", i);
+                for (int j = 0; j < 16; j++)
+                    buf_append(" %02x", f30_data[i + j]);
+                buf_append("\n");
+            }
+        }
+    }
+
+    // Compare to launchd's sandbox
+    bc("[SWAP] G4: launchd sandbox\n");
+    buf_append("\n  G4: Launchd sandbox comparison:\n");
+    if (have_launchd) {
+        buf_append("    launchd sandbox: 0x%llx\n",
+            (unsigned long long)launchd_info.sandbox);
+        buf_append("    launchd profile: 0x%llx\n",
+            (unsigned long long)launchd_info.sandbox_profile);
+        buf_append("    launchd ext_set: 0x%llx\n",
+            (unsigned long long)launchd_info.extension_set);
+
+        if (kaddr_ok(launchd_info.sandbox)) {
+            uint8_t ld_sb[256];
+            kreadbuf(launchd_info.sandbox, ld_sb, 256);
+            buf_append("    launchd sandbox fields (non-zero):\n");
+            for (int i = 0; i < 256; i += 8) {
+                uint64_t val = *(uint64_t*)(ld_sb + i);
+                if (val != 0) {
+                    buf_append("      +%02x: 0x%016llx", i,
+                        (unsigned long long)val);
+                    if (kaddr_ok(val))
+                        buf_append(" [ptr]");
+                    else if (val < 0x10000)
+                        buf_append(" [small]");
+                    buf_append("\n");
+                }
+            }
+            // Check if launchd shares our profile ptr
+            uint64_t ld_profile = *(uint64_t*)(ld_sb + 0x00);
+            buf_append("    profile ptrs match: %s\n",
+                (ld_profile == self_info.sandbox_profile) ? "YES (same profile!)" : "NO (different)");
+        } else {
+            buf_append("    launchd has NO sandbox (NULL) — unsandboxed!\n");
+        }
+    } else {
+        buf_append("    could not find launchd proc\n");
+    }
+
+    // ── Test H: SBS Launch Variants ──
+    bc("[SWAP] Test H: SBS launch variants\n");
+    buf_append("\n-- Test H: SBS Launch Variants --\n");
+
+    // H1: SBSLaunchApplicationWithIdentifier — non-suspended
+    bc("[SWAP] H1: SBS launch non-suspended\n");
+    buf_append("\n  H1: SBSLaunchApplicationWithIdentifier (non-suspended)\n");
+    {
+        typedef int (*SBSLaunchFn)(CFStringRef, Boolean);
+        SBSLaunchFn sbs_launch = (SBSLaunchFn)dlsym(sbs,
+            "SBSLaunchApplicationWithIdentifier");
+        if (sbs_launch) {
+            int r = sbs_launch(CFSTR("com.apple.calculator"), false);
+            buf_append("    launch(calculator, suspended=NO): %d\n", r);
+            // Try with our own bundle ID
+            NSString *myBundle = [[NSBundle mainBundle] bundleIdentifier];
+            int r2 = sbs_launch((__bridge CFStringRef)myBundle, false);
+            buf_append("    launch(self=%s, suspended=NO): %d\n",
+                [myBundle UTF8String], r2);
+        } else {
+            buf_append("    function not found\n");
+        }
+    }
+
+    // H2: SBSLaunchApplicationForDebugging
+    bc("[SWAP] H2: SBS launch for debugging\n");
+    buf_append("\n  H2: SBSLaunchApplicationForDebugging\n");
+    {
+        // SBSLaunchApplicationForDebugging(CFStringRef bundleID, CFStringRef urlScheme,
+        //   CFArrayRef arguments, CFDictionaryRef env, CFStringRef stdout, CFStringRef stderr, Boolean suspended)
+        typedef int (*SBSDebugFn)(CFStringRef, CFStringRef, CFArrayRef,
+            CFDictionaryRef, CFStringRef, CFStringRef, Boolean);
+        SBSDebugFn sbs_debug = (SBSDebugFn)dlsym(sbs,
+            "SBSLaunchApplicationForDebugging");
+        if (sbs_debug) {
+            NSString *myBundle = [[NSBundle mainBundle] bundleIdentifier];
+            int r = sbs_debug((__bridge CFStringRef)myBundle,
+                NULL, NULL, NULL, NULL, NULL, true);
+            buf_append("    launchForDebugging(self, suspended): %d\n", r);
+            int r2 = sbs_debug((__bridge CFStringRef)myBundle,
+                NULL, NULL, NULL, NULL, NULL, false);
+            buf_append("    launchForDebugging(self, running): %d\n", r2);
+        } else {
+            buf_append("    function not found\n");
+        }
+    }
+
+    // H3: SBSLaunchApplicationWithIdentifierAndLaunchOptions
+    bc("[SWAP] H3: SBS launch with options\n");
+    buf_append("\n  H3: SBSLaunchApplicationWithIdentifierAndLaunchOptions\n");
+    {
+        typedef int (*SBSLaunchOptFn)(CFStringRef, CFDictionaryRef, Boolean);
+        SBSLaunchOptFn sbs_opt = (SBSLaunchOptFn)dlsym(sbs,
+            "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
+        if (sbs_opt) {
+            NSString *myBundle = [[NSBundle mainBundle] bundleIdentifier];
+            // Empty options dict
+            NSDictionary *opts = @{};
+            int r = sbs_opt((__bridge CFStringRef)myBundle,
+                (__bridge CFDictionaryRef)opts, false);
+            buf_append("    launchWithOptions(self, {}, running): %d\n", r);
+        } else {
+            buf_append("    function not found\n");
+        }
+    }
+
+    // H4: SBSOpenSensitiveURLAndUnlock
+    bc("[SWAP] H4: SBSOpenSensitiveURL\n");
+    buf_append("\n  H4: SBSOpenSensitiveURLAndUnlock (C function)\n");
+    {
+        typedef int (*SBSOpenURLFn)(CFURLRef, char);
+        SBSOpenURLFn sbs_url = (SBSOpenURLFn)dlsym(sbs,
+            "SBSOpenSensitiveURLAndUnlock");
+        if (sbs_url) {
+            // Use fake scheme that won't open anything
+            NSURL *fakeURL = [NSURL URLWithString:@"jbexec-test://probe"];
+            int r = sbs_url((__bridge CFURLRef)fakeURL, 0);
+            buf_append("    SBSOpenSensitiveURL(jbexec-test://probe): %d\n", r);
+        } else {
+            buf_append("    function not found\n");
+        }
+    }
+
+    // ── Test I: URL Scheme Enumeration ──
+    bc("[SWAP] Test I: URL schemes\n");
+    buf_append("\n-- Test I: URL Scheme Enumeration --\n");
+
+    // Re-create workspace handle for URL tests
+    Class lsws_v15 = NSClassFromString(@"LSApplicationWorkspace");
+    SEL defWSSel_v15 = NSSelectorFromString(@"defaultWorkspace");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    id workspace = lsws_v15 ? [lsws_v15 performSelector:defWSSel_v15] : nil;
+#pragma clang diagnostic pop
+    buf_append("  workspace: %s\n", workspace ? "OK" : "nil");
+
+    // I1: privateURLSchemes
+    bc("[SWAP] I1: privateURLSchemes\n");
+    buf_append("\n  I1: privateURLSchemes\n");
+    if (workspace) {
+        SEL privSel = NSSelectorFromString(@"privateURLSchemes");
+        if ([workspace respondsToSelector:privSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id result = [workspace performSelector:privSel];
+#pragma clang diagnostic pop
+            if ([result isKindOfClass:[NSArray class]]) {
+                NSArray *schemes = (NSArray *)result;
+                buf_append("    count: %lu\n", (unsigned long)[schemes count]);
+                // Print first 20
+                NSUInteger max = MIN([schemes count], 20);
+                for (NSUInteger i = 0; i < max; i++) {
+                    buf_append("    [%lu]: %s\n", (unsigned long)i,
+                        [[schemes[i] description] UTF8String]);
+                }
+                if ([schemes count] > 20)
+                    buf_append("    ... (%lu more)\n",
+                        (unsigned long)([schemes count] - 20));
+            } else {
+                buf_append("    returned: %s\n",
+                    result ? [[result description] UTF8String] : "nil");
+            }
+        } else {
+            buf_append("    method not found\n");
+        }
+    }
+
+    // I2: publicURLSchemes
+    bc("[SWAP] I2: publicURLSchemes\n");
+    buf_append("\n  I2: publicURLSchemes\n");
+    {
+        SEL pubSel = NSSelectorFromString(@"publicURLSchemes");
+        if ([workspace respondsToSelector:pubSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id result = [workspace performSelector:pubSel];
+#pragma clang diagnostic pop
+            if ([result isKindOfClass:[NSArray class]]) {
+                NSArray *schemes = (NSArray *)result;
+                buf_append("    count: %lu\n", (unsigned long)[schemes count]);
+                NSUInteger max = MIN([schemes count], 20);
+                for (NSUInteger i = 0; i < max; i++) {
+                    buf_append("    [%lu]: %s\n", (unsigned long)i,
+                        [[schemes[i] description] UTF8String]);
+                }
+                if ([schemes count] > 20)
+                    buf_append("    ... (%lu more)\n",
+                        (unsigned long)([schemes count] - 20));
+            } else {
+                buf_append("    returned: %s\n",
+                    result ? [[result description] UTF8String] : "nil");
+            }
+        } else {
+            buf_append("    method not found\n");
+        }
+    }
+
+    // I3: applicationsAvailableForHandlingURLScheme:
+    bc("[SWAP] I3: apps for URL scheme\n");
+    buf_append("\n  I3: applicationsAvailableForHandlingURLScheme:\n");
+    {
+        SEL appsSel = NSSelectorFromString(
+            @"applicationsAvailableForHandlingURLScheme:");
+        if ([workspace respondsToSelector:appsSel]) {
+            // Check a few interesting schemes
+            NSArray *schemes = @[@"cydia", @"sileo", @"filza",
+                @"ssh", @"tel", @"facetime", @"ftp"];
+            for (NSString *scheme in schemes) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id result = [workspace performSelector:appsSel
+                    withObject:scheme];
+#pragma clang diagnostic pop
+                if ([result isKindOfClass:[NSArray class]]) {
+                    NSArray *apps = (NSArray *)result;
+                    buf_append("    %s: %lu app(s)\n",
+                        [scheme UTF8String], (unsigned long)[apps count]);
+                    for (id app in apps) {
+                        buf_append("      -> %s\n",
+                            [[app description] UTF8String]);
+                    }
+                } else {
+                    buf_append("    %s: %s\n", [scheme UTF8String],
+                        result ? [[result description] UTF8String] : "nil");
+                }
+            }
+        } else {
+            buf_append("    method not found\n");
+        }
+    }
+
+    // ── Test J: Extension Set Deep Dive ──
+    bc("[SWAP] Test J: extension set\n");
+    buf_append("\n-- Test J: Extension Set Deep Dive --\n");
+
+    buf_append("  extension_set: 0x%llx\n",
+        (unsigned long long)self_info.extension_set);
+    if (kaddr_ok(self_info.extension_set)) {
+        // Read 128 bytes of extension set structure
+        uint8_t ext_data[128];
+        kreadbuf(self_info.extension_set, ext_data, 128);
+        buf_append("  extension_set raw (128b):\n");
+        for (int i = 0; i < 128; i += 16) {
+            buf_append("    +%02x:", i);
+            for (int j = 0; j < 16; j++)
+                buf_append(" %02x", ext_data[i + j]);
+            buf_append("\n");
+        }
+
+        // Walk pointer-sized values looking for extension node chains
+        buf_append("\n  Extension node walk:\n");
+        for (int i = 0; i < 128; i += 8) {
+            uint64_t val = *(uint64_t*)(ext_data + i);
+            if (val && kaddr_ok(val)) {
+                // Read what it points to
+                uint8_t node_data[64];
+                kreadbuf(val, node_data, 64);
+                uint64_t node_next = *(uint64_t*)(node_data + 0x00);
+                uint64_t node_name_ptr = *(uint64_t*)(node_data + 0x08);
+
+                buf_append("    +%02x -> 0x%llx\n", i,
+                    (unsigned long long)val);
+
+                // Try to read as string pointer at offset 0x08
+                if (kaddr_ok(node_name_ptr)) {
+                    char name[128] = {0};
+                    kreadbuf(node_name_ptr, name, 100);
+                    // Check if it looks like a readable string
+                    int is_str = 1;
+                    for (int k = 0; k < 80 && name[k]; k++) {
+                        if (name[k] < 0x20 || name[k] > 0x7e) {
+                            is_str = 0; break;
+                        }
+                    }
+                    if (is_str && name[0]) {
+                        buf_append("      name: \"%s\"\n", name);
+                    }
+                }
+                // node first 32 bytes
+                buf_append("      data:");
+                for (int j = 0; j < 32; j++)
+                    buf_append(" %02x", node_data[j]);
+                buf_append("\n");
+
+                // Follow chain if next is valid
+                if (kaddr_ok(node_next) && node_next != val) {
+                    buf_append("      -> next: 0x%llx\n",
+                        (unsigned long long)node_next);
+                }
+            }
+        }
+
+        // Compare to launchd extension set
+        if (have_launchd && kaddr_ok(launchd_info.extension_set)) {
+            buf_append("\n  Launchd extension_set: 0x%llx\n",
+                (unsigned long long)launchd_info.extension_set);
+            uint8_t ld_ext[128];
+            kreadbuf(launchd_info.extension_set, ld_ext, 128);
+            buf_append("  Launchd ext raw (128b):\n");
+            for (int i = 0; i < 128; i += 16) {
+                buf_append("    +%02x:", i);
+                for (int j = 0; j < 16; j++)
+                    buf_append(" %02x", ld_ext[i + j]);
+                buf_append("\n");
+            }
+        }
+    } else {
+        buf_append("  extension_set not valid\n");
+    }
+
+    // ── Test K: sandbox_check for specific operations ──
+    bc("[SWAP] Test K: sandbox_check ops\n");
+    buf_append("\n-- Test K: Targeted sandbox_check --\n");
+    {
+        pid_t mypid = getpid();
+        struct { const char *op; int filter; const char *arg; } checks[] = {
+            {"process-exec",  SANDBOX_FILTER_PATH, "/bin/sh"},
+            {"process-exec",  SANDBOX_FILTER_PATH, "/usr/bin/env"},
+            {"process-exec",  SANDBOX_FILTER_PATH, "/usr/lib/dyld"},
+            {"process-exec*", SANDBOX_FILTER_NONE, NULL},
+            {"process-fork",  SANDBOX_FILTER_NONE, NULL},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.springboard.services"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.frontboard.systemappservices"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.backboard.hid"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.lsd.mapdb"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.runningboard"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.SecurityServer"},
+            {"mach-lookup",   SANDBOX_FILTER_GLOBAL_NAME,
+                "com.apple.distributed_notifications@Gv3"},
+        };
+        int n = sizeof(checks) / sizeof(checks[0]);
+        for (int i = 0; i < n; i++) {
+            int r;
+            if (checks[i].arg) {
+                r = sandbox_check(mypid, checks[i].op,
+                    checks[i].filter | SANDBOX_CHECK_NO_REPORT,
+                    checks[i].arg);
+            } else {
+                r = sandbox_check(mypid, checks[i].op,
+                    SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT);
+            }
+            buf_append("  %s %s%s%s: %s\n",
+                checks[i].op,
+                checks[i].arg ? "(" : "",
+                checks[i].arg ? checks[i].arg : "",
+                checks[i].arg ? ")" : "",
+                r == 0 ? "ALLOWED" : "BLOCKED");
+        }
+    }
+
+    // ── Analysis ──
+    buf_append("\n-- v15 Analysis --\n");
+    buf_append("v15 TESTED:\n");
+    buf_append("  G: Deep sandbox structure comparison (us vs launchd)\n");
+    buf_append("  H: SBS launch variants (non-suspended, debugging, options, URL)\n");
+    buf_append("  I: URL scheme enumeration (private, public, per-scheme apps)\n");
+    buf_append("  J: Extension set deep dive with node walk\n");
+    buf_append("  K: Targeted sandbox_check for mach-lookup services\n");
+
+    bc("[SWAP] v15 complete\n");
     bc_close();
     return buf_finish();
 }

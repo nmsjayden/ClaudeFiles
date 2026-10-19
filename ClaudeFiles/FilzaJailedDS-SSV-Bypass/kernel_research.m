@@ -21,9 +21,15 @@
 #import <sys/stat.h>
 #import <errno.h>
 #import <dlfcn.h>
+#import <Foundation/Foundation.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <libkern/OSCacheControl.h>
+
+// mach_vm.h is not available in iOS SDK; declare needed functions
+// (they exist at runtime on arm64 iOS)
+extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
+extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
+extern kern_return_t mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
 
 // sandbox_check is private API
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);

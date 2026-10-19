@@ -971,8 +971,9 @@ char *kresearch_swap_sandbox_profile(void) {
     bc("[SWAP] Test F: sandbox extension kernel\n");
     buf_append("\n-- Test F: Kernel sandbox extension structures --\n");
     {
+        uint64_t self_proc = proc_self();
         proc_info_t self_info;
-        if (kread_proc_info(getpid(), &self_info)) {
+        if (self_proc && gather_proc_info(self_proc, &self_info) == 0) {
             buf_append("  proc: 0x%llx\n", self_info.proc);
             buf_append("  ucred: 0x%llx\n", self_info.ucred);
             buf_append("  sandbox_label: 0x%llx\n",

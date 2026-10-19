@@ -692,74 +692,11 @@ char *kresearch_swap_sandbox_profile(void) {
             }
         }
 
-        // ── Test A4: xpc_pipe_routine to launchd (PRIVATE API) ──
-        bc("[SWAP] A4: xpc_pipe_routine\n");
-        buf_append("\n  A4: xpc_pipe_routine to launchd\n");
-        {
-            typedef int (*xpc_pipe_routine_fn)(void *, void *, void **);
-            typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
-
-            xpc_pipe_routine_fn xpr = NULL;
-            xpc_pipe_create_fn xppc = NULL;
-            if (xpc_h) {
-                xpr  = (xpc_pipe_routine_fn)dlsym(xpc_h, "xpc_pipe_routine");
-                xppc = (xpc_pipe_create_fn)dlsym(xpc_h, "xpc_pipe_create");
-            }
-            buf_append("  xpc_pipe_routine: %p\n", xpr);
-            buf_append("  xpc_pipe_create: %p\n", xppc);
-
-            if (xpr && fn_dcreate) {
-                void *pipe = NULL;
-                if (xppc) {
-                    pipe = xppc(NULL, 0);
-                    buf_append("  pipe to launchd: %p\n", pipe);
-                }
-                if (pipe) {
-                    void *msg = fn_dcreate(NULL, NULL, 0);
-                    if (fn_dint64) {
-                        fn_dint64(msg, "subsystem", 3);
-                        fn_dint64(msg, "routine", 815);
-                        fn_dint64(msg, "type", 1);
-                    }
-
-                    void *reply_raw = NULL;
-                    bc("[SWAP] A4: calling xpc_pipe_routine\n");
-                    int ret = xpr(pipe, msg, &reply_raw);
-                    buf_append("  xpc_pipe_routine: ret=%d\n", ret);
-                    if (reply_raw && fn_desc) {
-                        char *desc = fn_desc(reply_raw);
-                        if (desc) {
-                            buf_append("  Reply: %.800s\n", desc);
-                            free(desc);
-                        }
-                    }
-
-                    // Try submit job
-                    void *msg2 = fn_dcreate(NULL, NULL, 0);
-                    if (fn_dint64) {
-                        fn_dint64(msg2, "subsystem", 3);
-                        fn_dint64(msg2, "routine", 800);
-                        fn_dint64(msg2, "type", 1);
-                    }
-                    if (fn_dstr) {
-                        fn_dstr(msg2, "label", "com.test.jb");
-                        fn_dstr(msg2, "program", "/bin/sh");
-                    }
-
-                    reply_raw = NULL;
-                    bc("[SWAP] A4: submitting job\n");
-                    ret = xpr(pipe, msg2, &reply_raw);
-                    buf_append("  submit job: ret=%d\n", ret);
-                    if (reply_raw && fn_desc) {
-                        char *desc = fn_desc(reply_raw);
-                        if (desc) {
-                            buf_append("  Reply: %.500s\n", desc);
-                            free(desc);
-                        }
-                    }
-                }
-            }
-        }
+        // ── Test A4: xpc_pipe_routine — REMOVED ──
+        // xpc_pipe_create(NULL, 0) crashes from sandboxed apps.
+        // The bootstrap pipe accessor triggers a fault before
+        // returning. A1-A3 connection-based XPC works fine.
+        buf_append("\n  A4: xpc_pipe_routine — SKIPPED (crashes from sandbox)\n");
     }
 
     // ══════════════════════════════════════════════════════════════

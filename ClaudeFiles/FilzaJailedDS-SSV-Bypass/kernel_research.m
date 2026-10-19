@@ -976,15 +976,15 @@ char *kresearch_swap_sandbox_profile(void) {
         if (self_proc && gather_proc_info(self_proc, &self_info) == 0) {
             buf_append("  proc: 0x%llx\n", self_info.proc);
             buf_append("  ucred: 0x%llx\n", self_info.ucred);
-            buf_append("  sandbox_label: 0x%llx\n",
-                self_info.sandbox_label);
+            buf_append("  sandbox: 0x%llx\n",
+                self_info.sandbox);
 
-            if (self_info.sandbox_label) {
-                // Read the first 128 bytes of sandbox_label structure
+            if (self_info.sandbox) {
+                // Read the first 128 bytes of sandbox structure
                 // to understand its layout
                 uint8_t labelData[128];
                 for (int i = 0; i < 128; i += 8) {
-                    uint64_t val = kread64(self_info.sandbox_label + i);
+                    uint64_t val = kread64(self_info.sandbox + i);
                     memcpy(&labelData[i], &val, 8);
                 }
 

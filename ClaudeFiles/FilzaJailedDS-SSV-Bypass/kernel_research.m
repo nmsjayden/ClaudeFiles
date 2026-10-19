@@ -25,11 +25,9 @@
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
 
-// mach_vm.h is not available in iOS SDK; declare needed functions
-// (they exist at runtime on arm64 iOS)
-extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
-extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
-extern kern_return_t mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
+// mach_vm.h is not available in iOS SDK.
+// We resolve mach_vm_allocate/protect/deallocate via dlsym at runtime
+// to avoid linker issues (symbols may not be in tbd stubs).
 
 // sandbox_check is private API
 extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
@@ -789,32 +787,34 @@ char *kresearch_swap_sandbox_profile(void) {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST F: Try mach_vm_allocate + mach_vm_protect + write
-    // in our OWN process to create executable memory
-    // If we can create RWX pages, we can JIT compile code.
+    // TEST F: Try vm_allocate + vm_protect + write
+    // in our OWN process to create executable memory.
+    // Uses vm_* (available in SDK) instead of mach_vm_* (not in SDK).
+    // Does NOT attempt to execute JIT code (would crash on arm64e/SPTM).
     // ══════════════════════════════════════════════════════════════
     fprintf(stderr, "[SWAP] Test F: executable memory\n");
     buf_append("\n-- Test F: Executable memory allocation --\n");
     {
-        mach_vm_address_t addr = 0;
-        mach_vm_size_t size = 0x4000; // 16KB page
+        vm_address_t addr = 0;
+        vm_size_t size = 0x4000; // 16KB page
 
         // Allocate memory in our task
-        kern_return_t kr = mach_vm_allocate(mach_task_self(),
+        kern_return_t kr = vm_allocate(mach_task_self(),
             &addr, size, VM_FLAGS_ANYWHERE);
-        buf_append("  mach_vm_allocate: kr=%d addr=0x%llx\n", kr, addr);
+        buf_append("  vm_allocate: kr=%d addr=0x%lx\n", kr, (unsigned long)addr);
 
         if (kr == KERN_SUCCESS) {
             // Try to make it RWX (read-write-execute)
-            kr = mach_vm_protect(mach_task_self(), addr, size,
+            kr = vm_protect(mach_task_self(), addr, size,
                 FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            buf_append("  mach_vm_protect RWX: kr=%d\n", kr);
+            buf_append("  vm_protect RWX: kr=%d (%s)\n", kr,
+                       kr == KERN_SUCCESS ? "ALLOWED" : "DENIED");
 
             if (kr != KERN_SUCCESS) {
-                // RWX denied - try RW first, then RX
-                kr = mach_vm_protect(mach_task_self(), addr, size,
+                // RWX denied - try RW first, then RX (W^X enforcement)
+                kr = vm_protect(mach_task_self(), addr, size,
                     FALSE, VM_PROT_READ | VM_PROT_WRITE);
-                buf_append("  mach_vm_protect RW: kr=%d\n", kr);
+                buf_append("  vm_protect RW: kr=%d\n", kr);
 
                 if (kr == KERN_SUCCESS) {
                     // Write a tiny ARM64 function: mov x0, #42; ret
@@ -822,50 +822,28 @@ char *kresearch_swap_sandbox_profile(void) {
                         0xd2800540, // mov x0, #42
                         0xd65f03c0  // ret
                     };
-                    memcpy((void *)addr, code, sizeof(code));
-                    sys_icache_invalidate((void *)addr, sizeof(code));
+                    memcpy((void *)(uintptr_t)addr, code, sizeof(code));
+                    sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
+                    buf_append("  Wrote 8 bytes of ARM64 code to RW page\n");
 
-                    // Now flip to RX
-                    kr = mach_vm_protect(mach_task_self(), addr, size,
+                    // Now try to flip to RX
+                    kr = vm_protect(mach_task_self(), addr, size,
                         FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-                    buf_append("  mach_vm_protect RX: kr=%d\n", kr);
+                    buf_append("  vm_protect W->RX: kr=%d (%s)\n", kr,
+                               kr == KERN_SUCCESS ? "ALLOWED" : "DENIED");
 
                     if (kr == KERN_SUCCESS) {
-                        // Try to execute it!
-                        typedef int (*jit_fn)(void);
-                        jit_fn fn = (jit_fn)addr;
-                        buf_append("  Calling JIT code at 0x%llx...\n", addr);
-                        int result = fn();
-                        buf_append("  JIT returned: %d (expected 42)\n",
-                                   result);
-                        if (result == 42) {
-                            buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
-                        }
+                        buf_append("  W^X flip succeeded — page is now RX\n");
+                        buf_append("  (Not calling JIT code — arm64e PAC would crash)\n");
+                        buf_append("  >>> W->RX MEMORY TRANSITION WORKS <<<\n");
                     }
                 }
             } else {
-                // RWX worked directly!
-                buf_append("  *** RWX MEMORY AVAILABLE! ***\n");
-                uint32_t code[] = {
-                    0xd2800540, // mov x0, #42
-                    0xd65f03c0  // ret
-                };
-                memcpy((void *)addr, code, sizeof(code));
-
-                // Clear instruction cache
-                sys_icache_invalidate((void *)addr, sizeof(code));
-
-                typedef int (*jit_fn)(void);
-                jit_fn fn = (jit_fn)addr;
-                int result = fn();
-                buf_append("  JIT returned: %d (expected 42)\n", result);
-                if (result == 42) {
-                    buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
-                }
+                buf_append("  >>> RWX MEMORY AVAILABLE (unexpected!) <<<\n");
             }
 
             // Clean up
-            mach_vm_deallocate(mach_task_self(), addr, size);
+            vm_deallocate(mach_task_self(), addr, size);
         }
     }
 

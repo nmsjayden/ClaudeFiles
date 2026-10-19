@@ -32,6 +32,12 @@ struct ResearchView: View {
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),
                             ])
                         }
+
+                        Section {
+                            commandGroup(title: "Diagnostics", icon: "ant.fill", color: .red, commands: [
+                                ("breadcrumbs",  "View Breadcrumbs", "Last run's crash-safe log"),
+                            ])
+                        }
                     }
                     .padding()
                 }
@@ -176,6 +182,9 @@ struct ResearchView: View {
 }
 
 // MARK: - Runner
+// Uses DispatchQueue.global() + autoreleasepool instead of Task.detached.
+// The C functions in kernel_research.m use ObjC/Foundation internally
+// (NSBundle, NSFileManager) and NEED an autorelease pool on non-main threads.
 
 @MainActor
 final class ResearchRunner: ObservableObject {
@@ -199,6 +208,7 @@ final class ResearchRunner: ObservableObject {
             "swap_profile": "Research v11",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",
+            "breadcrumbs": "Breadcrumbs",
         ]
 
         isRunning = true
@@ -211,62 +221,71 @@ final class ResearchRunner: ObservableObject {
         // Start elapsed timer
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            DispatchQueue.main.async { [weak self] in
                 guard let self = self, let start = self.startTime else { return }
                 let secs = Date().timeIntervalSince(start)
                 self.elapsed = String(format: "%.1fs", secs)
             }
         }
 
-        // Run on background thread — kresearch can take a while
-        Task.detached(priority: .userInitiated) {
-            let result: String
-            switch command {
-            case "dump_self":
-                if let r = kresearch_dump_self() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED: exploit not initialized?" }
+        // Run on background GCD queue with autoreleasepool.
+        // This is safer than Task.detached for calling ObjC/C functions
+        // that internally create autorelease objects.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: String = autoreleasepool {
+                switch command {
+                case "dump_self":
+                    if let r = kresearch_dump_self() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED: exploit not initialized?" }
 
-            case "dump_proc":
-                if let r = kresearch_dump_proc(1) {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED: could not dump PID 1" }
+                case "dump_proc":
+                    if let r = kresearch_dump_proc(1) {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED: could not dump PID 1" }
 
-            case "compare":
-                if let r = kresearch_compare_creds(1) {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED: could not compare" }
+                case "compare":
+                    if let r = kresearch_compare_creds(1) {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED: could not compare" }
 
-            case "sandbox_ops":
-                if let r = kresearch_check_sandbox_ops() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED" }
+                case "sandbox_ops":
+                    if let r = kresearch_check_sandbox_ops() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
 
-            case "sandbox_profile":
-                if let r = kresearch_dump_sandbox_profile() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED" }
+                case "sandbox_profile":
+                    if let r = kresearch_dump_sandbox_profile() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
 
-            case "swap_profile":
-                if let r = kresearch_swap_sandbox_profile() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED" }
+                case "swap_profile":
+                    if let r = kresearch_swap_sandbox_profile() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
 
-            case "exec_ext":
-                if let r = kresearch_add_exec_extension() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED" }
+                case "exec_ext":
+                    if let r = kresearch_add_exec_extension() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
 
-            case "test_spawn":
-                if let r = kresearch_test_spawn() {
-                    result = String(cString: r); free(r)
-                } else { result = "FAILED" }
+                case "test_spawn":
+                    if let r = kresearch_test_spawn() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
 
-            default:
-                result = "Unknown command: \(command)"
+                case "breadcrumbs":
+                    if let r = kresearch_read_breadcrumbs() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "(no breadcrumbs file found)" }
+
+                default:
+                    return "Unknown command: \(command)"
+                }
             }
 
-            await MainActor.run {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
                 self.output = result
                 self.isRunning = false
                 self.timer?.invalidate()

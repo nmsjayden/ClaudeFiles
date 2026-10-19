@@ -49,4 +49,10 @@ char *kresearch_add_exec_extension(void);
 /// Returns a malloc'd string (caller must free).
 char *kresearch_test_spawn(void);
 
+/// Read the persistent breadcrumb log from the last research run.
+/// Breadcrumbs survive crashes — call this after relaunching to see
+/// exactly where the previous run died.
+/// Returns a malloc'd string (caller must free).
+char *kresearch_read_breadcrumbs(void);
+
 #endif /* kernel_research_h */

@@ -585,35 +585,65 @@ char *kresearch_swap_sandbox_profile(void) {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST C: Try NSTask and system()
-    // These use fork internally but might take different code paths
+    // TEST C: Try posix_spawn with pipe to capture output
+    // system() and popen() are unavailable on iOS SDK.
+    // Use posix_spawn directly with pipe for stdout capture.
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test C: system()\n");
-    buf_append("\n-- Test C: system() --\n");
+    fprintf(stderr, "[SWAP] Test C: posix_spawn with pipe\n");
+    buf_append("\n-- Test C: posix_spawn with pipe --\n");
     {
-        int ret = system("echo test_ok");
-        buf_append("  system(\"echo test_ok\"): %d\n", ret);
-        if (ret == -1) {
-            buf_append("  errno=%d (%s)\n", errno, strerror(errno));
+        int pipefd[2];
+        if (pipe(pipefd) == 0) {
+            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_init(&actions);
+            posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+            posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+
+            pid_t child = 0;
+            char *argv[] = {"/bin/sh", "-c", "echo spawn_pipe_ok && id", NULL};
+            char *envp[] = {"PATH=/usr/bin:/bin", NULL};
+            int ret = posix_spawn(&child, "/bin/sh", &actions, NULL, argv, envp);
+            buf_append("  posix_spawn /bin/sh (pipe): %d (%s)\n",
+                       ret, ret == 0 ? "SUCCESS" : strerror(ret));
+
+            if (ret == 0) {
+                close(pipefd[1]);
+                char outbuf[512] = {0};
+                ssize_t n = read(pipefd[0], outbuf, sizeof(outbuf) - 1);
+                if (n > 0) {
+                    outbuf[n] = '\0';
+                    buf_append("  output: %s\n", outbuf);
+                }
+                int status = 0;
+                waitpid(child, &status, 0);
+                buf_append("  exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            } else {
+                close(pipefd[1]);
+            }
+            close(pipefd[0]);
+            posix_spawn_file_actions_destroy(&actions);
+        } else {
+            buf_append("  pipe() failed: %d (%s)\n", errno, strerror(errno));
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST D: Try popen (fork+pipe+exec)
+    // TEST D: Try fork() directly (raw syscall)
+    // fork is likely EPERM but let's confirm and get the errno
     // ══════════════════════════════════════════════════════════════
-    fprintf(stderr, "[SWAP] Test D: popen\n");
-    buf_append("\n-- Test D: popen --\n");
+    fprintf(stderr, "[SWAP] Test D: fork\n");
+    buf_append("\n-- Test D: fork() --\n");
     {
-        FILE *fp = popen("echo popen_ok", "r");
-        if (fp) {
-            char line[256] = {0};
-            if (fgets(line, sizeof(line), fp)) {
-                buf_append("  popen output: %s", line);
-            }
-            int ret = pclose(fp);
-            buf_append("  pclose: %d\n", ret);
+        pid_t fpid = fork();
+        if (fpid == 0) {
+            _exit(42);
+        } else if (fpid > 0) {
+            int status = 0;
+            waitpid(fpid, &status, 0);
+            buf_append("  fork: SUCCESS! child=%d exit=%d\n",
+                       fpid, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         } else {
-            buf_append("  popen FAILED: %d (%s)\n", errno, strerror(errno));
+            buf_append("  fork: FAILED errno=%d (%s)\n", errno, strerror(errno));
         }
     }
 

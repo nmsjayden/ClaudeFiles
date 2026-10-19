@@ -22,8 +22,11 @@
 #import <errno.h>
 #import <dlfcn.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
+#import <objc/runtime.h>
+#import <fcntl.h>
 
 // mach_vm.h is not available in iOS SDK.
 // We resolve mach_vm_allocate/protect/deallocate via dlsym at runtime
@@ -531,218 +534,221 @@ char *kresearch_dump_sandbox_profile(void) {
 
 char *kresearch_swap_sandbox_profile(void) {
     bc_init();
-    bc("[SWAP] v11 starting\n");
+    bc("[SWAP] v12 starting\n");
     buf_init();
-    buf_append("=== EXEC BYPASS v11 - JIT + PRIVATE API EXPLOIT ===\n");
-    buf_append("v10 confirmed: RWX memory ALLOWED, private frameworks load,\n");
-    buf_append("  SBSLaunchApp/xpc_pipe_routine symbols found.\n");
-    buf_append("  System dylibs in shared cache (can't copy), task_for_pid denied.\n");
-    buf_append("v11: Execute JIT code, call private APIs, XPC to launchd.\n\n");
+    buf_append("=== EXEC BYPASS v12 - XPC EXPLOITATION ===\n");
+    buf_append("v11 confirmed:\n");
+    buf_append("  JIT: DEAD (SPTM tracks page write history, blocks exec forever)\n");
+    buf_append("  SBS Launch: ret=9 (not entitled)\n");
+    buf_append("  XPC connections: ALL SUCCEED (SB, runningboard, installd)\n");
+    buf_append("  Custom dylib: wrong platform tag in Mach-O\n");
+    buf_append("  posix_spawn: still EPERM\n");
+    buf_append("v12: Exploit live XPC connections, ObjC runtime, launch services.\n\n");
 
     // ══════════════════════════════════════════════════════════════
-    // TEST A: Memory permission probing (NO execution)
-    // v11 result: vm_protect RWX returns kr=0, W->RX also kr=0,
-    // but SPTM crashes on actual instruction fetch. SPTM tracks
-    // page history — once a page was writable, it NEVER allows
-    // execute, even after flipping to RX. This is stronger than
-    // standard W^X.
-    // This test now probes what transitions are allowed WITHOUT
-    // attempting execution (which would crash).
+    // TEST A: Send XPC messages to system services
+    // v11 showed we can CONNECT — now send actual messages and
+    // see what replies we get. Focus on services that manage
+    // process lifecycle.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test A: Memory permission probing (safe)\n");
-    buf_append("-- Test A: Memory permission probing --\n");
-    buf_append("  (NO execution — SPTM crashes on exec of ex-writable pages)\n");
+    bc("[SWAP] Test A: XPC messaging\n");
+    buf_append("-- Test A: XPC messaging to system services --\n");
     {
-        vm_address_t addr = 0;
-        vm_size_t size = 0x4000;
-
-        kern_return_t kr = vm_allocate(mach_task_self(),
-            &addr, size, VM_FLAGS_ANYWHERE);
-        buf_append("  vm_allocate: kr=%d addr=0x%lx\n",
-                   kr, (unsigned long)addr);
-
-        if (kr == KERN_SUCCESS) {
-            // Test 1: RW (baseline)
-            kr = vm_protect(mach_task_self(), addr, size,
-                FALSE, VM_PROT_READ | VM_PROT_WRITE);
-            buf_append("  vm_protect RW:  kr=%d\n", kr);
-
-            // Write test data
-            if (kr == KERN_SUCCESS) {
-                uint32_t code[] = { 0xd2800540, 0xd65f03c0 };
-                memcpy((void *)(uintptr_t)addr, code, sizeof(code));
-                uint32_t rb = *(uint32_t *)(uintptr_t)addr;
-                buf_append("  Write+readback: 0x%08x (OK=%s)\n",
-                           rb, rb == 0xd2800540 ? "YES" : "NO");
-            }
-
-            // Test 2: RW -> RX transition
-            kern_return_t kr_rx = vm_protect(mach_task_self(), addr, size,
-                FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-            buf_append("  vm_protect RX:  kr=%d (RW->RX transition)\n", kr_rx);
-
-            // Test 3: RWX
-            kern_return_t kr_rwx = vm_protect(mach_task_self(), addr, size,
-                FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-            buf_append("  vm_protect RWX: kr=%d\n", kr_rwx);
-
-            // Test 4: Allocate fresh page as RX directly (never writable)
-            vm_address_t addr2 = 0;
-            kern_return_t kr2 = vm_allocate(mach_task_self(),
-                &addr2, size, VM_FLAGS_ANYWHERE);
-            if (kr2 == KERN_SUCCESS) {
-                kern_return_t kr_rx2 = vm_protect(mach_task_self(), addr2, size,
-                    FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-                buf_append("  Fresh page RX (never-written): kr=%d\n", kr_rx2);
-                vm_deallocate(mach_task_self(), addr2, size);
-            }
-
-            buf_append("\n  CONCLUSION:\n");
-            buf_append("  vm_protect accepts RW, RX, RWX — kernel doesn't block.\n");
-            buf_append("  But SPTM enforces at hardware level:\n");
-            buf_append("  - Page that was EVER writable → exec faults (EXC_BAD_ACCESS)\n");
-            buf_append("  - JIT is IMPOSSIBLE without SPTM-signed page tables\n");
-            buf_append("  - Only code from signed binaries (shared cache) can execute\n");
-            buf_append("  - Focus: private APIs, XPC, dlopen of system frameworks\n");
-
-            vm_deallocate(mach_task_self(), addr, size);
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST B: Call SBSLaunchApplicationWithIdentifier
-    // This private API tells SpringBoard to launch an app.
-    // Different code path than posix_spawn — goes via XPC to SB.
-    // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test B: SBS launch app\n");
-    buf_append("\n-- Test B: Launch app via SpringBoardServices --\n");
-    {
-        void *sbs = dlopen("/System/Library/PrivateFrameworks/"
-            "SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
-        if (!sbs) {
-            buf_append("  dlopen SBS: FAILED\n");
-        } else {
-            // Try the simpler API first
-            void *sym = dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
-            buf_append("  SBSLaunchApplicationWithIdentifier: %p\n", sym);
-
-            if (sym) {
-                // SBSLaunchApplicationWithIdentifier(CFStringRef bundleID,
-                //                                    BOOL suspended)
-                // Returns int (0 = success)
-                typedef int (*sbs_launch_fn)(CFStringRef, BOOL);
-                sbs_launch_fn launch = (sbs_launch_fn)sym;
-
-                // Try launching Safari
-                CFStringRef safari = CFSTR("com.apple.mobilesafari");
-                int ret = launch(safari, NO);
-                buf_append("  Launch Safari: ret=%d (%s)\n",
-                           ret, ret == 0 ? "SUCCESS" : "FAILED");
-
-                // Try launching Settings
-                CFStringRef settings = CFSTR("com.apple.Preferences");
-                ret = launch(settings, NO);
-                buf_append("  Launch Settings: ret=%d (%s)\n",
-                           ret, ret == 0 ? "SUCCESS" : "FAILED");
-            }
-
-            // Also try the options variant
-            void *sym2 = dlsym(sbs,
-                "SBSLaunchApplicationWithIdentifierAndLaunchOptions");
-            buf_append("  WithLaunchOptions: %p\n", sym2);
-            if (sym2) {
-                // SBSLaunchApplicationWithIdentifierAndLaunchOptions(
-                //     CFStringRef bundleID, CFDictionaryRef options,
-                //     BOOL suspended)
-                typedef int (*sbs_launch2_fn)(CFStringRef,
-                    CFDictionaryRef, BOOL);
-                sbs_launch2_fn launch2 = (sbs_launch2_fn)sym2;
-
-                CFStringRef safari = CFSTR("com.apple.mobilesafari");
-                int ret = launch2(safari, NULL, NO);
-                buf_append("  Launch Safari (opts): ret=%d\n", ret);
-            }
-
-            // Try SBSOpenSensitiveURLConnectionWithIdentifier
-            // This can open URLs, potentially url schemes
-            void *sym3 = dlsym(sbs, "SBSOpenSensitiveURLConnectionWithIdentifier");
-            buf_append("  SBSOpenSensitiveURL: %s\n",
-                       sym3 ? "FOUND" : "not found");
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // TEST C: XPC communication with launchd
-    // Try submitting a launchd job via XPC. If we can talk to
-    // launchd, we can potentially run code as root.
-    // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test C: XPC to launchd\n");
-    buf_append("\n-- Test C: XPC to launchd --\n");
-    {
-        // Use Objective-C xpc wrappers
+        // Resolve XPC functions via dlsym
         void *xpc_h = dlopen("/usr/lib/system/libxpc.dylib", RTLD_LAZY);
         if (!xpc_h) {
             buf_append("  dlopen libxpc: FAILED\n");
         } else {
-            // Check what XPC services we can connect to
-            // xpc_connection_create_mach_service connects to launchd-managed
-            // services
-            typedef void* (*xpc_conn_create_fn)(const char *, void *, uint64_t);
-            xpc_conn_create_fn xpc_conn_create = (xpc_conn_create_fn)
-                dlsym(xpc_h, "xpc_connection_create_mach_service");
-            buf_append("  xpc_connection_create_mach_service: %p\n",
-                       (void *)xpc_conn_create);
+            typedef void *(*xpc_conn_create_fn)(const char *, void *, uint64_t);
+            typedef void (*xpc_conn_set_handler_fn)(void *, void *);
+            typedef void (*xpc_conn_resume_fn)(void *);
+            typedef void *(*xpc_conn_send_sync_fn)(void *, void *);
+            typedef void *(*xpc_dict_create_fn)(const char *const *,
+                const void *const *, size_t);
+            typedef void (*xpc_dict_set_string_fn)(void *, const char *,
+                const char *);
+            typedef void (*xpc_dict_set_int64_fn)(void *, const char *, int64_t);
+            typedef void (*xpc_dict_set_bool_fn)(void *, const char *, _Bool);
+            typedef const char *(*xpc_dict_get_string_fn)(void *, const char *);
+            typedef int64_t (*xpc_dict_get_int64_fn)(void *, const char *);
+            typedef void *(*xpc_copy_desc_fn)(void *);
+            typedef const char *(*xpc_type_get_name_fn)(void *);
+            typedef void *(*xpc_get_type_fn)(void *);
 
-            // Try connecting to interesting services
-            const char *services[] = {
-                "com.apple.springboard.services",
-                "com.apple.mobile.installd",
-                "com.apple.lsd.mapdb",
-                "com.apple.runningboard",
-                "com.apple.coreservices.launchservicesd",
-                NULL
-            };
+            xpc_conn_create_fn    xcc  = dlsym(xpc_h, "xpc_connection_create_mach_service");
+            xpc_conn_set_handler_fn xsh = dlsym(xpc_h, "xpc_connection_set_event_handler");
+            xpc_conn_resume_fn    xcr  = dlsym(xpc_h, "xpc_connection_resume");
+            xpc_conn_send_sync_fn xss  = dlsym(xpc_h, "xpc_connection_send_message_with_reply_sync");
+            xpc_dict_create_fn    xdc  = dlsym(xpc_h, "xpc_dictionary_create");
+            xpc_dict_set_string_fn xdss = dlsym(xpc_h, "xpc_dictionary_set_string");
+            xpc_dict_set_int64_fn xdsi = dlsym(xpc_h, "xpc_dictionary_set_int64");
+            xpc_dict_set_bool_fn xdsb  = dlsym(xpc_h, "xpc_dictionary_set_bool");
+            xpc_copy_desc_fn     xcd  = dlsym(xpc_h, "xpc_copy_description");
+            xpc_type_get_name_fn xtn  = dlsym(xpc_h, "xpc_type_get_name");
+            xpc_get_type_fn      xgt  = dlsym(xpc_h, "xpc_get_type");
 
-            if (xpc_conn_create) {
-                for (int i = 0; services[i]; i++) {
-                    void *conn = xpc_conn_create(services[i], NULL, 0);
-                    buf_append("  %s: %s\n",
-                               services[i], conn ? "CONNECTED" : "FAILED");
+            // Also need the error type pointer for comparison
+            void **xpc_error_conn_invalid = dlsym(xpc_h, "_xpc_error_connection_invalid");
+            void **xpc_error_conn_interrupted = dlsym(xpc_h, "_xpc_error_connection_interrupted");
+
+            bc("[SWAP] XPC symbols resolved\n");
+            buf_append("  XPC symbols: create=%p send_sync=%p dict=%p\n",
+                       xcc, xss, xdc);
+
+            if (xcc && xss && xdc && xcr && xsh) {
+                // ── Test A1: Talk to com.apple.runningboard ──
+                bc("[SWAP] A1: runningboard XPC\n");
+                buf_append("\n  A1: com.apple.runningboard\n");
+                {
+                    void *conn = xcc("com.apple.runningboard", NULL, 0);
+                    if (conn) {
+                        // Must set handler and resume before sending
+                        xsh(conn, ^(void *event) { (void)event; });
+                        xcr(conn);
+
+                        // Send a simple ping / identity query
+                        void *msg = xdc(NULL, NULL, 0);
+                        xdsi(msg, "type", 1);  // query type
+                        xdss(msg, "process", "com.apple.mobilesafari");
+                        xdsb(msg, "suspended", false);
+
+                        bc("[SWAP] A1: sending to runningboard\n");
+                        void *reply = xss(conn, msg);
+                        if (reply) {
+                            char *desc = xcd(reply);
+                            if (desc) {
+                                buf_append("  Reply: %.500s\n", desc);
+                                free(desc);
+                            }
+                            // Check if it's an error
+                            if (xpc_error_conn_invalid && reply == *xpc_error_conn_invalid) {
+                                buf_append("  (connection invalid)\n");
+                            } else if (xpc_error_conn_interrupted && reply == *xpc_error_conn_interrupted) {
+                                buf_append("  (connection interrupted)\n");
+                            }
+                        } else {
+                            buf_append("  Reply: NULL\n");
+                        }
+                    }
                 }
-            }
 
-            // Try bootstrap_look_up for mach ports
-            typedef kern_return_t (*bootstrap_lookup_fn)(mach_port_t,
-                const char *, mach_port_t *);
-            bootstrap_lookup_fn blookup = (bootstrap_lookup_fn)
-                dlsym(xpc_h, "bootstrap_look_up");
-            if (!blookup) {
-                // It's in libSystem
-                void *ls = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
-                if (ls) blookup = (bootstrap_lookup_fn)
-                    dlsym(ls, "bootstrap_look_up");
-            }
-            buf_append("\n  bootstrap_look_up: %p\n", (void *)blookup);
+                // ── Test A2: Talk to com.apple.springboard.services ──
+                bc("[SWAP] A2: springboard XPC\n");
+                buf_append("\n  A2: com.apple.springboard.services\n");
+                {
+                    void *conn = xcc("com.apple.springboard.services", NULL, 0);
+                    if (conn) {
+                        xsh(conn, ^(void *event) { (void)event; });
+                        xcr(conn);
 
-            if (blookup) {
-                mach_port_t bp = MACH_PORT_NULL;
-                task_get_special_port(mach_task_self(),
-                    TASK_BOOTSTRAP_PORT, &bp);
-                buf_append("  bootstrap port: 0x%x\n", bp);
+                        // SBS uses XPC internally. Try sending an
+                        // openApplication message directly.
+                        void *msg = xdc(NULL, NULL, 0);
+                        xdss(msg, "bundleId", "com.apple.mobilesafari");
+                        xdsi(msg, "action", 0);  // open
 
-                if (bp != MACH_PORT_NULL) {
-                    const char *mach_services[] = {
-                        "com.apple.springboard.services",
-                        "com.apple.runningboard",
-                        "com.apple.mobile.installd",
-                        NULL
-                    };
-                    for (int i = 0; mach_services[i]; i++) {
-                        mach_port_t port = MACH_PORT_NULL;
-                        kern_return_t kr = blookup(bp,
-                            mach_services[i], &port);
-                        buf_append("  %s: kr=%d port=0x%x\n",
-                                   mach_services[i], kr, port);
+                        bc("[SWAP] A2: sending to SB\n");
+                        void *reply = xss(conn, msg);
+                        if (reply) {
+                            char *desc = xcd(reply);
+                            if (desc) {
+                                buf_append("  Reply: %.500s\n", desc);
+                                free(desc);
+                            }
+                        } else {
+                            buf_append("  Reply: NULL\n");
+                        }
+                    }
+                }
+
+                // ── Test A3: Talk to com.apple.mobile.installd ──
+                bc("[SWAP] A3: installd XPC\n");
+                buf_append("\n  A3: com.apple.mobile.installd\n");
+                {
+                    void *conn = xcc("com.apple.mobile.installd", NULL, 0);
+                    if (conn) {
+                        xsh(conn, ^(void *event) { (void)event; });
+                        xcr(conn);
+
+                        // Ask installd to list installed apps
+                        void *msg = xdc(NULL, NULL, 0);
+                        xdss(msg, "Command", "Lookup");
+                        xdss(msg, "ClientOptions", "");
+
+                        bc("[SWAP] A3: sending to installd\n");
+                        void *reply = xss(conn, msg);
+                        if (reply) {
+                            char *desc = xcd(reply);
+                            if (desc) {
+                                buf_append("  Reply: %.500s\n", desc);
+                                free(desc);
+                            }
+                        } else {
+                            buf_append("  Reply: NULL\n");
+                        }
+                    }
+                }
+
+                // ── Test A4: xpc_pipe_routine to launchd ──
+                bc("[SWAP] A4: xpc_pipe_routine\n");
+                buf_append("\n  A4: xpc_pipe_routine to launchd\n");
+                {
+                    // xpc_pipe_routine talks directly to launchd
+                    typedef int (*xpc_pipe_routine_fn)(void *, void *, void **);
+                    typedef void *(*xpc_pipe_create_fn)(const char *, uint64_t);
+                    xpc_pipe_routine_fn xpr = dlsym(xpc_h, "xpc_pipe_routine");
+                    xpc_pipe_create_fn xpc = dlsym(xpc_h, "xpc_pipe_create");
+                    buf_append("  xpc_pipe_routine: %p\n", xpr);
+                    buf_append("  xpc_pipe_create: %p\n", xpc);
+
+                    if (xpr) {
+                        // Create a pipe to launchd (NULL name = launchd)
+                        void *pipe = NULL;
+                        if (xpc) {
+                            pipe = xpc(NULL, 0);
+                            buf_append("  pipe to launchd: %p\n", pipe);
+                        }
+
+                        if (pipe) {
+                            // Send "list" command (type 815 in launchd protocol)
+                            // launchd XPC protocol uses "subsystem" and "routine"
+                            void *msg = xdc(NULL, NULL, 0);
+                            xdsi(msg, "subsystem", 3);    // process subsystem
+                            xdsi(msg, "routine", 815);     // list jobs
+                            xdsi(msg, "type", 1);
+
+                            void *reply = NULL;
+                            bc("[SWAP] A4: calling xpc_pipe_routine\n");
+                            int ret = xpr(pipe, msg, &reply);
+                            buf_append("  xpc_pipe_routine: ret=%d\n", ret);
+                            if (reply) {
+                                char *desc = xcd(reply);
+                                if (desc) {
+                                    buf_append("  Reply: %.800s\n", desc);
+                                    free(desc);
+                                }
+                            }
+
+                            // Try "submit" command (submit a job to launchd)
+                            void *msg2 = xdc(NULL, NULL, 0);
+                            xdsi(msg2, "subsystem", 3);
+                            xdsi(msg2, "routine", 800);   // submit job
+                            xdsi(msg2, "type", 1);
+                            xdss(msg2, "label", "com.test.jb");
+                            xdss(msg2, "program", "/bin/sh");
+
+                            reply = NULL;
+                            bc("[SWAP] A4: submitting job\n");
+                            ret = xpr(pipe, msg2, &reply);
+                            buf_append("  submit job: ret=%d\n", ret);
+                            if (reply) {
+                                char *desc = xcd(reply);
+                                if (desc) {
+                                    buf_append("  Reply: %.500s\n", desc);
+                                    free(desc);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -750,116 +756,255 @@ char *kresearch_swap_sandbox_profile(void) {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST D: Write minimal Mach-O dylib and try dlopen
-    // Even though system dylibs are in shared cache, we can try
-    // writing our OWN Mach-O and loading it. Code signing will
-    // likely block this, but we need to know the exact error.
+    // TEST B: ObjC Runtime — LSApplicationWorkspace & FrontBoard
+    // Use NSClassFromString to instantiate private framework classes
+    // that manage app launching. These go through different code
+    // paths than SBS — possibly different entitlement checks.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test D: custom dylib\n");
-    buf_append("\n-- Test D: Write and load custom Mach-O --\n");
+    bc("[SWAP] Test B: ObjC runtime launch\n");
+    buf_append("\n-- Test B: ObjC runtime app launching --\n");
     {
-        NSArray *docPaths = NSSearchPathForDirectoriesInDomains(
-            NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docs = [docPaths firstObject];
+        // Load LaunchServices framework
+        void *ls = dlopen("/System/Library/PrivateFrameworks/"
+            "MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+        if (!ls) ls = dlopen("/System/Library/Frameworks/"
+            "CoreServices.framework/CoreServices", RTLD_LAZY);
 
-        if (docs) {
-            NSString *testPath = [docs stringByAppendingPathComponent:
-                @"test_jit.dylib"];
+        // Try LSApplicationWorkspace
+        Class lsws = NSClassFromString(@"LSApplicationWorkspace");
+        buf_append("  LSApplicationWorkspace class: %p\n", lsws);
 
-            // Minimal ARM64 Mach-O dylib (just headers, no real code)
-            // MH_MAGIC_64 + minimal load commands
-            uint8_t macho[] = {
-                // Mach-O header (32 bytes)
-                0xCF, 0xFA, 0xED, 0xFE, // MH_MAGIC_64
-                0x0C, 0x00, 0x00, 0x01, // CPU_TYPE_ARM64
-                0x00, 0x00, 0x00, 0x00, // CPU_SUBTYPE
-                0x06, 0x00, 0x00, 0x00, // MH_DYLIB
-                0x00, 0x00, 0x00, 0x00, // ncmds=0
-                0x00, 0x00, 0x00, 0x00, // sizeofcmds=0
-                0x85, 0x00, 0x20, 0x00, // flags: MH_DYLDLINK|MH_PIE|etc
-                0x00, 0x00, 0x00, 0x00, // reserved
-            };
+        if (lsws) {
+            // [LSApplicationWorkspace defaultWorkspace]
+            id workspace = [lsws performSelector:
+                @selector(defaultWorkspace)];
+            buf_append("  defaultWorkspace: %p\n", workspace);
 
-            NSData *data = [NSData dataWithBytes:macho length:sizeof(macho)];
-            BOOL wrote = [data writeToFile:testPath atomically:YES];
-            buf_append("  Write test dylib: %s\n",
-                       wrote ? "OK" : "FAILED");
+            if (workspace) {
+                // Try openApplicationWithBundleID:
+                SEL openSel = NSSelectorFromString(
+                    @"openApplicationWithBundleID:");
+                if ([workspace respondsToSelector:openSel]) {
+                    bc("[SWAP] B: calling openApplicationWithBundleID\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id result = [workspace performSelector:openSel
+                        withObject:@"com.apple.mobilesafari"];
+#pragma clang diagnostic pop
+                    buf_append("  openApp Safari: %s\n",
+                               result ? "returned non-nil" : "returned nil");
+                } else {
+                    buf_append("  openApplicationWithBundleID: NOT FOUND\n");
 
-            if (wrote) {
-                void *h = dlopen([testPath UTF8String], RTLD_LAZY);
-                buf_append("  dlopen custom dylib: %s\n",
-                           h ? "*** LOADED! ***" : dlerror());
-                if (h) {
-                    buf_append("  >>> CUSTOM CODE LOADING WORKS! <<<\n");
-                    dlclose(h);
+                    // List all methods to find what's available
+                    unsigned int count = 0;
+                    Method *methods = class_copyMethodList(
+                        object_getClass(workspace), &count);
+                    buf_append("  Available methods (%u):\n", count);
+                    int printed = 0;
+                    for (unsigned int i = 0; i < count && printed < 20; i++) {
+                        const char *name = sel_getName(
+                            method_getName(methods[i]));
+                        // Only show open/launch/exec related methods
+                        if (strstr(name, "open") || strstr(name, "launch") ||
+                            strstr(name, "exec") || strstr(name, "install") ||
+                            strstr(name, "run")) {
+                            buf_append("    - %s\n", name);
+                            printed++;
+                        }
+                    }
+                    if (methods) free(methods);
+                }
+
+                // Try openURL: — this can launch apps via URL schemes
+                SEL openURLSel = NSSelectorFromString(@"openURL:");
+                if ([workspace respondsToSelector:openURLSel]) {
+                    NSURL *url = [NSURL URLWithString:@"tel://"];
+                    bc("[SWAP] B: calling openURL:\n");
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id result = [workspace performSelector:openURLSel
+                        withObject:url];
+#pragma clang diagnostic pop
+                    buf_append("  openURL tel://: %s\n",
+                               result ? "returned non-nil" : "returned nil");
+                } else {
+                    buf_append("  openURL: NOT FOUND\n");
+                }
+            }
+        }
+
+        // Try FrontBoardServices
+        void *fbs = dlopen("/System/Library/PrivateFrameworks/"
+            "FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
+        buf_append("\n  FrontBoardServices: %s\n",
+                   fbs ? "LOADED" : "NOT FOUND");
+
+        if (fbs) {
+            Class fbsService = NSClassFromString(@"FBSSystemService");
+            buf_append("  FBSSystemService: %p\n", fbsService);
+            if (fbsService) {
+                id svc = [fbsService performSelector:
+                    @selector(sharedService)];
+                buf_append("  sharedService: %p\n", svc);
+                if (svc) {
+                    // List available methods
+                    unsigned int count = 0;
+                    Method *methods = class_copyMethodList(
+                        [svc class], &count);
+                    buf_append("  FBS methods (%u):\n", count);
+                    int printed = 0;
+                    for (unsigned int i = 0; i < count && printed < 15; i++) {
+                        const char *name = sel_getName(
+                            method_getName(methods[i]));
+                        if (strstr(name, "open") || strstr(name, "launch") ||
+                            strstr(name, "create") || strstr(name, "process") ||
+                            strstr(name, "exec") || strstr(name, "app")) {
+                            buf_append("    - %s\n", name);
+                            printed++;
+                        }
+                    }
+                    if (methods) free(methods);
                 }
             }
 
-            [[NSFileManager defaultManager]
-                removeItemAtPath:testPath error:nil];
+            // Try FBSOpenApplicationService
+            Class fbsOpen = NSClassFromString(@"FBSOpenApplicationService");
+            buf_append("  FBSOpenApplicationService: %p\n", fbsOpen);
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // TEST E: posix_spawn with different attrs/flags
-    // Previous tests used default attrs. Try with specific flags
-    // that might bypass the sandbox/AMFI check.
+    // TEST C: UIApplication openURL (from within our own app)
+    // UIApplication.shared.open() goes through SpringBoard but
+    // uses a different entitlement path than SBS direct calls.
     // ══════════════════════════════════════════════════════════════
-    bc("[SWAP] Test E: posix_spawn variants\n");
-    buf_append("\n-- Test E: posix_spawn with different attrs --\n");
+    bc("[SWAP] Test C: UIApplication openURL\n");
+    buf_append("\n-- Test C: UIApplication openURL --\n");
     {
-        // Test 1: posix_spawn with POSIX_SPAWN_SETEXEC (replace process)
+        // Must call on main thread
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block BOOL openResult = NO;
+
+        if ([NSThread isMainThread]) {
+            NSURL *url = [NSURL URLWithString:@"app-settings:"];
+            openResult = [[UIApplication sharedApplication] canOpenURL:url];
+            buf_append("  canOpenURL app-settings: %s\n",
+                       openResult ? "YES" : "NO");
+
+            NSURL *safari = [NSURL URLWithString:@"https://apple.com"];
+            openResult = [[UIApplication sharedApplication]
+                canOpenURL:safari];
+            buf_append("  canOpenURL https: %s\n",
+                       openResult ? "YES" : "NO");
+
+            // Actually try opening (async)
+            [[UIApplication sharedApplication] openURL:safari
+                options:@{} completionHandler:^(BOOL success) {
+                buf_append("  openURL https: %s\n",
+                           success ? "OPENED" : "FAILED");
+                dispatch_semaphore_signal(sem);
+            }];
+            dispatch_semaphore_wait(sem,
+                dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+        } else {
+            __block BOOL canOpen1 = NO, canOpen2 = NO;
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                NSURL *url = [NSURL URLWithString:@"app-settings:"];
+                canOpen1 = [[UIApplication sharedApplication] canOpenURL:url];
+                NSURL *safari = [NSURL URLWithString:@"https://apple.com"];
+                canOpen2 = [[UIApplication sharedApplication]
+                    canOpenURL:safari];
+
+                [[UIApplication sharedApplication] openURL:safari
+                    options:@{} completionHandler:^(BOOL success) {
+                    buf_append("  openURL https: %s\n",
+                               success ? "OPENED" : "FAILED");
+                    dispatch_semaphore_signal(sem);
+                }];
+            });
+            buf_append("  canOpenURL app-settings: %s\n",
+                       canOpen1 ? "YES" : "NO");
+            buf_append("  canOpenURL https: %s\n",
+                       canOpen2 ? "YES" : "NO");
+            dispatch_semaphore_wait(sem,
+                dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // TEST D: NSTask / NSProcess (if available on iOS)
+    // These are macOS APIs but some parts may exist in the iOS
+    // shared cache. Also try system() and popen().
+    // ══════════════════════════════════════════════════════════════
+    bc("[SWAP] Test D: Process APIs\n");
+    buf_append("\n-- Test D: Process creation APIs --\n");
+    {
+        // system() — simplest possible exec
+        bc("[SWAP] D: system()\n");
+        int ret = system("echo jb_test");
+        buf_append("  system('echo jb_test'): ret=%d errno=%d (%s)\n",
+                   ret, errno, strerror(errno));
+
+        // popen()
+        bc("[SWAP] D: popen()\n");
+        FILE *fp = popen("echo jb_popen", "r");
+        if (fp) {
+            char line[256] = {0};
+            if (fgets(line, sizeof(line), fp)) {
+                buf_append("  popen output: %s", line);
+            }
+            int pc = pclose(fp);
+            buf_append("  popen: WORKED! exit=%d\n", pc);
+        } else {
+            buf_append("  popen: FAILED errno=%d (%s)\n",
+                       errno, strerror(errno));
+        }
+
+        // NSTask (may not exist on iOS)
+        Class nsTask = NSClassFromString(@"NSTask");
+        buf_append("  NSTask class: %p\n", nsTask);
+        if (nsTask) {
+            buf_append("  >>> NSTask EXISTS on iOS! <<<\n");
+            // List its methods
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(nsTask, &count);
+            buf_append("  NSTask methods (%u):\n", count);
+            for (unsigned int i = 0; i < count && i < 15; i++) {
+                buf_append("    - %s\n",
+                    sel_getName(method_getName(methods[i])));
+            }
+            if (methods) free(methods);
+        }
+
+        // Check for posix_spawn_file_actions tricks
+        bc("[SWAP] D: spawn with file actions\n");
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+
         posix_spawnattr_t attr;
         posix_spawnattr_init(&attr);
-        short flags = POSIX_SPAWN_SETPGROUP;
-        posix_spawnattr_setflags(&attr, flags);
 
         pid_t child = 0;
-        char *argv[] = {"/bin/sh", "-c", "echo jb_ok", NULL};
+        char *argv[] = {"/bin/sh", "-c", "id", NULL};
         char *envp[] = {NULL};
-        int ret = posix_spawn(&child, "/bin/sh", NULL, &attr, argv, envp);
-        buf_append("  posix_spawn /bin/sh (SETPGROUP): %d (%s)\n",
+        ret = posix_spawn(&child, "/bin/sh", &fa, &attr, argv, envp);
+        buf_append("  posix_spawn with file_actions: %d (%s)\n",
                    ret, ret == 0 ? "SUCCESS" : strerror(ret));
+        posix_spawn_file_actions_destroy(&fa);
         posix_spawnattr_destroy(&attr);
-
-        // Test 2: Try /usr/bin/env instead
-        child = 0;
-        char *argv2[] = {"/usr/bin/env", "sh", "-c", "echo jb_ok", NULL};
-        ret = posix_spawn(&child, "/usr/bin/env", NULL, NULL, argv2, envp);
-        buf_append("  posix_spawn /usr/bin/env: %d (%s)\n",
-                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
-
-        // Test 3: Try spawning ourselves (re-exec)
-        NSString *selfPath = [[NSBundle mainBundle] executablePath];
-        buf_append("  Our executable: %s\n", [selfPath UTF8String]);
-        child = 0;
-        char *argv3[] = {(char *)[selfPath UTF8String], NULL};
-        ret = posix_spawn(&child, [selfPath UTF8String],
-                         NULL, NULL, argv3, envp);
-        buf_append("  posix_spawn self: %d (%s)\n",
-                   ret, ret == 0 ? "SUCCESS" : strerror(ret));
-
-        if (ret == 0 && child > 0) {
-            buf_append("  *** SELF-EXEC WORKS! child=%d ***\n", child);
-            // Kill the child immediately
-            kill(child, SIGKILL);
-            waitpid(child, NULL, 0);
-        }
     }
 
-    buf_append("\n-- v11 Analysis --\n");
-    buf_append("KEY FINDINGS:\n");
-    buf_append("  RWX memory: ALLOWED (v10)\n");
-    buf_append("  Private frameworks: LOADED (v10)\n");
-    buf_append("  System dylibs on disk: NO (shared cache only)\n");
-    buf_append("VECTORS:\n");
-    buf_append("  If A(JIT) works: arbitrary ARM64 shellcode exec\n");
-    buf_append("  If B(SBS) works: launch apps via SpringBoard\n");
-    buf_append("  If C(XPC) works: communicate with system services\n");
-    buf_append("  If D(dylib) works: load custom code via dlopen\n");
-    buf_append("  If E(spawn-self) works: re-exec our own binary\n");
+    buf_append("\n-- v12 Analysis --\n");
+    buf_append("v12 TESTED:\n");
+    buf_append("  A: XPC messaging (runningboard, springboard, installd, launchd)\n");
+    buf_append("  B: ObjC runtime (LSApplicationWorkspace, FrontBoardServices)\n");
+    buf_append("  C: UIApplication openURL\n");
+    buf_append("  D: system(), popen(), NSTask, posix_spawn+file_actions\n");
+    buf_append("FOCUS: Which XPC replies are we getting? Which ObjC methods exist?\n");
 
-    bc("[SWAP] v11 complete\n");
+    bc("[SWAP] v12 complete\n");
     bc_close();
     return buf_finish();
 }

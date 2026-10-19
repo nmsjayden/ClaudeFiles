@@ -27,7 +27,7 @@ struct ResearchView: View {
 
                         Section {
                             commandGroup(title: "Active Tests", icon: "bolt.fill", color: .orange, commands: [
-                                ("swap_profile",  "Run Research (v11)", "JIT + private API exploit tests"),
+                                ("swap_profile",  "Run Research (v12)", "XPC + ObjC runtime exploit tests"),
                                 ("exec_ext",      "Add Exec Extension", "Add process-exec sandbox ext"),
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),
                             ])

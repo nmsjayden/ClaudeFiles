@@ -1080,29 +1080,9 @@ char *kresearch_swap_sandbox_profile(void) {
         uint8_t sb_data[256];
         kreadbuf(self_info.sandbox, sb_data, 256);
 
-        // Extract key fields
+        // Extract key fields used below
         uint64_t field_00 = *(uint64_t*)(sb_data + 0x00);
-        uint64_t field_08 = *(uint64_t*)(sb_data + 0x08);
-        uint64_t field_10 = *(uint64_t*)(sb_data + 0x10);
-        uint64_t field_18 = *(uint64_t*)(sb_data + 0x18);
-        uint64_t field_20 = *(uint64_t*)(sb_data + 0x20);
-        uint64_t field_28 = *(uint64_t*)(sb_data + 0x28);
         uint64_t field_30 = *(uint64_t*)(sb_data + 0x30);
-        uint64_t field_38 = *(uint64_t*)(sb_data + 0x38);
-        uint64_t field_40 = *(uint64_t*)(sb_data + 0x40);
-        uint64_t field_48 = *(uint64_t*)(sb_data + 0x48);
-        uint64_t field_50 = *(uint64_t*)(sb_data + 0x50);
-        uint64_t field_58 = *(uint64_t*)(sb_data + 0x58);
-        // Second half mirrors
-        uint64_t field_80 = *(uint64_t*)(sb_data + 0x80);
-        uint64_t field_88 = *(uint64_t*)(sb_data + 0x88);
-        uint64_t field_90 = *(uint64_t*)(sb_data + 0x90);
-        uint64_t field_98 = *(uint64_t*)(sb_data + 0x98);
-        uint64_t field_a0 = *(uint64_t*)(sb_data + 0xa0);
-        uint64_t field_a8 = *(uint64_t*)(sb_data + 0xa8);
-        uint64_t field_b0 = *(uint64_t*)(sb_data + 0xb0);
-        uint64_t field_b8 = *(uint64_t*)(sb_data + 0xb8);
-        uint64_t field_c0 = *(uint64_t*)(sb_data + 0xc0);
 
         buf_append("    Full 256b field map:\n");
         for (int i = 0; i < 256; i += 8) {

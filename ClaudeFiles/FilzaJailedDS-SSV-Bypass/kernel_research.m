@@ -1681,3 +1681,410 @@ char *kresearch_test_spawn(void) {
 
     return buf_finish();
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Kernel research primitives — Claude API tool backends
+// ════════════════════════════════════════════════════════════════════
+
+char *kresearch_kread(uint64_t address, int size) {
+    buf_init();
+
+    if (!kaddr_ok(address)) {
+        buf_append("ERROR: invalid kernel address 0x%llx\n", address);
+        return buf_finish();
+    }
+
+    if (size < 1) size = 64;
+    if (size > 4096) size = 4096;
+
+    buf_append("kread @ 0x%llx, %d bytes:\n", address, size);
+
+    uint8_t *data = (uint8_t *)malloc(size);
+    kreadbuf(address, data, size);
+
+    for (int i = 0; i < size; i += 16) {
+        buf_append("  +%04x: ", i);
+        for (int j = 0; j < 16 && (i + j) < size; j++) {
+            buf_append("%02x ", data[i + j]);
+        }
+        buf_append(" |");
+        for (int j = 0; j < 16 && (i + j) < size; j++) {
+            uint8_t b = data[i + j];
+            buf_append("%c", (b >= 0x20 && b < 0x7f) ? b : '.');
+        }
+        buf_append("|\n");
+    }
+
+    buf_append("\nPointer-sized values:\n");
+    int ptrCount = size / 8;
+    if (ptrCount > 32) ptrCount = 32;
+    for (int i = 0; i < ptrCount; i++) {
+        uint64_t val = 0;
+        memcpy(&val, data + (i * 8), 8);
+        if (val != 0) {
+            buf_append("  +0x%02x: 0x%016llx", i * 8, val);
+            if (kaddr_ok(val)) {
+                buf_append(" (kernel ptr)");
+            }
+            buf_append("\n");
+        }
+    }
+
+    free(data);
+    return buf_finish();
+}
+
+char *kresearch_kread64(uint64_t address) {
+    buf_init();
+
+    if (!kaddr_ok(address)) {
+        buf_append("ERROR: invalid kernel address 0x%llx\n", address);
+        return buf_finish();
+    }
+
+    uint64_t value = kread64(address);
+    buf_append("kread64 @ 0x%llx:\n", address);
+    buf_append("  value: 0x%016llx (%llu)\n", value, value);
+    if (kaddr_ok(value)) {
+        buf_append("  looks like a kernel pointer\n");
+        uint64_t deref = kread64(value);
+        buf_append("  *value: 0x%016llx\n", deref);
+    }
+    uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
+    uint32_t hi = (uint32_t)(value >> 32);
+    buf_append("  lo32: 0x%08x (%u)  hi32: 0x%08x (%u)\n", lo, lo, hi, hi);
+
+    return buf_finish();
+}
+
+char *kresearch_follow_chain(uint64_t base, const char *offsets_csv) {
+    buf_init();
+
+    if (!kaddr_ok(base)) {
+        buf_append("ERROR: invalid base address 0x%llx\n", base);
+        return buf_finish();
+    }
+
+    buf_append("Follow pointer chain from 0x%llx:\n", base);
+    buf_append("  [0] base = 0x%llx\n", base);
+
+    uint64_t current = base;
+    int step = 1;
+
+    char *offsets_copy = strdup(offsets_csv ? offsets_csv : "");
+    char *saveptr = NULL;
+    char *token = strtok_r(offsets_copy, ",", &saveptr);
+
+    while (token != NULL) {
+        while (*token == ' ') token++;
+
+        uint64_t offset = 0;
+        if (token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
+            offset = strtoull(token + 2, NULL, 16);
+        } else {
+            offset = strtoull(token, NULL, 10);
+        }
+
+        uint64_t addr = current + offset;
+        buf_append("  [%d] 0x%llx + 0x%llx = 0x%llx\n", step, current, offset, addr);
+
+        if (!kaddr_ok(addr)) {
+            buf_append("  ERROR: address 0x%llx is not a valid kernel address\n", addr);
+            break;
+        }
+
+        uint64_t value = kread_ptr(addr);
+        buf_append("       → 0x%016llx", value);
+
+        if (kaddr_ok(value)) {
+            buf_append(" (valid kernel ptr)\n");
+            current = value;
+        } else if (value == 0) {
+            buf_append(" (NULL)\n");
+            break;
+        } else {
+            buf_append(" (not a kernel ptr, raw value)\n");
+            current = value;
+        }
+
+        step++;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    buf_append("\nFinal value: 0x%016llx\n", current);
+    free(offsets_copy);
+    return buf_finish();
+}
+
+char *kresearch_proc_info(int pid) {
+    buf_init();
+
+    uint64_t proc;
+    if (pid == 0) {
+        proc = proc_self();
+        buf_append("=== PROC INFO: self ===\n");
+    } else {
+        proc = proc_find((pid_t)pid);
+        buf_append("=== PROC INFO: PID %d ===\n", pid);
+    }
+
+    if (!proc || !kaddr_ok(proc)) {
+        buf_append("ERROR: could not find proc for PID %d\n", pid);
+        return buf_finish();
+    }
+
+    proc_info_t info;
+    if (gather_proc_info(proc, &info) != 0) {
+        buf_append("ERROR: gather_proc_info failed\n");
+        return buf_finish();
+    }
+
+    dump_proc_info(&info);
+
+    buf_append("\n--- Additional Details ---\n");
+    buf_append("  sandbox addr:   0x%llx\n", info.sandbox);
+    buf_append("  profile addr:   0x%llx\n", info.sandbox_profile);
+    buf_append("  extension_set:  0x%llx\n", info.extension_set);
+    buf_append("  cs_flags:       0x%x\n", info.cs_flags);
+
+    if (kaddr_ok(info.sandbox)) {
+        buf_append("\n--- Sandbox Structure (first 128 bytes) ---\n");
+        uint8_t sbdata[128];
+        kreadbuf(info.sandbox, sbdata, 128);
+        for (int i = 0; i < 128; i += 16) {
+            buf_append("  +%02x: ", i);
+            for (int j = 0; j < 16; j++) {
+                buf_append("%02x ", sbdata[i + j]);
+            }
+            buf_append("\n");
+        }
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_sandbox_check_op(const char *operation, const char *name) {
+    buf_init();
+
+    if (!operation || strlen(operation) == 0) {
+        buf_append("ERROR: operation string required\n");
+        return buf_finish();
+    }
+
+    buf_append("sandbox_check for operation: %s\n", operation);
+
+    int result;
+    if (name && strlen(name) > 0) {
+        buf_append("  with name: %s\n", name);
+
+        int filter_type = SANDBOX_FILTER_NONE;
+        if (strstr(operation, "file-") != NULL) {
+            filter_type = SANDBOX_FILTER_PATH;
+        } else if (strstr(operation, "mach-lookup") != NULL ||
+                   strstr(operation, "iokit-open") != NULL) {
+            filter_type = SANDBOX_FILTER_GLOBAL_NAME;
+        }
+
+        result = sandbox_check(getpid(), operation,
+                               filter_type | SANDBOX_CHECK_NO_REPORT, name);
+    } else {
+        result = sandbox_check(getpid(), operation,
+                               SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT);
+    }
+
+    buf_append("  result: %d (%s)\n", result, result == 0 ? "ALLOWED" : "DENIED");
+
+    return buf_finish();
+}
+
+char *kresearch_sandbox_dump(int offset, int size) {
+    buf_init();
+
+    proc_info_t self_info;
+    gather_proc_info(proc_self(), &self_info);
+
+    if (!kaddr_ok(self_info.sandbox)) {
+        buf_append("ERROR: no sandbox structure found\n");
+        return buf_finish();
+    }
+
+    if (size < 1) size = 128;
+    if (size > 1024) size = 1024;
+    if (offset < 0) offset = 0;
+
+    uint64_t addr = self_info.sandbox + (uint64_t)offset;
+    buf_append("Sandbox dump: sandbox=0x%llx offset=+0x%x size=%d\n",
+               self_info.sandbox, offset, size);
+    buf_append("  Reading from: 0x%llx\n\n", addr);
+
+    if (!kaddr_ok(addr)) {
+        buf_append("ERROR: resulting address 0x%llx is invalid\n", addr);
+        return buf_finish();
+    }
+
+    uint8_t *data = (uint8_t *)malloc(size);
+    kreadbuf(addr, data, size);
+
+    for (int i = 0; i < size; i += 16) {
+        buf_append("  +%04x: ", offset + i);
+        for (int j = 0; j < 16 && (i + j) < size; j++) {
+            buf_append("%02x ", data[i + j]);
+        }
+        buf_append(" |");
+        for (int j = 0; j < 16 && (i + j) < size; j++) {
+            uint8_t b = data[i + j];
+            buf_append("%c", (b >= 0x20 && b < 0x7f) ? b : '.');
+        }
+        buf_append("|\n");
+    }
+
+    buf_append("\nPointer values:\n");
+    int ptrCount = size / 8;
+    if (ptrCount > 64) ptrCount = 64;
+    for (int i = 0; i < ptrCount; i++) {
+        uint64_t val = 0;
+        memcpy(&val, data + (i * 8), 8);
+        if (val != 0) {
+            buf_append("  +0x%02x: 0x%016llx", offset + i * 8, val);
+            if (kaddr_ok(val)) buf_append(" (kptr)");
+            buf_append("\n");
+        }
+    }
+
+    free(data);
+    return buf_finish();
+}
+
+char *kresearch_dlsym_lookup(const char *framework_path, const char *symbol_name) {
+    buf_init();
+
+    if (!framework_path || !symbol_name) {
+        buf_append("ERROR: framework_path and symbol_name required\n");
+        return buf_finish();
+    }
+
+    buf_append("dlsym lookup: %s in %s\n", symbol_name, framework_path);
+
+    void *handle = dlopen(framework_path, RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        buf_append("ERROR: dlopen failed: %s\n", dlerror());
+        return buf_finish();
+    }
+
+    void *sym = dlsym(handle, symbol_name);
+    if (sym) {
+        buf_append("  address: %p (0x%llx)\n", sym, (uint64_t)sym);
+    } else {
+        buf_append("  NOT FOUND: %s\n", dlerror());
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_dlcall(const char *framework_path, const char *function_name,
+                       uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
+    buf_init();
+
+    if (!framework_path || !function_name) {
+        buf_append("ERROR: framework_path and function_name required\n");
+        return buf_finish();
+    }
+
+    buf_append("dlcall: %s(%llu, %llu, %llu, %llu)\n",
+               function_name, arg0, arg1, arg2, arg3);
+
+    void *handle = dlopen(framework_path, RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        buf_append("ERROR: dlopen failed: %s\n", dlerror());
+        return buf_finish();
+    }
+
+    typedef uint64_t (*func_ptr_t)(uint64_t, uint64_t, uint64_t, uint64_t);
+    func_ptr_t func = (func_ptr_t)dlsym(handle, function_name);
+    if (!func) {
+        buf_append("ERROR: dlsym failed: %s\n", dlerror());
+        return buf_finish();
+    }
+
+    buf_append("  function at: %p\n", func);
+
+    uint64_t result = func(arg0, arg1, arg2, arg3);
+    buf_append("  result: 0x%llx (%llu)\n", result, result);
+    if ((int64_t)result < 0 && (int64_t)result > -1000) {
+        buf_append("  (as signed: %lld — may be error code)\n", (int64_t)result);
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_run_command(const char *command_name) {
+    if (!command_name) return strdup("ERROR: command_name required");
+
+    if (strcmp(command_name, "dump_self") == 0)        return kresearch_dump_self();
+    if (strcmp(command_name, "dump_proc_1") == 0)      return kresearch_dump_proc(1);
+    if (strcmp(command_name, "compare") == 0)           return kresearch_compare_creds(1);
+    if (strcmp(command_name, "sandbox_ops") == 0)       return kresearch_check_sandbox_ops();
+    if (strcmp(command_name, "sandbox_profile") == 0)   return kresearch_dump_sandbox_profile();
+    if (strcmp(command_name, "swap_profile") == 0)      return kresearch_swap_sandbox_profile();
+    if (strcmp(command_name, "exec_ext") == 0)          return kresearch_add_exec_extension();
+    if (strcmp(command_name, "test_spawn") == 0)        return kresearch_test_spawn();
+    if (strcmp(command_name, "breadcrumbs") == 0)       return kresearch_read_breadcrumbs();
+
+    char *msg = (char *)malloc(512);
+    snprintf(msg, 512,
+        "ERROR: unknown command '%s'. Available commands:\n"
+        "  dump_self, dump_proc_1, compare, sandbox_ops, sandbox_profile,\n"
+        "  swap_profile, exec_ext, test_spawn, breadcrumbs",
+        command_name);
+    return msg;
+}
+
+char *kresearch_proc_list(const char *name_filter) {
+    buf_init();
+
+    uint64_t self_proc = proc_self();
+    if (!self_proc || !kaddr_ok(self_proc)) {
+        buf_append("ERROR: proc_self() failed — kernel r/w not available\n");
+        return buf_finish();
+    }
+
+    buf_append("=== KERNEL PROCESS LIST ===\n");
+    if (name_filter && strlen(name_filter) > 0) {
+        buf_append("Filter: '%s'\n", name_filter);
+    }
+    buf_append("\n");
+
+    int shown = 0;
+    for (pid_t pid = 0; pid < 2000; pid++) {
+        uint64_t proc = proc_find(pid);
+        if (!proc || !kaddr_ok(proc)) continue;
+
+        char name[32] = {0};
+        kreadbuf(proc + off_proc_p_name, name, 31);
+
+        if (name_filter && strlen(name_filter) > 0 &&
+            strcasestr(name, name_filter) == NULL) {
+            continue;
+        }
+
+        uint64_t proc_ro = kread_ptr(proc + off_proc_p_proc_ro);
+        uint32_t uid = 0;
+        if (kaddr_ok(proc_ro)) {
+            uint64_t ucred = kread_ptr(proc_ro + off_proc_ro_p_ucred);
+            if (kaddr_ok(ucred)) {
+                uid = kread32(ucred + 0x18);
+            }
+        }
+
+        buf_append("  PID %5d  uid=%u  proc=0x%llx  %s\n",
+                   pid, uid, proc, name);
+        shown++;
+        if (shown >= 200) {
+            buf_append("  ... (limited to 200 results)\n");
+            break;
+        }
+    }
+
+    buf_append("\nTotal shown: %d\n", shown);
+    return buf_finish();
+}

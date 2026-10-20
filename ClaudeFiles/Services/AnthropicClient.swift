@@ -484,6 +484,78 @@ enum FileToolDefinitions {
                     "destination": Prop(description: "Absolute path of the destination"),
                     "move": Prop(description: "Set to 'true' to move instead of copy (default: copy)")
                 ], required: ["source", "destination"])),
+
+        // ── Kernel Research Primitives ──────────────────────────────────
+
+        ToolDef(name: "kernel_read",
+                description: "Read N bytes from a kernel virtual address. Returns hex dump with ASCII and pointer-sized value annotations. Use to inspect any kernel memory region.",
+                inputSchema: Schema(properties: [
+                    "address": Prop(description: "Kernel virtual address (decimal uint64)"),
+                    "size": Prop(description: "Number of bytes to read (1-4096, default 64)")
+                ], required: ["address"])),
+
+        ToolDef(name: "kernel_read64",
+                description: "Read a single 64-bit value from a kernel address. Shows hex, decimal, and whether it looks like a kernel pointer. If it is a pointer, also dereferences it one level.",
+                inputSchema: Schema(properties: [
+                    "address": Prop(description: "Kernel virtual address (decimal uint64)")
+                ], required: ["address"])),
+
+        ToolDef(name: "kernel_follow_chain",
+                description: "Follow a chain of kernel pointers. Reads ptr at base+offset[0], then at result+offset[1], etc. Essential for walking kernel data structures like proc→proc_ro→ucred→label.",
+                inputSchema: Schema(properties: [
+                    "base": Prop(description: "Starting kernel address (decimal uint64)"),
+                    "offsets": Prop(description: "Comma-separated offsets in hex (0x10,0x20) or decimal (16,32)")
+                ], required: ["base", "offsets"])),
+
+        ToolDef(name: "kernel_proc_info",
+                description: "Get detailed kernel proc_info for a process by PID. Returns proc, proc_ro, ucred, sandbox, profile, extension_set addresses plus credential fields. Use pid=0 for our own process.",
+                inputSchema: Schema(properties: [
+                    "pid": Prop(description: "Process ID (0 = self)")
+                ], required: ["pid"])),
+
+        ToolDef(name: "kernel_sandbox_check",
+                description: "Check if a sandbox operation is allowed or denied for our process. Operations: process-exec, process-fork, mach-lookup, file-read-data, file-write-data, iokit-open, etc.",
+                inputSchema: Schema(properties: [
+                    "operation": Prop(description: "Sandbox operation string (e.g. 'process-exec', 'mach-lookup')"),
+                    "name": Prop(description: "Optional target name/path for the operation (e.g. service name for mach-lookup, path for file ops)")
+                ], required: ["operation"])),
+
+        ToolDef(name: "kernel_sandbox_dump",
+                description: "Dump bytes from our process's sandbox structure at a given offset. Returns hex dump with pointer annotations. The sandbox struct contains the profile pointer, extension set, and other fields.",
+                inputSchema: Schema(properties: [
+                    "offset": Prop(description: "Byte offset from sandbox structure base (default 0)"),
+                    "size": Prop(description: "Number of bytes to dump (1-1024, default 128)")
+                ], required: [])),
+
+        ToolDef(name: "kernel_dlsym",
+                description: "Look up a symbol address using dlsym in a given framework. Use to find private API function pointers.",
+                inputSchema: Schema(properties: [
+                    "framework": Prop(description: "Framework path (e.g. '/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices')"),
+                    "symbol": Prop(description: "Symbol name (e.g. 'SBSLaunchApplicationWithIdentifier')")
+                ], required: ["framework", "symbol"])),
+
+        ToolDef(name: "kernel_dlcall",
+                description: "Call a function from a dynamically loaded framework with up to 4 uint64 arguments. Returns the uint64 return value. Use carefully — calling the wrong function can crash.",
+                inputSchema: Schema(properties: [
+                    "framework": Prop(description: "Framework path"),
+                    "function": Prop(description: "Function name"),
+                    "arg0": Prop(description: "First argument (decimal uint64, default 0)"),
+                    "arg1": Prop(description: "Second argument (decimal uint64, default 0)"),
+                    "arg2": Prop(description: "Third argument (decimal uint64, default 0)"),
+                    "arg3": Prop(description: "Fourth argument (decimal uint64, default 0)")
+                ], required: ["framework", "function"])),
+
+        ToolDef(name: "kernel_run_command",
+                description: "Run a named research command from the existing research toolkit. Available: dump_self, dump_proc_1, compare, sandbox_ops, sandbox_profile, swap_profile, exec_ext, test_spawn, breadcrumbs.",
+                inputSchema: Schema(properties: [
+                    "command": Prop(description: "Command name (e.g. 'dump_self', 'sandbox_ops')")
+                ], required: ["command"])),
+
+        ToolDef(name: "kernel_proc_list",
+                description: "Walk the kernel process list and return info about all (or filtered) processes. Shows PID, UID, proc address, and name for each process.",
+                inputSchema: Schema(properties: [
+                    "filter": Prop(description: "Optional name substring filter (case-insensitive). Empty or omitted = show all.")
+                ], required: [])),
     ]
 }
 

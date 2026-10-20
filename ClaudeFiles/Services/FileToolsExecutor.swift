@@ -80,8 +80,91 @@ final class FileToolsExecutor {
         case "copy_move_file": return copyMoveFile(source: input["source"]?.string ?? "",
                                                      destination: input["destination"]?.string ?? "",
                                                      move: input["move"]?.string == "true")
+
+        // ── Kernel Research Primitives ──────────────────────────────────
+
+        case "kernel_read":
+            let addr = parseUInt64(input["address"])
+            let size = parseInt(input["size"]) ?? 64
+            return callKResearch { kresearch_kread(addr, Int32(size)) }
+
+        case "kernel_read64":
+            let addr = parseUInt64(input["address"])
+            return callKResearch { kresearch_kread64(addr) }
+
+        case "kernel_follow_chain":
+            let base = parseUInt64(input["base"])
+            let offsets = input["offsets"]?.string ?? ""
+            return callKResearch { kresearch_follow_chain(base, offsets) }
+
+        case "kernel_proc_info":
+            let pid = parseInt(input["pid"]) ?? 0
+            return callKResearch { kresearch_proc_info(Int32(pid)) }
+
+        case "kernel_sandbox_check":
+            let op = input["operation"]?.string ?? ""
+            let nm = input["name"]?.string ?? ""
+            return callKResearch { kresearch_sandbox_check_op(op, nm) }
+
+        case "kernel_sandbox_dump":
+            let off = parseInt(input["offset"]) ?? 0
+            let sz  = parseInt(input["size"]) ?? 128
+            return callKResearch { kresearch_sandbox_dump(Int32(off), Int32(sz)) }
+
+        case "kernel_dlsym":
+            let fw  = input["framework"]?.string ?? ""
+            let sym = input["symbol"]?.string ?? ""
+            return callKResearch { kresearch_dlsym_lookup(fw, sym) }
+
+        case "kernel_dlcall":
+            let fw = input["framework"]?.string ?? ""
+            let fn = input["function"]?.string ?? ""
+            let a0 = parseUInt64(input["arg0"])
+            let a1 = parseUInt64(input["arg1"])
+            let a2 = parseUInt64(input["arg2"])
+            let a3 = parseUInt64(input["arg3"])
+            return callKResearch { kresearch_dlcall(fw, fn, a0, a1, a2, a3) }
+
+        case "kernel_run_command":
+            let cmd = input["command"]?.string ?? ""
+            return callKResearch { kresearch_run_command(cmd) }
+
+        case "kernel_proc_list":
+            let filter = input["filter"]?.string ?? ""
+            return callKResearch { kresearch_proc_list(filter) }
+
         default:               return "Unknown tool: \(name)"
         }
+    }
+
+    // MARK: - Kernel Research Helpers
+
+    /// Call a C kernel research function that returns a malloc'd string.
+    private func callKResearch(_ fn: () -> UnsafeMutablePointer<CChar>?) -> String {
+        guard let result = fn() else {
+            return "ERROR: kernel research function returned NULL — exploit may not be initialized"
+        }
+        let str = String(cString: result)
+        free(result)
+        return str
+    }
+
+    /// Parse a UInt64 from AnyJSON — handles both string ("0xffffffe1234") and number cases.
+    private func parseUInt64(_ val: AnyJSON?) -> UInt64 {
+        if let n = val?.uint64Value { return n }
+        guard let s = val?.string, !s.isEmpty else { return 0 }
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("0x") || trimmed.hasPrefix("0X") {
+            return UInt64(trimmed.dropFirst(2), radix: 16) ?? 0
+        }
+        return UInt64(trimmed) ?? 0
+    }
+
+    /// Parse an Int from AnyJSON — handles both string and number cases.
+    private func parseInt(_ val: AnyJSON?) -> Int? {
+        if let n = val?.intValue { return n }
+        guard let s = val?.string, !s.isEmpty else { return nil }
+        return Int(s)
     }
 
     private func readFile(path: String) -> String {

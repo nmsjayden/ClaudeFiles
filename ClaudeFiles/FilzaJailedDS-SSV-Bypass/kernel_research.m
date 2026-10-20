@@ -33,12 +33,7 @@
 // We resolve mach_vm_allocate/protect/deallocate via dlsym at runtime
 // to avoid linker issues (symbols may not be in tbd stubs).
 
-// sandbox_check is private API
-extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
-#define SANDBOX_FILTER_PATH          (1 << 0)
-#define SANDBOX_CHECK_NO_REPORT      (1 << 9)
-#define SANDBOX_FILTER_GLOBAL_NAME   (1 << 1)
-#define SANDBOX_FILTER_NONE          0
+// sandbox_check and filter constants now provided by kexploit/sandbox.h
 
 // ── Helpers ──
 

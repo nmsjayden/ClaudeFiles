@@ -107,4 +107,25 @@ char *kresearch_run_command(const char *command_name);
 /// Returns a malloc'd string (caller must free).
 char *kresearch_proc_list(const char *name_filter);
 
+// ────────────────────────────────────────────────────────────────────
+// Kernel WRITE primitives + advanced test tools
+// ────────────────────────────────────────────────────────────────────
+
+/// [WRITE] Write a single 64-bit value to a kernel address.
+/// Returns a malloc'd string confirming the write + readback.
+char *kresearch_kwrite64(uint64_t address, uint64_t value);
+
+/// [WRITE] Write arbitrary bytes (hex string) to a kernel address.
+/// hex_data is a hex string like "00000000" or "ff ff ff ff".
+/// Returns a malloc'd string confirming the write + readback.
+char *kresearch_kwrite(uint64_t address, const char *hex_data);
+
+/// Test posix_spawn with a specific binary and args string.
+/// Returns detailed error reporting including errno and sandbox deny info.
+char *kresearch_posix_spawn_test(const char *binary_path, const char *args_str);
+
+/// Attempt to consume a sandbox extension token string.
+/// Returns a malloc'd string with the result (handle or error).
+char *kresearch_sandbox_ext_consume(const char *token);
+
 #endif /* kernel_research_h */

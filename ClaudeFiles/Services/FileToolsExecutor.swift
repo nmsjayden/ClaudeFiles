@@ -133,6 +133,27 @@ final class FileToolsExecutor {
             let filter = input["filter"]?.string ?? ""
             return callKResearch { kresearch_proc_list(filter) }
 
+        // ── Kernel WRITE + Advanced Test Tools ─────────────────────────
+
+        case "kernel_write64":
+            let addr = parseUInt64(input["address"])
+            let val  = parseUInt64(input["value"])
+            return callKResearch { kresearch_kwrite64(addr, val) }
+
+        case "kernel_write":
+            let addr = parseUInt64(input["address"])
+            let hex  = input["hex_data"]?.string ?? ""
+            return callKResearch { kresearch_kwrite(addr, hex) }
+
+        case "posix_spawn_test":
+            let bin  = input["binary"]?.string ?? ""
+            let args = input["args"]?.string ?? ""
+            return callKResearch { kresearch_posix_spawn_test(bin, args) }
+
+        case "sandbox_ext_consume":
+            let tok = input["token"]?.string ?? ""
+            return callKResearch { kresearch_sandbox_ext_consume(tok) }
+
         default:               return "Unknown tool: \(name)"
         }
     }

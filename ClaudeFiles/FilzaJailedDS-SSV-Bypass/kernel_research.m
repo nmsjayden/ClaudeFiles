@@ -27,6 +27,7 @@
 #import <objc/runtime.h>
 #import <fcntl.h>
 #import <xpc/xpc.h>
+#import "kexploit/sandbox.h"
 
 // mach_vm.h is not available in iOS SDK.
 // We resolve mach_vm_allocate/protect/deallocate via dlsym at runtime
@@ -2086,5 +2087,297 @@ char *kresearch_proc_list(const char *name_filter) {
     }
 
     buf_append("\nTotal shown: %d\n", shown);
+    return buf_finish();
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Kernel WRITE primitives + advanced test tools
+// ════════════════════════════════════════════════════════════════════
+
+char *kresearch_kwrite64(uint64_t address, uint64_t value) {
+    buf_init();
+
+    if (!kaddr_ok(address)) {
+        buf_append("ERROR: invalid kernel address 0x%llx\n", address);
+        return buf_finish();
+    }
+
+    // Read before
+    uint64_t before = kread64(address);
+    buf_append("kwrite64 @ 0x%llx:\n", address);
+    buf_append("  before: 0x%016llx\n", before);
+    buf_append("  writing: 0x%016llx\n", value);
+
+    // Do the write
+    kwrite64(address, value);
+
+    // Read back to confirm
+    uint64_t after = kread64(address);
+    buf_append("  after:  0x%016llx\n", after);
+
+    if (after == value) {
+        buf_append("  STATUS: WRITE CONFIRMED ✓\n");
+    } else if (after == before) {
+        buf_append("  STATUS: WRITE FAILED — value unchanged (PPL/SPTM protected?)\n");
+    } else {
+        buf_append("  STATUS: WRITE PARTIAL — value changed but not to expected\n");
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_kwrite(uint64_t address, const char *hex_data) {
+    buf_init();
+
+    if (!kaddr_ok(address)) {
+        buf_append("ERROR: invalid kernel address 0x%llx\n", address);
+        return buf_finish();
+    }
+
+    if (!hex_data || strlen(hex_data) == 0) {
+        buf_append("ERROR: hex_data required (e.g. \"00000000\" or \"ff ff ff\")\n");
+        return buf_finish();
+    }
+
+    // Parse hex string into bytes — skip spaces
+    uint8_t bytes[512];
+    int byte_count = 0;
+    const char *p = hex_data;
+    while (*p && byte_count < 512) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        char hi = *p++;
+        if (!*p) { buf_append("ERROR: odd number of hex chars\n"); return buf_finish(); }
+        char lo = *p++;
+
+        int h = (hi >= '0' && hi <= '9') ? hi - '0' :
+                (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
+                (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
+        int l = (lo >= '0' && lo <= '9') ? lo - '0' :
+                (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
+                (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
+        if (h < 0 || l < 0) {
+            buf_append("ERROR: invalid hex char near '%c%c'\n", hi, lo);
+            return buf_finish();
+        }
+        bytes[byte_count++] = (uint8_t)((h << 4) | l);
+    }
+
+    buf_append("kwrite @ 0x%llx, %d bytes:\n", address, byte_count);
+
+    // Read before
+    uint8_t before[512];
+    kreadbuf(address, before, byte_count);
+    buf_append("  before: ");
+    for (int i = 0; i < byte_count && i < 32; i++) buf_append("%02x ", before[i]);
+    if (byte_count > 32) buf_append("...");
+    buf_append("\n");
+
+    buf_append("  writing: ");
+    for (int i = 0; i < byte_count && i < 32; i++) buf_append("%02x ", bytes[i]);
+    if (byte_count > 32) buf_append("...");
+    buf_append("\n");
+
+    // Write
+    kwritebuf(address, bytes, byte_count);
+
+    // Read back
+    uint8_t after[512];
+    kreadbuf(address, after, byte_count);
+    buf_append("  after:  ");
+    for (int i = 0; i < byte_count && i < 32; i++) buf_append("%02x ", after[i]);
+    if (byte_count > 32) buf_append("...");
+    buf_append("\n");
+
+    // Verify
+    int matches = 1;
+    for (int i = 0; i < byte_count; i++) {
+        if (after[i] != bytes[i]) { matches = 0; break; }
+    }
+
+    if (matches) {
+        buf_append("  STATUS: WRITE CONFIRMED ✓ (%d bytes written)\n", byte_count);
+    } else {
+        int unchanged = 1;
+        for (int i = 0; i < byte_count; i++) {
+            if (after[i] != before[i]) { unchanged = 0; break; }
+        }
+        if (unchanged) {
+            buf_append("  STATUS: WRITE FAILED — memory unchanged (PPL/SPTM protected?)\n");
+        } else {
+            buf_append("  STATUS: WRITE PARTIAL — some bytes changed but not all\n");
+        }
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_posix_spawn_test(const char *binary_path, const char *args_str) {
+    buf_init();
+
+    if (!binary_path || strlen(binary_path) == 0) {
+        buf_append("ERROR: binary_path required\n");
+        return buf_finish();
+    }
+
+    buf_append("=== posix_spawn test ===\n");
+    buf_append("  binary: %s\n", binary_path);
+    if (args_str && strlen(args_str) > 0) {
+        buf_append("  args: %s\n", args_str);
+    }
+
+    // Check if binary exists
+    if (access(binary_path, F_OK) != 0) {
+        buf_append("  WARNING: binary not found at path (errno %d: %s)\n",
+                   errno, strerror(errno));
+        buf_append("  Attempting spawn anyway...\n");
+    } else {
+        buf_append("  binary exists: YES\n");
+        if (access(binary_path, X_OK) == 0) {
+            buf_append("  executable: YES\n");
+        } else {
+            buf_append("  executable: NO (errno %d: %s)\n", errno, strerror(errno));
+        }
+    }
+
+    // Pre-spawn sandbox check
+    int sb_exec = sandbox_check(getpid(), "process-exec",
+                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
+                                binary_path);
+    buf_append("  sandbox_check(process-exec, %s): %s\n",
+               binary_path, sb_exec == 0 ? "ALLOWED" : "DENIED");
+
+    int sb_fork = sandbox_check(getpid(), "process-fork",
+                                SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT);
+    buf_append("  sandbox_check(process-fork): %s\n",
+               sb_fork == 0 ? "ALLOWED" : "DENIED");
+
+    // Build argv
+    char *argv[32] = {0};
+    argv[0] = (char *)binary_path;
+    int argc = 1;
+
+    if (args_str && strlen(args_str) > 0) {
+        char *args_copy = strdup(args_str);
+        char *save = NULL;
+        char *tok = strtok_r(args_copy, " ", &save);
+        while (tok && argc < 31) {
+            argv[argc++] = tok;
+            tok = strtok_r(NULL, " ", &save);
+        }
+        // Note: args_copy leaked — acceptable for research tool
+    }
+    argv[argc] = NULL;
+
+    // Spawn attributes — SETEXEC to try in-process exec as fallback data
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    // Environment
+    char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL};
+
+    pid_t child = -1;
+    errno = 0;
+    int ret = posix_spawn(&child, binary_path, NULL, &attr, argv, envp);
+    int spawn_errno = errno;
+    posix_spawnattr_destroy(&attr);
+
+    buf_append("\n  posix_spawn returned: %d\n", ret);
+    if (ret == 0) {
+        buf_append("  ✅ SUCCESS! child PID = %d\n", child);
+        int status = 0;
+        waitpid(child, &status, WNOHANG);
+        if (WIFEXITED(status)) {
+            buf_append("  child exit code: %d\n", WEXITSTATUS(status));
+        } else {
+            buf_append("  child still running or signaled\n");
+        }
+    } else {
+        buf_append("  ❌ FAILED: %d (%s)\n", ret, strerror(ret));
+        if (spawn_errno != 0 && spawn_errno != ret) {
+            buf_append("  errno: %d (%s)\n", spawn_errno, strerror(spawn_errno));
+        }
+        switch (ret) {
+            case EPERM:
+                buf_append("  → EPERM: sandbox or AMFI denied execution\n");
+                break;
+            case ENOENT:
+                buf_append("  → ENOENT: binary not found\n");
+                break;
+            case EACCES:
+                buf_append("  → EACCES: permission denied (filesystem)\n");
+                break;
+            case ENOEXEC:
+                buf_append("  → ENOEXEC: not executable (code signing?)\n");
+                break;
+            default:
+                break;
+        }
+    }
+
+    return buf_finish();
+}
+
+char *kresearch_sandbox_ext_consume(const char *token) {
+    buf_init();
+
+    if (!token || strlen(token) == 0) {
+        buf_append("ERROR: extension token string required\n");
+        return buf_finish();
+    }
+
+    buf_append("=== sandbox_extension_consume ===\n");
+    buf_append("  token: %.80s%s\n", token, strlen(token) > 80 ? "..." : "");
+    buf_append("  token length: %zu\n", strlen(token));
+
+    // Try to consume it
+    int64_t handle = sandbox_extension_consume(token);
+    buf_append("  result handle: %lld\n", handle);
+
+    if (handle > 0) {
+        buf_append("  ✅ SUCCESS — extension consumed (handle=%lld)\n", handle);
+        buf_append("  Extension is now active for this process.\n");
+
+        // Re-check some operations
+        int exec_check = sandbox_check(getpid(), "process-exec",
+                                       SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT);
+        int fork_check = sandbox_check(getpid(), "process-fork",
+                                       SANDBOX_FILTER_NONE | SANDBOX_CHECK_NO_REPORT);
+        buf_append("  post-consume process-exec: %s\n",
+                   exec_check == 0 ? "ALLOWED" : "DENIED");
+        buf_append("  post-consume process-fork: %s\n",
+                   fork_check == 0 ? "ALLOWED" : "DENIED");
+    } else if (handle == 0) {
+        buf_append("  ❌ FAILED — returned 0 (invalid token?)\n");
+    } else {
+        buf_append("  ❌ FAILED — returned %lld (error)\n", handle);
+    }
+
+    // Also try sandbox_extension_issue_file for reference
+    buf_append("\n--- Attempting to issue extensions ---\n");
+
+    char *file_ext = sandbox_extension_issue_file(APP_SANDBOX_READ,
+                                                   "/bin/sh", 0);
+    if (file_ext) {
+        buf_append("  issue_file(READ, /bin/sh): %.80s...\n", file_ext);
+        buf_append("  token length: %zu\n", strlen(file_ext));
+        free(file_ext);
+    } else {
+        buf_append("  issue_file(READ, /bin/sh): FAILED (NULL)\n");
+    }
+
+    char *exec_ext = sandbox_extension_issue_file("com.apple.sandbox.executable",
+                                                   "/bin/sh", 0);
+    if (exec_ext) {
+        buf_append("  issue_file(executable, /bin/sh): %.80s...\n", exec_ext);
+        int64_t h2 = sandbox_extension_consume(exec_ext);
+        buf_append("  consume result: %lld\n", h2);
+        free(exec_ext);
+    } else {
+        buf_append("  issue_file(executable, /bin/sh): FAILED (NULL)\n");
+    }
+
     return buf_finish();
 }

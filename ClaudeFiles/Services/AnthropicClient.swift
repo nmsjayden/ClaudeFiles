@@ -556,6 +556,35 @@ enum FileToolDefinitions {
                 inputSchema: Schema(properties: [
                     "filter": Prop(description: "Optional name substring filter (case-insensitive). Empty or omitted = show all.")
                 ], required: [])),
+
+        // ── Kernel WRITE + Advanced Test Tools ─────────────────────────
+
+        ToolDef(name: "kernel_write64",
+                description: "[WRITE] Write a single 64-bit value to a kernel address. Reads before and after to confirm. Reports whether write succeeded or was blocked by PPL/SPTM.",
+                inputSchema: Schema(properties: [
+                    "address": Prop(description: "Kernel virtual address (decimal or hex string like '0xffffffe1234')"),
+                    "value": Prop(description: "Value to write (decimal or hex string)")
+                ], required: ["address", "value"])),
+
+        ToolDef(name: "kernel_write",
+                description: "[WRITE] Write arbitrary bytes to a kernel address. Reads before and after to confirm. Reports whether write succeeded or was blocked.",
+                inputSchema: Schema(properties: [
+                    "address": Prop(description: "Kernel virtual address (decimal or hex string)"),
+                    "hex_data": Prop(description: "Hex bytes to write, e.g. '0000000000000000' or 'ff ff ff ff'")
+                ], required: ["address", "hex_data"])),
+
+        ToolDef(name: "posix_spawn_test",
+                description: "Test posix_spawn with a specific binary path. Does pre-flight sandbox checks, then attempts the spawn. Reports detailed success/failure info including errno.",
+                inputSchema: Schema(properties: [
+                    "binary": Prop(description: "Absolute path to binary (e.g. '/bin/sh', '/usr/bin/id')"),
+                    "args": Prop(description: "Optional space-separated arguments")
+                ], required: ["binary"])),
+
+        ToolDef(name: "sandbox_ext_consume",
+                description: "Consume a sandbox extension token string. Also attempts to issue file extensions for /bin/sh as a test. Reports handle and post-consume sandbox state.",
+                inputSchema: Schema(properties: [
+                    "token": Prop(description: "Sandbox extension token string to consume")
+                ], required: ["token"])),
     ]
 }
 

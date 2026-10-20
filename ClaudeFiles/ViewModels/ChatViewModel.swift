@@ -227,7 +227,7 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 29 tools:
+    the FilzaJailedDS kernel exploit (opa334). You have 33 tools:
     - read_file, write_file, list_directory, search_files, get_file_info
     - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
     - grep_search: search file contents for a pattern
@@ -323,6 +323,14 @@ final class ChatViewModel: ObservableObject {
     dump_proc_1, compare, sandbox_ops, sandbox_profile, swap_profile, exec_ext, \
     test_spawn, breadcrumbs.
     - kernel_proc_list(filter): Walk kernel proc list. Optional name filter (case-insensitive).
+    - kernel_write64(address, value): [WRITE] Write a uint64 to a kernel address. Reads \
+    before/after to confirm. Reports if PPL/SPTM blocked the write.
+    - kernel_write(address, hex_data): [WRITE] Write arbitrary bytes (hex string like \
+    "0000000000000000") to a kernel address. Confirms with readback.
+    - posix_spawn_test(binary, args): Test posix_spawn with a specific binary. Does \
+    sandbox pre-checks, attempts spawn, reports detailed errno.
+    - sandbox_ext_consume(token): Consume a sandbox extension token. Also tries to \
+    issue extensions for /bin/sh as a test.
 
     KERNEL RESEARCH METHODOLOGY:
     When investigating the kernel or researching SPTM bypass vectors, follow this approach:

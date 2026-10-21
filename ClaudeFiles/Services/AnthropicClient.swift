@@ -591,8 +591,19 @@ enum FileToolDefinitions {
                 description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Checks BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which layout is correct. ALWAYS run this before patch_exec.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "patch_exec",
-                description: "WRITE — Attempt to add a process-exec sandbox extension using the SAME kwrite path the filesystem sandbox escape uses (writes ONLY to extension_set memory — writable kernel heap). Searches all 16 buckets. Clones the existing filesystem extension with class 'com.apple.sandbox.executable', links it into an empty bucket, then tests sandbox_check and posix_spawn. This is the SPTM bypass attempt. Run dump_extensions FIRST to verify struct offsets.",
+                description: "WRITE — v2 with CONFIRMED LARA offsets (class_name at +0x10, ext at +0x08). Adds a 'com.apple.sandbox.executable' extension to the extension_set using kwrite on writable kernel heap. Handles all-buckets-full by prepending to chain. Tests sandbox_check + posix_spawn on /bin/sh, /usr/bin/env, /bin/df, /bin/ps. Run dump_extensions FIRST.",
                 inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "try_profile_swap",
+                description: "WRITE — RISKY. Tries 3 approaches to bypass sandbox: (1) Copy target PID's sandbox profile pointer into ours, (2) Write NULL as profile, (3) Zero the flags at sandbox+0x50/+0x58. Tests sandbox_check after each. Auto-restores on failure. Default target PID is SpringBoard (usually 34). The sandbox_label is on writable heap so writes won't crash, but the sandbox evaluator might.",
+                inputSchema: Schema(properties: [
+                    "target_pid": Prop(description: "PID to copy profile from (default: 34 for SpringBoard)")
+                ], required: [])),
+        ToolDef(name: "sandbox_label_write",
+                description: "WRITE — Write a 64-bit value to sandbox_label+offset. Generic tool for experimenting with sandbox label fields. Reports before/after values and tests sandbox_check. Use offset 0x00 for profile ptr, 0x10 for extension_set, 0x50/0x58 for flags.",
+                inputSchema: Schema(properties: [
+                    "offset": Prop(description: "Offset within sandbox_label (0x00-0x78, hex or decimal)"),
+                    "value": Prop(description: "64-bit value to write (hex with 0x prefix or decimal)")
+                ], required: ["offset", "value"])),
     ]
 }
 

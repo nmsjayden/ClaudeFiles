@@ -69,6 +69,17 @@ struct extension_class_node {
 // from our data_ptr (0x18) and path_len (0x20). Our layout works for
 // patch_sandbox_ext on our device. dump_extensions includes raw hex dumps
 // so we can empirically verify which offsets contain valid data.
+// LARA class_node layout (confirmed correct on our iOS 18.1 device):
+//   +0x00 = next (pointer to next class_node in bucket chain)
+//   +0x08 = ext_list_head (pointer to first extension in this class)
+//   +0x10 = class_name (pointer to class name string)
+//   +0x18 = count
+// Our struct has class_name at +0x00 and next at +0x08 — WRONG for this device.
+#define LARA_CN_NEXT       0x00
+#define LARA_CN_EXT        0x08
+#define LARA_CN_CLASSNAME  0x10
+#define LARA_CN_COUNT      0x18
+
 #define LARA_OFF_EXT_DATA    0x40
 #define LARA_OFF_EXT_DATALEN 0x48
 #define EXTENSION_RAW_SIZE   0x60  // how many bytes to raw-dump per extension

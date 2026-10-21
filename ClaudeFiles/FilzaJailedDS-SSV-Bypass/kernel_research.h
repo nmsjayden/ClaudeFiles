@@ -142,8 +142,25 @@ char *kresearch_dump_extensions(void);
 
 /// [WRITE — SAFE] Attempt to add a process-exec sandbox extension
 /// using the same kwrite path that the filesystem sandbox escape uses.
+/// Uses LARA class_node layout (confirmed: class_name at +0x10, ext at +0x08).
+/// Handles all-buckets-full by prepending to an existing bucket chain.
 /// Only writes to extension_set memory (writable kernel heap).
 /// Returns a malloc'd string describing what happened.
 char *kresearch_patch_exec(void);
+
+/// [WRITE — RISKY] Swap our sandbox profile pointer with another process's.
+/// Reads the target PID's sandbox_label→profile pointer and writes it into ours.
+/// Also tries writing NULL (0x0) as profile pointer.
+/// The sandbox_label is on writable heap, so the write itself won't crash,
+/// but the sandbox evaluator might crash if it can't handle the new profile.
+/// Saves the original value so it can be restored.
+/// Returns a malloc'd string describing what happened.
+char *kresearch_try_profile_swap(int target_pid);
+
+/// [WRITE] Write a 64-bit value to sandbox_label + offset.
+/// Generic tool for experimenting with sandbox_label fields.
+/// Reports before/after values.
+/// Returns a malloc'd string (caller must free).
+char *kresearch_sandbox_label_write(int offset, uint64_t value);
 
 #endif /* kernel_research_h */

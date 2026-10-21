@@ -227,7 +227,7 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 35 tools:
+    the FilzaJailedDS kernel exploit (opa334). You have 37 tools:
     - read_file, write_file, list_directory, search_files, get_file_info
     - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
     - grep_search: search file contents for a pattern
@@ -335,11 +335,19 @@ final class ChatViewModel: ObservableObject {
     detail: class names, paths, flags, linked list structure, and RAW HEX DUMPS. It checks \
     BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which \
     layout is correct on this device. ALWAYS run this first before patch_exec.
-    - patch_exec(): WRITE. Adds a process-exec sandbox extension using the SAME kwrite \
-    path the filesystem sandbox escape uses. Only writes to extension_set memory (writable \
-    kernel heap). Searches all 16 buckets. Clones the existing filesystem extension with \
-    class 'com.apple.sandbox.executable', tests sandbox_check and posix_spawn after. THIS \
-    IS THE SPTM BYPASS ATTEMPT — call dump_extensions first to verify struct offsets.
+    - patch_exec(): WRITE — v2 with CONFIRMED LARA offsets (class_name at +0x10, ext at \
+    +0x08 in class_node). Adds a 'com.apple.sandbox.executable' extension to the extension_set \
+    using kwrite on writable kernel heap. Handles all-buckets-full by prepending to chain. \
+    Tests sandbox_check + posix_spawn on /bin/sh, /usr/bin/env, /bin/df, /bin/ps.
+    - try_profile_swap(target_pid): WRITE — RISKY. Tries 3 approaches: (1) Copy target PID's \
+    sandbox profile pointer into ours, (2) Write NULL as profile, (3) Zero sandbox flags at \
+    +0x50/+0x58. Tests sandbox_check after each. Auto-restores on failure. Default: PID 34 \
+    (SpringBoard). The sandbox_label is writable heap so writes won't crash, but the sandbox \
+    evaluator might.
+    - sandbox_label_write(offset, value): WRITE — Write a 64-bit value to sandbox_label+offset. \
+    Generic tool for experimenting with sandbox label fields. Reports before/after values and \
+    tests sandbox_check. Use offset 0x00 for profile ptr, 0x10 for extension_set, 0x50/0x58 \
+    for flags.
 
     KERNEL RESEARCH METHODOLOGY:
     When investigating the kernel or researching SPTM bypass vectors, follow this approach:
@@ -355,6 +363,23 @@ final class ChatViewModel: ObservableObject {
     (proc_ro, ucred, mac_label) are READ-ONLY. The sandbox_label struct itself IS writable \
     but sandbox_check still enforces profile rules. posix_spawn currently fails with EPERM. \
     The goal: find a way to execute arbitrary binaries from the app.
+
+    CONFIRMED FINDINGS FROM PREVIOUS RESEARCH:
+    - LARA class_node layout is CORRECT: next=+0x00, ext=+0x08, class_name=+0x10, count=+0x18
+    - Our class_node layout (class_name=+0x00) is WRONG — reads empty strings
+    - LARA extension offsets confirmed: data_ptr at +0x40, data_len at +0x48
+    - All 16 extension set buckets are populated (no empty ones)
+    - Extension classes found: com.apple.assets.read (bucket 0), com.apple.app-sandbox.read-write \
+    (buckets 1-5, 8, 10-15), com.apple.Pasteboard-readonly (bucket 7)
+    - com.apple.sandbox.executable is NOT present — this is what patch_exec adds
+    - sandbox_label+0x00 = profile ptr (writable), +0x10 = extension_set ptr, \
+    +0x50 = 0xa0 (flags?), +0x58 = 0x01 (flags?)
+    - launchd (PID 1) has no sandbox (ptr=0xffffffffffffffff)
+    - SpringBoard (PID 34) has a different, larger sandbox profile
+
+    STRATEGY: Run patch_exec first (extension injection). If sandbox still denies exec, \
+    try try_profile_swap to copy SpringBoard's profile or NULL the profile pointer. \
+    If both fail, use sandbox_label_write to experiment with other fields.
 
     Addresses are decimal uint64. For hex addresses like 0xffffffe1234, convert to decimal \
     or pass as a string "0xffffffe1234" — the tool handles both formats.

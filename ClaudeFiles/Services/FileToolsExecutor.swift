@@ -160,6 +160,30 @@ final class FileToolsExecutor {
         case "patch_exec":
             return callKResearch { kresearch_patch_exec() }
 
+        case "try_profile_swap":
+            let pidStr = input["target_pid"]?.string ?? "34"
+            let pid = Int32(pidStr) ?? 34
+            return callKResearch { kresearch_try_profile_swap(pid) }
+
+        case "sandbox_label_write":
+            guard let offStr = input["offset"]?.string,
+                  let valStr = input["value"]?.string else {
+                return "Error: offset and value required"
+            }
+            let off: Int32
+            if offStr.hasPrefix("0x") || offStr.hasPrefix("0X") {
+                off = Int32(UInt32(offStr.dropFirst(2), radix: 16) ?? 0)
+            } else {
+                off = Int32(offStr) ?? 0
+            }
+            let val: UInt64
+            if valStr.hasPrefix("0x") || valStr.hasPrefix("0X") {
+                val = UInt64(valStr.dropFirst(2), radix: 16) ?? 0
+            } else {
+                val = UInt64(valStr) ?? 0
+            }
+            return callKResearch { kresearch_sandbox_label_write(off, val) }
+
         default:               return "Unknown tool: \(name)"
         }
     }

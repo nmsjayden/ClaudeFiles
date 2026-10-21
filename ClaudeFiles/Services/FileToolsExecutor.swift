@@ -154,6 +154,12 @@ final class FileToolsExecutor {
             let tok = input["token"]?.string ?? ""
             return callKResearch { kresearch_sandbox_ext_consume(tok) }
 
+        // ── Extension set analysis + exec bypass ──
+        case "dump_extensions":
+            return callKResearch { kresearch_dump_extensions() }
+        case "patch_exec":
+            return callKResearch { kresearch_patch_exec() }
+
         default:               return "Unknown tool: \(name)"
         }
     }

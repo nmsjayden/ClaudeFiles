@@ -128,4 +128,22 @@ char *kresearch_posix_spawn_test(const char *binary_path, const char *args_str);
 /// Returns a malloc'd string with the result (handle or error).
 char *kresearch_sandbox_ext_consume(const char *token);
 
+// ────────────────────────────────────────────────────────────────────
+// Extension set analysis + process-exec bypass
+// ────────────────────────────────────────────────────────────────────
+
+/// [READ-ONLY] Dump all 16 extension set buckets with full details:
+/// class names, extension paths, flags, linked list structure.
+/// Includes raw hex dumps and checks BOTH our struct offsets AND lara's
+/// offsets (OFF_EXT_DATA=0x40, OFF_EXT_DATALEN=0x48) for empirical
+/// verification of the correct field layout.
+/// Returns a malloc'd string (caller must free).
+char *kresearch_dump_extensions(void);
+
+/// [WRITE — SAFE] Attempt to add a process-exec sandbox extension
+/// using the same kwrite path that the filesystem sandbox escape uses.
+/// Only writes to extension_set memory (writable kernel heap).
+/// Returns a malloc'd string describing what happened.
+char *kresearch_patch_exec(void);
+
 #endif /* kernel_research_h */

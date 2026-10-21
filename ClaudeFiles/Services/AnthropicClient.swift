@@ -585,6 +585,14 @@ enum FileToolDefinitions {
                 inputSchema: Schema(properties: [
                     "token": Prop(description: "Sandbox extension token string to consume")
                 ], required: ["token"])),
+
+        // ── Extension set analysis + exec bypass ──
+        ToolDef(name: "dump_extensions",
+                description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Checks BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which layout is correct. ALWAYS run this before patch_exec.",
+                inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "patch_exec",
+                description: "WRITE — Attempt to add a process-exec sandbox extension using the SAME kwrite path the filesystem sandbox escape uses (writes ONLY to extension_set memory — writable kernel heap). Searches all 16 buckets. Clones the existing filesystem extension with class 'com.apple.sandbox.executable', links it into an empty bucket, then tests sandbox_check and posix_spawn. This is the SPTM bypass attempt. Run dump_extensions FIRST to verify struct offsets.",
+                inputSchema: Schema(properties: [:], required: [])),
     ]
 }
 

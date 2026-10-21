@@ -1,10 +1,13 @@
 //  sandbox_research.h
-//  Private kernel sandbox structures for iOS 16–17 (arm64).
+//  Private kernel sandbox structures for iOS 16–18 (arm64).
 //
 //  These layouts are derived from:
 //    • Apple XNU open-source (mac_policy, kauth) for the outer wrapper
 //    • Reverse-engineering of the Sandbox.kext binary (opa334 / 34306 research)
 //    • Field names/order confirmed by every offsetof() + kwrite call in sandbox.m
+//    • Cross-referenced with lara (rooootdev) which uses 16 buckets and
+//      different extension offsets (OFF_EXT_DATA=0x40, OFF_EXT_DATALEN=0x48).
+//      Our struct works on our device; dump_extensions verifies empirically.
 //
 //  Only the fields actually referenced in sandbox.m are declared; padding/unknown
 //  words fill the rest to keep sizeof() correct for kreadbuf/kwritebuf.
@@ -36,11 +39,12 @@ struct sandbox_label {
 // ---------------------------------------------------------------------------
 // struct extension_set
 //   Hash table of extension_class_node* buckets, indexed by extension type.
-//   sandbox.m walks type_buckets[0..8] and writes type_buckets[0] and [i].
+//   sandbox.m walks type_buckets[0..8]; lara uses 16 buckets on iOS 17–18.
+//   We use 16 to ensure we don't miss any extension type buckets.
 // ---------------------------------------------------------------------------
+#define SANDBOX_EXT_NUM_BUCKETS 16
 struct extension_set {
-    struct extension_class_node *type_buckets[9]; // 0x00..0x47  ← iterated by sandbox.m
-    uint64_t                     unk[5];           // 0x48..0x6F  padding
+    struct extension_class_node *type_buckets[SANDBOX_EXT_NUM_BUCKETS]; // 0x00..0x7F
 };
 
 // ---------------------------------------------------------------------------
@@ -61,11 +65,19 @@ struct extension_class_node {
 //   sandbox.m uses offsetof() on: data_ptr, path_len, file.{consumed,
 //   storage_class, st_dev}, and st_ino.
 // ---------------------------------------------------------------------------
+// NOTE: lara uses OFF_EXT_DATA=0x40 and OFF_EXT_DATALEN=0x48, which differ
+// from our data_ptr (0x18) and path_len (0x20). Our layout works for
+// patch_sandbox_ext on our device. dump_extensions includes raw hex dumps
+// so we can empirically verify which offsets contain valid data.
+#define LARA_OFF_EXT_DATA    0x40
+#define LARA_OFF_EXT_DATALEN 0x48
+#define EXTENSION_RAW_SIZE   0x60  // how many bytes to raw-dump per extension
+
 struct extension {
     struct extension *next;       // 0x00  linked list
     uint64_t          hash;       // 0x08
     void             *ext_class;  // 0x10  pointer to extension class object
-    void             *data_ptr;   // 0x18  ← pointer to path string
+    void             *data_ptr;   // 0x18  ← pointer to path string (our working offset)
     uint64_t          path_len;   // 0x20  ← written via kwrite64
     struct {
         uint8_t  consumed;        // 0x28  ← written via kwrite8
@@ -74,5 +86,5 @@ struct extension {
         uint32_t st_dev;          // 0x2C  ← written via kwrite32
     } file;                       // 0x28
     uint64_t st_ino;              // 0x30  ← written via kwrite64
-    uint64_t unk[4];              // 0x38..0x57  padding
+    uint64_t unk[6];              // 0x38..0x67  padding (expanded for lara offset range)
 };

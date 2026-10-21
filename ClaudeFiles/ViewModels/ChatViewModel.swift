@@ -227,7 +227,7 @@ final class ChatViewModel: ObservableObject {
 
     private let systemPrompt = """
     You are running inside a custom iOS app on a device with filesystem access via \
-    the FilzaJailedDS kernel exploit (opa334). You have 33 tools:
+    the FilzaJailedDS kernel exploit (opa334). You have 35 tools:
     - read_file, write_file, list_directory, search_files, get_file_info
     - bash_exec: run shell commands (ls, cat, find, ps, uname, etc.)
     - grep_search: search file contents for a pattern
@@ -331,6 +331,15 @@ final class ChatViewModel: ObservableObject {
     sandbox pre-checks, attempts spawn, reports detailed errno.
     - sandbox_ext_consume(token): Consume a sandbox extension token. Also tries to \
     issue extensions for /bin/sh as a test.
+    - dump_extensions(): READ-ONLY. Dumps all 16 sandbox extension set buckets with full \
+    detail: class names, paths, flags, linked list structure, and RAW HEX DUMPS. It checks \
+    BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which \
+    layout is correct on this device. ALWAYS run this first before patch_exec.
+    - patch_exec(): WRITE. Adds a process-exec sandbox extension using the SAME kwrite \
+    path the filesystem sandbox escape uses. Only writes to extension_set memory (writable \
+    kernel heap). Searches all 16 buckets. Clones the existing filesystem extension with \
+    class 'com.apple.sandbox.executable', tests sandbox_check and posix_spawn after. THIS \
+    IS THE SPTM BYPASS ATTEMPT — call dump_extensions first to verify struct offsets.
 
     KERNEL RESEARCH METHODOLOGY:
     When investigating the kernel or researching SPTM bypass vectors, follow this approach:

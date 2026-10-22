@@ -624,7 +624,7 @@ enum FileToolDefinitions {
                 description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Zone metadata protected — skips freed pointers safely. Run this before patch_exec to understand the extension layout.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "patch_exec",
-                description: "v5 WRITE — Scans all 16 extension buckets, finds a read-write class_node whose class_name string is long enough, then OVERWRITES the string bytes to 'com.apple.sandbox.executable'. All addresses validated via zone metadata protection. Checks sandbox_check BEFORE and AFTER rename; auto-restores original if no state change. Dumps sandbox_label raw fields. Run dump_extensions first.",
+                description: "v6 POINTER REDIRECT — Scans all 16 extension buckets, finds a writable class_node (zone heap) and a writable extension data buffer. Plants 'com.apple.sandbox.executable' string at the tail of the data buffer, then redirects the class_name POINTER in the class_node struct. Avoids writing to kernel static region (SPTM read-only). Checks sandbox_check BEFORE and AFTER; auto-restores pointer + stash bytes on no change. Run dump_extensions first.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "try_profile_swap",
                 description: "WRITE — Copies SpringBoard's sandbox profile pointer into ours. Tests sandbox_check + posix_spawn after. Profile is on writable heap but SPTM may integrity-check the bytecode, so this can kernel panic. Auto-restores on failure. Previous NULL write and flag zeroing attempts removed (they panicked).",

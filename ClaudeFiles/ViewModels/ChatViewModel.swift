@@ -335,15 +335,13 @@ final class ChatViewModel: ObservableObject {
     detail: class names, paths, flags, linked list structure, and RAW HEX DUMPS. It checks \
     BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which \
     layout is correct on this device. ALWAYS run this first before patch_exec.
-    - patch_exec(): WRITE — v2 with CONFIRMED LARA offsets (class_name at +0x10, ext at \
-    +0x08 in class_node). Adds a 'com.apple.sandbox.executable' extension to the extension_set \
-    using kwrite on writable kernel heap. Handles all-buckets-full by prepending to chain. \
+    - patch_exec(): WRITE — v3 "rename existing class_node" approach. Scans all 16 buckets for \
+    read-write class_nodes, picks one, and renames it to com.apple.sandbox.executable by writing \
+    the new class name into its extension data buffer. Only writes 8 bytes (one class_name pointer). \
     Tests sandbox_check + posix_spawn on /bin/sh, /usr/bin/env, /bin/df, /bin/ps.
-    - try_profile_swap(target_pid): WRITE — RISKY. Tries 3 approaches: (1) Copy target PID's \
-    sandbox profile pointer into ours, (2) Write NULL as profile, (3) Zero sandbox flags at \
-    +0x50/+0x58. Tests sandbox_check after each. Auto-restores on failure. Default: PID 34 \
-    (SpringBoard). The sandbox_label is writable heap so writes won't crash, but the sandbox \
-    evaluator might.
+    - try_profile_swap(target_pid): WRITE — Copies target PID's sandbox profile pointer into ours. \
+    Tests sandbox_check after swap. Auto-restores on failure. Default: PID 34 (SpringBoard). \
+    Dumps full sandbox_label fields for analysis. Does NOT write NULL or zero flags (those panic).
     - sandbox_label_write(offset, value): WRITE — Write a 64-bit value to sandbox_label+offset. \
     Generic tool for experimenting with sandbox label fields. Reports before/after values and \
     tests sandbox_check. Use offset 0x00 for profile ptr, 0x10 for extension_set, 0x50/0x58 \
@@ -377,9 +375,10 @@ final class ChatViewModel: ObservableObject {
     - launchd (PID 1) has no sandbox (ptr=0xffffffffffffffff)
     - SpringBoard (PID 34) has a different, larger sandbox profile
 
-    STRATEGY: Run patch_exec first (extension injection). If sandbox still denies exec, \
-    try try_profile_swap to copy SpringBoard's profile or NULL the profile pointer. \
-    If both fail, use sandbox_label_write to experiment with other fields.
+    STRATEGY: Run patch_exec first (extension rename to add executable class). If sandbox \
+    still denies exec, try try_profile_swap to copy SpringBoard's profile. If both fail, \
+    use sandbox_label_write to experiment with other fields. NEVER write NULL to profile \
+    or zero flags — those cause kernel panics.
 
     Addresses are decimal uint64. For hex addresses like 0xffffffe1234, convert to decimal \
     or pass as a string "0xffffffe1234" — the tool handles both formats.

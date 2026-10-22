@@ -35,7 +35,8 @@ struct ResearchView: View {
 
                         Section {
                             commandGroup(title: "Diagnostics", icon: "ant.fill", color: .red, commands: [
-                                ("breadcrumbs",  "View Breadcrumbs", "Last run's crash-safe log"),
+                                ("breadcrumbs",      "Research Breadcrumbs", "kernel_research.m crash-safe log"),
+                                ("ssv_breadcrumbs",  "SSV Breadcrumbs",      "sandbox.m escape crash-safe log"),
                             ])
                         }
                     }
@@ -208,7 +209,8 @@ final class ResearchRunner: ObservableObject {
             "swap_profile": "Research v15",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",
-            "breadcrumbs": "Breadcrumbs",
+            "breadcrumbs": "Research Breadcrumbs",
+            "ssv_breadcrumbs": "SSV Breadcrumbs",
         ]
 
         isRunning = true
@@ -278,6 +280,11 @@ final class ResearchRunner: ObservableObject {
                     if let r = kresearch_read_breadcrumbs() {
                         let s = String(cString: r); free(r); return s
                     } else { return "(no breadcrumbs file found)" }
+
+                case "ssv_breadcrumbs":
+                    if let r = read_ssv_breadcrumbs() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "(no SSV breadcrumbs file found)" }
 
                 default:
                     return "Unknown command: \(command)"

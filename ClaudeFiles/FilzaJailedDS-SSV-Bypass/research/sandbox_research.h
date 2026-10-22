@@ -51,51 +51,35 @@ struct extension_set {
 // struct extension_class_node
 //   Linked-list node for one extension class (e.g. "com.apple.app-sandbox.read-write").
 //   Must be exactly 0x20 bytes — confirmed by the kwrite_zone_element(..., 0x20) call.
+//
+//   CONFIRMED on iOS 18.1 (iPhone 14, A15 T8110) via device testing:
+//   LARA's offsets are correct; our old layout (class_name=0x00) was WRONG.
 // ---------------------------------------------------------------------------
 struct extension_class_node {
-    const char                   *class_name;     // 0x00  ← read & overwritten
-    struct extension_class_node  *next;           // 0x08  (sibling in bucket chain)
-    struct extension             *ext_list_head;  // 0x10  ← head of extension list
+    struct extension_class_node  *next;           // 0x00  sibling in bucket chain
+    struct extension             *ext_list_head;  // 0x08  head of extension list
+    const char                   *class_name;     // 0x10  pointer to class name string
     uint64_t                      count;          // 0x18
 };  // sizeof == 0x20  ✓
 
-// ---------------------------------------------------------------------------
-// struct extension
-//   A single granted sandbox extension (filesystem path entry).
-//   sandbox.m uses offsetof() on: data_ptr, path_len, file.{consumed,
-//   storage_class, st_dev}, and st_ino.
-// ---------------------------------------------------------------------------
-// NOTE: lara uses OFF_EXT_DATA=0x40 and OFF_EXT_DATALEN=0x48, which differ
-// from our data_ptr (0x18) and path_len (0x20). Our layout works for
-// patch_sandbox_ext on our device. dump_extensions includes raw hex dumps
-// so we can empirically verify which offsets contain valid data.
-// LARA class_node layout (confirmed correct on our iOS 18.1 device):
-//   +0x00 = next (pointer to next class_node in bucket chain)
-//   +0x08 = ext_list_head (pointer to first extension in this class)
-//   +0x10 = class_name (pointer to class name string)
-//   +0x18 = count
-// Our struct has class_name at +0x00 and next at +0x08 — WRONG for this device.
-#define LARA_CN_NEXT       0x00
-#define LARA_CN_EXT        0x08
-#define LARA_CN_CLASSNAME  0x10
-#define LARA_CN_COUNT      0x18
+// Convenience defines matching the struct above (for raw-byte access)
+#define CN_OFF_NEXT       0x00
+#define CN_OFF_EXT        0x08
+#define CN_OFF_CLASSNAME  0x10
+#define CN_OFF_COUNT      0x18
 
-#define LARA_OFF_EXT_DATA    0x40
-#define LARA_OFF_EXT_DATALEN 0x48
-#define EXTENSION_RAW_SIZE   0x60  // how many bytes to raw-dump per extension
+// ---------------------------------------------------------------------------
+// Extension struct — field offsets confirmed via LARA and device testing.
+//
+// The full extension struct is ~0x60 bytes.  Only data_ptr and data_len are
+// confirmed; the rest is filled with padding so sizeof() is correct for
+// raw kreadbuf calls.  The sandbox escape uses raw-offset defines below
+// rather than offsetof() so we don't depend on getting every field right.
+// ---------------------------------------------------------------------------
+#define EXT_OFF_DATA      0x40   // pointer to path/data string
+#define EXT_OFF_DATALEN   0x48   // uint64 path length
+#define EXT_RAW_SIZE      0x60   // how many bytes to raw-dump per extension
 
 struct extension {
-    struct extension *next;       // 0x00  linked list
-    uint64_t          hash;       // 0x08
-    void             *ext_class;  // 0x10  pointer to extension class object
-    void             *data_ptr;   // 0x18  ← pointer to path string (our working offset)
-    uint64_t          path_len;   // 0x20  ← written via kwrite64
-    struct {
-        uint8_t  consumed;        // 0x28  ← written via kwrite8
-        uint8_t  storage_class;   // 0x29  ← written via kwrite8 with SC_ISSUED
-        uint16_t unk_flags;       // 0x2A
-        uint32_t st_dev;          // 0x2C  ← written via kwrite32
-    } file;                       // 0x28
-    uint64_t st_ino;              // 0x30  ← written via kwrite64
-    uint64_t unk[6];              // 0x38..0x67  padding (expanded for lara offset range)
+    uint8_t raw[EXT_RAW_SIZE];   // opaque — use EXT_OFF_* for field access
 };

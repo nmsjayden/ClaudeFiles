@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.6"
+    static let codeVersion = "2024-10-07.7"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -1008,6 +1008,18 @@ final class FileToolsExecutor {
             lines.append(crumbs)
             lines.append("── END BREADCRUMBS ──")
             lines.append("(The last BEFORE without a matching AFTER is what caused the kernel panic)")
+        }
+
+        // SSV (sandbox escape) breadcrumbs — separate log from sandbox.m
+        if let ssvPtr = read_ssv_breadcrumbs() {
+            let ssv = String(cString: ssvPtr)
+            free(ssvPtr)
+            if !ssv.isEmpty {
+                lines.append("")
+                lines.append("── SSV BREADCRUMBS (sandbox escape) ──")
+                lines.append(ssv)
+                lines.append("── END SSV ──")
+            }
         }
 
         return lines.joined(separator: "\n")

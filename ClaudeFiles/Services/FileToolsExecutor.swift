@@ -4,7 +4,7 @@ import UIKit
 final class FileToolsExecutor {
 
     /// Bump this every time code changes so device_info confirms the build is current.
-    static let codeVersion = "2024-10-07.7"
+    static let codeVersion = "2024-10-07.8"
 
     private let writeBlocklist = ["/System/Library/CoreServices", "/usr/lib", "/bin", "/sbin"]
 
@@ -44,6 +44,34 @@ final class FileToolsExecutor {
         try? FileManager.default.removeItem(at: breadcrumbURL)
     }
 
+    // ── Last tool result persistence ──
+    // Saves the full output of every kernel research tool call to disk with fsync
+    // BEFORE returning it to the AI. If the app crashes (kernel panic etc),
+    // the AI can read what happened via device_info or the "last_result" tool.
+    private static let lastResultURL: URL = {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return docs.appendingPathComponent("last_tool_result.txt")
+    }()
+
+    /// Save tool name + result to disk (fsync'd) before returning to AI.
+    private static func persistResult(tool: String, result: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let content = "[\(timestamp)] tool=\(tool)\n\(result)"
+        let path = lastResultURL.path
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { return }
+        content.withCString { ptr in
+            _ = write(fd, ptr, strlen(ptr))
+        }
+        fsync(fd)
+        close(fd)
+    }
+
+    /// Read the last tool result (survives crashes).
+    static func readLastResult() -> String {
+        (try? String(contentsOf: lastResultURL)) ?? "(no previous result)"
+    }
+
     func execute(name: String, input: [String: AnyJSON]) async -> String {
         let path      = input["path"]?.string      ?? ""
         let content   = input["content"]?.string   ?? ""
@@ -64,6 +92,7 @@ final class FileToolsExecutor {
         case "tail_file":      return tailFile(path: path, lines: input["lines"]?.intValue ?? 50)
         case "process_list":   return processList()
         case "device_info":    return await deviceInfo()
+        case "last_result":    return Self.readLastResult()
         case "open_url":       return await openURL(input["url"]?.string ?? "")
         case "remote_call":    return await remoteCall(process: input["process"]?.string ?? "",
                                                        function: input["function"]?.string ?? "",
@@ -86,35 +115,35 @@ final class FileToolsExecutor {
         case "kernel_read":
             let addr = parseUInt64(input["address"])
             let size = parseInt(input["size"]) ?? 64
-            return callKResearch { kresearch_kread(addr, Int32(size)) }
+            return callKResearch(tool: name) { kresearch_kread(addr, Int32(size)) }
 
         case "kernel_read64":
             let addr = parseUInt64(input["address"])
-            return callKResearch { kresearch_kread64(addr) }
+            return callKResearch(tool: name) { kresearch_kread64(addr) }
 
         case "kernel_follow_chain":
             let base = parseUInt64(input["base"])
             let offsets = input["offsets"]?.string ?? ""
-            return callKResearch { kresearch_follow_chain(base, offsets) }
+            return callKResearch(tool: name) { kresearch_follow_chain(base, offsets) }
 
         case "kernel_proc_info":
             let pid = parseInt(input["pid"]) ?? 0
-            return callKResearch { kresearch_proc_info(Int32(pid)) }
+            return callKResearch(tool: name) { kresearch_proc_info(Int32(pid)) }
 
         case "kernel_sandbox_check":
             let op = input["operation"]?.string ?? ""
             let nm = input["name"]?.string ?? ""
-            return callKResearch { kresearch_sandbox_check_op(op, nm) }
+            return callKResearch(tool: name) { kresearch_sandbox_check_op(op, nm) }
 
         case "kernel_sandbox_dump":
             let off = parseInt(input["offset"]) ?? 0
             let sz  = parseInt(input["size"]) ?? 128
-            return callKResearch { kresearch_sandbox_dump(Int32(off), Int32(sz)) }
+            return callKResearch(tool: name) { kresearch_sandbox_dump(Int32(off), Int32(sz)) }
 
         case "kernel_dlsym":
             let fw  = input["framework"]?.string ?? ""
             let sym = input["symbol"]?.string ?? ""
-            return callKResearch { kresearch_dlsym_lookup(fw, sym) }
+            return callKResearch(tool: name) { kresearch_dlsym_lookup(fw, sym) }
 
         case "kernel_dlcall":
             let fw = input["framework"]?.string ?? ""
@@ -123,47 +152,47 @@ final class FileToolsExecutor {
             let a1 = parseUInt64(input["arg1"])
             let a2 = parseUInt64(input["arg2"])
             let a3 = parseUInt64(input["arg3"])
-            return callKResearch { kresearch_dlcall(fw, fn, a0, a1, a2, a3) }
+            return callKResearch(tool: name) { kresearch_dlcall(fw, fn, a0, a1, a2, a3) }
 
         case "kernel_run_command":
             let cmd = input["command"]?.string ?? ""
-            return callKResearch { kresearch_run_command(cmd) }
+            return callKResearch(tool: name) { kresearch_run_command(cmd) }
 
         case "kernel_proc_list":
             let filter = input["filter"]?.string ?? ""
-            return callKResearch { kresearch_proc_list(filter) }
+            return callKResearch(tool: name) { kresearch_proc_list(filter) }
 
         // ── Kernel WRITE + Advanced Test Tools ─────────────────────────
 
         case "kernel_write64":
             let addr = parseUInt64(input["address"])
             let val  = parseUInt64(input["value"])
-            return callKResearch { kresearch_kwrite64(addr, val) }
+            return callKResearch(tool: name) { kresearch_kwrite64(addr, val) }
 
         case "kernel_write":
             let addr = parseUInt64(input["address"])
             let hex  = input["hex_data"]?.string ?? ""
-            return callKResearch { kresearch_kwrite(addr, hex) }
+            return callKResearch(tool: name) { kresearch_kwrite(addr, hex) }
 
         case "posix_spawn_test":
             let bin  = input["binary"]?.string ?? ""
             let args = input["args"]?.string ?? ""
-            return callKResearch { kresearch_posix_spawn_test(bin, args) }
+            return callKResearch(tool: name) { kresearch_posix_spawn_test(bin, args) }
 
         case "sandbox_ext_consume":
             let tok = input["token"]?.string ?? ""
-            return callKResearch { kresearch_sandbox_ext_consume(tok) }
+            return callKResearch(tool: name) { kresearch_sandbox_ext_consume(tok) }
 
         // ── Extension set analysis + exec bypass ──
         case "dump_extensions":
-            return callKResearch { kresearch_dump_extensions() }
+            return callKResearch(tool: name) { kresearch_dump_extensions() }
         case "patch_exec":
-            return callKResearch { kresearch_patch_exec() }
+            return callKResearch(tool: name) { kresearch_patch_exec() }
 
         case "try_profile_swap":
             let pidStr = input["target_pid"]?.string ?? "34"
             let pid = Int32(pidStr) ?? 34
-            return callKResearch { kresearch_try_profile_swap(pid) }
+            return callKResearch(tool: name) { kresearch_try_profile_swap(pid) }
 
         case "sandbox_label_write":
             guard let offStr = input["offset"]?.string,
@@ -182,7 +211,7 @@ final class FileToolsExecutor {
             } else {
                 val = UInt64(valStr) ?? 0
             }
-            return callKResearch { kresearch_sandbox_label_write(off, val) }
+            return callKResearch(tool: name) { kresearch_sandbox_label_write(off, val) }
 
         default:               return "Unknown tool: \(name)"
         }
@@ -191,12 +220,17 @@ final class FileToolsExecutor {
     // MARK: - Kernel Research Helpers
 
     /// Call a C kernel research function that returns a malloc'd string.
-    private func callKResearch(_ fn: () -> UnsafeMutablePointer<CChar>?) -> String {
+    /// Persists the result to disk (fsync) before returning, so it survives crashes.
+    private func callKResearch(tool: String = "unknown", _ fn: () -> UnsafeMutablePointer<CChar>?) -> String {
         guard let result = fn() else {
-            return "ERROR: kernel research function returned NULL — exploit may not be initialized"
+            let err = "ERROR: kernel research function returned NULL — exploit may not be initialized"
+            Self.persistResult(tool: tool, result: err)
+            return err
         }
         let str = String(cString: result)
         free(result)
+        // Save to disk BEFORE returning — survives kernel panics
+        Self.persistResult(tool: tool, result: str)
         return str
     }
 
@@ -1020,6 +1054,22 @@ final class FileToolsExecutor {
                 lines.append(ssv)
                 lines.append("── END SSV ──")
             }
+        }
+
+        // Last tool result — survives crashes so AI can see what the tool returned
+        // even if the app crashed before sending the result back to the API
+        let lastResult = Self.readLastResult()
+        if lastResult != "(no previous result)" {
+            lines.append("")
+            lines.append("── LAST TOOL RESULT (persisted to disk) ──")
+            // Truncate if very long — full output available via last_result tool
+            if lastResult.count > 2000 {
+                lines.append(String(lastResult.prefix(2000)))
+                lines.append("... (truncated, run last_result for full output)")
+            } else {
+                lines.append(lastResult)
+            }
+            lines.append("── END LAST RESULT ──")
         }
 
         return lines.joined(separator: "\n")

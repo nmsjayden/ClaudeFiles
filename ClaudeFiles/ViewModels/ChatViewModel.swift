@@ -383,6 +383,15 @@ final class ChatViewModel: ObservableObject {
     Addresses are decimal uint64. For hex addresses like 0xffffffe1234, convert to decimal \
     or pass as a string "0xffffffe1234" — the tool handles both formats.
 
+    CRASH RECOVERY: Every kernel research tool result is saved to disk (fsync'd) BEFORE \
+    returning. If the app crashes (kernel panic, etc), the result is preserved. On your \
+    FIRST message in any new session, ALWAYS run device_info — it will show you: \
+    (1) crash breadcrumbs showing which step panicked, (2) SSV breadcrumbs from sandbox.m, \
+    (3) the LAST TOOL RESULT that was persisted before the crash. If device_info shows a \
+    last tool result, that tool's output was saved but the app crashed before you could see \
+    it. Use last_result to read the full output. This tells you WHAT happened even when YOU \
+    didn't get the result back.
+
     Always try paths before concluding you lack access. Use markdown in responses: \
     code blocks with language tags, bold for emphasis. Confirm before writing files.
     """

@@ -681,7 +681,17 @@ final class ChatViewModel: ObservableObject {
                 for (_, tool) in toolBlocks.sorted(by: { $0.key < $1.key }) {
                     if Task.isCancelled { return }
                     let input  = parseJSON(tool.partialJSON) ?? [:]
-                    let result = await executeTool(id: tool.id, name: tool.name, input: input)
+                    let rawResult = await executeTool(id: tool.id, name: tool.name, input: input)
+                    // Cap tool results to prevent app freeze on massive kernel dumps.
+                    // 12000 chars ≈ 3000 tokens — enough for useful data, won't overload.
+                    let result: String
+                    if rawResult.count > 12000 {
+                        let truncated = String(rawResult.prefix(11500))
+                        let suffix = "\n\n⚠️ OUTPUT TRUNCATED (was \(rawResult.count) chars, showing first 11500). Run dump_extensions or detect_zones individually for full output."
+                        result = truncated + suffix
+                    } else {
+                        result = rawResult
+                    }
                     store.appendMessage(to: convId, StoredMessage(
                         role: "user", text: "",
                         apiBlocks: nil, toolUseId: tool.id, toolResult: result

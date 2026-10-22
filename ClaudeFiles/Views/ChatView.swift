@@ -727,7 +727,10 @@ struct MessageBubble: View {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(message.toolCalls) { ToolCallCard(tool: $0) }
                 if !message.text.isEmpty {
-                    MarkdownView(message.text)
+                    let displayText = message.text.count > 8000
+                        ? String(message.text.prefix(7500)) + "\n\n*… (\(message.text.count - 7500) more chars — use Copy text for full)*"
+                        : message.text
+                    MarkdownView(displayText)
                         .textSelection(.enabled)
                         .contextMenu {
                             Button {
@@ -878,13 +881,26 @@ struct ToolCallCard: View {
         VStack(alignment: .leading, spacing: 4) {
             SectionLabel("RESULT")
             if let r = tool.result, !r.isEmpty {
+                // Cap display text to prevent UI freeze on massive outputs
+                let displayText = r.count > 6000
+                    ? String(r.prefix(5500)) + "\n\n… (\(r.count - 5500) more chars — copy to see full)"
+                    : r
                 ScrollView {
-                    Text(r)
+                    Text(displayText)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxHeight: 260)
+                if r.count > 6000 {
+                    Button {
+                        UIPasteboard.general.string = r
+                    } label: {
+                        Label("Copy full output", systemImage: "doc.on.doc")
+                            .font(.caption2)
+                    }
+                    .padding(.top, 2)
+                }
             } else {
                 Text("(no output)")
                     .font(.caption).foregroundStyle(.secondary).italic()

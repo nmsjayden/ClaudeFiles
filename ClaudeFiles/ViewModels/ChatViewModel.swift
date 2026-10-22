@@ -619,8 +619,17 @@ final class ChatViewModel: ObservableObject {
                         finalStopReason = reason
                     case .statusMessage(let msg):
                         self.streamingText = "⏳ \(msg)"
+                    case .usageStart(let input, let output, let cacheCreation, let cacheRead):
+                        UsageTracker.shared.updateUsage(
+                            input: input, output: output,
+                            cacheCreation: cacheCreation, cacheRead: cacheRead)
+                    case .usageDelta(let output):
+                        UsageTracker.shared.updateOutputTokens(output)
                     }
                 }
+
+                // Finalize usage tracking for this API call
+                UsageTracker.shared.finishRequest()
 
                 // Build persistent blocks
                 var apiBlocks: [StoredBlock] = []

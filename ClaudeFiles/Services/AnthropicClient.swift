@@ -117,6 +117,9 @@ final class AnthropicClient {
 
         DebugLog.log("HTTP status: \(http.statusCode)")
 
+        // Parse rate-limit headers on every response (including errors)
+        await UsageTracker.shared.updateFromHeaders(http)
+
         if http.statusCode == 401 {
             var buf = Data()
             for try await byte in bytes { buf.append(byte) }
@@ -220,6 +223,14 @@ final class AnthropicClient {
     private func processSSE(event: String, data: String, onEvent: (StreamEvent) -> Void) {
         guard let payload = data.data(using: .utf8) else { return }
         switch event {
+        case "message_start":
+            if let p = try? JSONDecoder().decode(MessageStartEvent.self, from: payload) {
+                let u = p.message.usage
+                onEvent(.usageStart(inputTokens: u.input_tokens,
+                                     outputTokens: u.output_tokens,
+                                     cacheCreation: u.cache_creation_input_tokens ?? 0,
+                                     cacheRead: u.cache_read_input_tokens ?? 0))
+            }
         case "content_block_start":
             if let p = try? JSONDecoder().decode(ContentBlockStartEvent.self, from: payload) {
                 if p.content_block.type == "tool_use" {
@@ -251,6 +262,9 @@ final class AnthropicClient {
                 if let reason = p.delta.stop_reason {
                     onEvent(.messageStop(stopReason: reason))
                 }
+                if let usage = p.usage {
+                    onEvent(.usageDelta(outputTokens: usage.output_tokens))
+                }
             }
         default: break
         }
@@ -269,6 +283,8 @@ enum StreamEvent {
     case blockStop(index: Int)
     case messageStop(stopReason: String)
     case statusMessage(String)  // transient status (e.g. "retrying…")
+    case usageStart(inputTokens: Int, outputTokens: Int, cacheCreation: Int, cacheRead: Int)
+    case usageDelta(outputTokens: Int)
 }
 
 // MARK: - Request
@@ -333,9 +349,23 @@ private struct ContentBlockDeltaEvent: Decodable {
 private struct ContentBlockStopEvent: Decodable {
     let index: Int
 }
+private struct MessageStartEvent: Decodable {
+    let message: MessageInfo
+    struct MessageInfo: Decodable {
+        let usage: Usage
+    }
+    struct Usage: Decodable {
+        let input_tokens: Int
+        let output_tokens: Int
+        let cache_creation_input_tokens: Int?
+        let cache_read_input_tokens: Int?
+    }
+}
 private struct MessageDeltaEvent: Decodable {
     let delta: Delta
+    let usage: DeltaUsage?
     struct Delta: Decodable { let stop_reason: String? }
+    struct DeltaUsage: Decodable { let output_tokens: Int }
 }
 
 // MARK: - Tool definitions (unchanged)
@@ -591,10 +621,10 @@ enum FileToolDefinitions {
 
         // ── Extension set analysis + exec bypass ──
         ToolDef(name: "dump_extensions",
-                description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Checks BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which layout is correct. ALWAYS run this before patch_exec.",
+                description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Zone metadata protected — skips freed pointers safely. Run this before patch_exec to understand the extension layout.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "patch_exec",
-                description: "READ-ONLY v4 — Analyzes all 16 extension buckets, counts classes/extensions, checks process-exec/process-fork sandbox status, dumps sandbox_label raw fields. Previous v3 caused kernel panics by writing into live extension data buffers. This version only reads. Run dump_extensions first for detailed hex dumps.",
+                description: "v5 WRITE — Scans all 16 extension buckets, finds a read-write class_node whose class_name string is long enough, then OVERWRITES the string bytes to 'com.apple.sandbox.executable'. All addresses validated via zone metadata protection. Checks sandbox_check BEFORE and AFTER rename; auto-restores original if no state change. Dumps sandbox_label raw fields. Run dump_extensions first.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "try_profile_swap",
                 description: "WRITE — Copies SpringBoard's sandbox profile pointer into ours. Tests sandbox_check + posix_spawn after. Profile is on writable heap but SPTM may integrity-check the bytecode, so this can kernel panic. Auto-restores on failure. Previous NULL write and flag zeroing attempts removed (they panicked).",

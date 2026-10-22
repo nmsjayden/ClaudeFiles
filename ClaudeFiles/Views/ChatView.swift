@@ -63,6 +63,7 @@ private struct ChatContent: View {
         NavigationView {
             VStack(spacing: 0) {
                 mainBody
+                UsageStrip()
                 Divider().opacity(0.4)
                 InputBar(vm: vm, inputFocused: _inputFocused)
             }
@@ -304,9 +305,12 @@ private struct SuggestionChip: View {
 private struct MessageList: View {
     @ObservedObject var vm: ChatViewModel
     @FocusState var inputFocused: Bool
-    @State private var autoScroll: Bool = true
-    @State private var bottomVisible: Bool = false
-    @State private var keyboardHeight: CGFloat = 0
+
+    // stickToBottom: auto-follows new content. False when user drags
+    //   up; true on: send, jump-button, or scrolling back to bottom.
+    // bottomOnScreen: drives the jump-to-bottom button visibility.
+    @State private var stickToBottom  = true
+    @State private var bottomOnScreen = false
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -321,70 +325,75 @@ private struct MessageList: View {
                             streamingContent
                         }
 
-                        // Bottom anchor — uses onAppear/onDisappear to track visibility
+                        // Invisible bottom anchor
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
-                            .onAppear  { bottomVisible = true;  autoScroll = true }
-                            .onDisappear {
-                                bottomVisible = false
-                                // Only stop auto-scroll if user manually scrolled up
-                                // (not when new content pushed the anchor off-screen)
-                                if !vm.isSending { autoScroll = false }
-                            }
+                            .onAppear  { bottomOnScreen = true }
+                            .onDisappear { bottomOnScreen = false }
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 18)
                 }
-                .onChange(of: vm.displayMessages.count)    { _ in scrollIfAuto(proxy) }
-                .onChange(of: vm.streamingText)            { _ in scrollIfAuto(proxy) }
-                .onChange(of: vm.streamingToolCalls.count) { _ in scrollIfAuto(proxy) }
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { inputFocused = false }
+                // ── Detect user scroll-up via simultaneous drag ──
+                // The gesture fires alongside ScrollView's pan without
+                // stealing it.  Positive height = finger down = content up.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 10)
+                        .onChanged { value in
+                            if value.translation.height > 14 {
+                                stickToBottom = false
+                            }
+                        }
+                        .onEnded { _ in
+                            // Re-engage if the user scrolled back to bottom
+                            if bottomOnScreen { stickToBottom = true }
+                        }
+                )
+                // ── Auto-scroll triggers ──
+                .onChange(of: vm.displayMessages.count)    { _ in autoScroll(proxy) }
+                .onChange(of: vm.streamingText)            { _ in autoScroll(proxy) }
+                .onChange(of: vm.streamingToolCalls.count) { _ in autoScroll(proxy) }
                 .onChange(of: vm.isSending) { sending in
                     if sending {
-                        autoScroll = true
-                        scrollToBottom(proxy)
+                        stickToBottom = true
+                        scrollToBottom(proxy, animated: true)
                     }
                 }
-                .scrollDismissesKeyboard(.interactively)
                 .onAppear {
-                    // Scroll to bottom when chat is first opened
-                    autoScroll = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    stickToBottom = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                         proxy.scrollTo("bottom", anchor: .bottom)
                     }
                 }
-                .onTapGesture { inputFocused = false }
-                // When keyboard opens/closes, scroll to bottom if we were following
+                // ── Keyboard ──
                 .onReceive(
                     NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)
-                ) { note in
-                    if let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
-                        keyboardHeight = frame.height
-                    }
-                    if autoScroll || bottomVisible {
-                        // Delay slightly to let the keyboard animation start
+                ) { _ in
+                    if stickToBottom {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            scrollToBottom(proxy)
+                            scrollToBottom(proxy, animated: true)
                         }
                     }
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)
                 ) { _ in
-                    keyboardHeight = 0
-                    if autoScroll || bottomVisible {
+                    if stickToBottom {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            scrollToBottom(proxy)
+                            scrollToBottom(proxy, animated: true)
                         }
                     }
                 }
 
-                // Jump-to-bottom button — visible when bottom anchor is off-screen
-                if !bottomVisible {
+                // ── Jump-to-bottom FAB ──
+                if !stickToBottom && !bottomOnScreen {
                     Button {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        autoScroll = true
-                        scrollToBottom(proxy)
+                        stickToBottom = true
+                        scrollToBottom(proxy, animated: true)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 14, weight: .bold))
@@ -397,7 +406,7 @@ private struct MessageList: View {
                     }
                     .padding(.bottom, 12)
                     .transition(.scale(scale: 0.6).combined(with: .opacity))
-                    .animation(.spring(response: 0.3, dampingFraction: 0.7), value: bottomVisible)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.7), value: bottomOnScreen)
                 }
             }
         }
@@ -413,21 +422,21 @@ private struct MessageList: View {
         }
     }
 
-    private func scrollIfAuto(_ proxy: ScrollViewProxy) {
-        guard autoScroll else { return }
-        scrollToBottom(proxy)
+    private func autoScroll(_ proxy: ScrollViewProxy) {
+        guard stickToBottom else { return }
+        scrollToBottom(proxy, animated: false)
     }
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        // First scroll attempt with short delay for layout pass
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            withAnimation(.easeOut(duration: 0.15)) {
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
-            // Second attempt after LazyVStack finishes loading off-screen items
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                withAnimation(.easeOut(duration: 0.1)) {
+
+    /// animated: false during streaming prevents LazyVStack flicker.
+    /// animated: true for user-initiated scrolls (jump button, send).
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
                     proxy.scrollTo("bottom", anchor: .bottom)
                 }
+            } else {
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
     }
@@ -1516,4 +1525,128 @@ private struct InfoBlock: View {
     }
 }
 
-// (Preference key removed — scroll tracking now uses onAppear/onDisappear)
+// MARK: - Usage / rate-limit indicator
+
+private struct UsageStrip: View {
+    @ObservedObject private var usage = UsageTracker.shared
+    @State private var expanded = false
+
+    var body: some View {
+        if usage.lastUpdated != nil {
+            VStack(spacing: 0) {
+                // Compact strip — always visible once data arrives
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        statusDot
+                        Text(usage.limitSummary)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(usage.sessionSummary)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(stripBackground)
+                }
+                .buttonStyle(.plain)
+
+                // Expanded detail panel
+                if expanded {
+                    VStack(alignment: .leading, spacing: 6) {
+                        detailRow("Requests",
+                                  "\(usage.requestsRemaining)/\(usage.requestsLimit)",
+                                  pct: usage.requestsLimit > 0
+                                    ? Double(usage.requestsRemaining) / Double(usage.requestsLimit)
+                                    : 1.0)
+                        detailRow("Tokens",
+                                  "\(fmtTokens(usage.tokensRemaining))/\(fmtTokens(usage.tokensLimit))",
+                                  pct: usage.tokensLimit > 0
+                                    ? Double(usage.tokensRemaining) / Double(usage.tokensLimit)
+                                    : 1.0)
+                        HStack {
+                            Text("Session: \(fmtTokens(usage.sessionInputTokens)) in / \(fmtTokens(usage.sessionOutputTokens)) out")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if let cd = usage.resetCountdown {
+                                Text("Reset: \(cd)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground).opacity(0.5))
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        }
+    }
+
+    private var statusDot: some View {
+        Circle()
+            .fill(statusColor)
+            .frame(width: 6, height: 6)
+    }
+
+    private var statusColor: Color {
+        switch usage.status {
+        case .good:     return .green
+        case .warning:  return .yellow
+        case .critical: return .red
+        case .unknown:  return .gray
+        }
+    }
+
+    private var stripBackground: some View {
+        Rectangle()
+            .fill(statusColor.opacity(usage.status == .critical ? 0.10 : 0.04))
+    }
+
+    private func detailRow(_ label: String, _ value: String, pct: Double) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(value)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color(.separator).opacity(0.3))
+                        .frame(height: 3)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(barColor(pct))
+                        .frame(width: geo.size.width * min(max(pct, 0), 1), height: 3)
+                }
+            }
+            .frame(height: 3)
+        }
+    }
+
+    private func barColor(_ pct: Double) -> Color {
+        if pct <= 0.05 { return .red }
+        if pct <= 0.20 { return .yellow }
+        return .green
+    }
+
+    private func fmtTokens(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000     { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+}
+
+// (Scroll: simultaneousGesture drag detection + onAppear/onDisappear anchor)

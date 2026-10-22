@@ -591,10 +591,10 @@ enum FileToolDefinitions {
                 description: "READ-ONLY. Dump all 16 sandbox extension set buckets with full detail: class names, extension paths, flags, linked list structure, and RAW HEX DUMPS. Checks BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which layout is correct. ALWAYS run this before patch_exec.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "patch_exec",
-                description: "WRITE — v2 with CONFIRMED LARA offsets (class_name at +0x10, ext at +0x08). Adds a 'com.apple.sandbox.executable' extension to the extension_set using kwrite on writable kernel heap. Handles all-buckets-full by prepending to chain. Tests sandbox_check + posix_spawn on /bin/sh, /usr/bin/env, /bin/df, /bin/ps. Run dump_extensions FIRST.",
+                description: "READ-ONLY v4 — Analyzes all 16 extension buckets, counts classes/extensions, checks process-exec/process-fork sandbox status, dumps sandbox_label raw fields. Previous v3 caused kernel panics by writing into live extension data buffers. This version only reads. Run dump_extensions first for detailed hex dumps.",
                 inputSchema: Schema(properties: [:], required: [])),
         ToolDef(name: "try_profile_swap",
-                description: "WRITE — RISKY. Tries 3 approaches to bypass sandbox: (1) Copy target PID's sandbox profile pointer into ours, (2) Write NULL as profile, (3) Zero the flags at sandbox+0x50/+0x58. Tests sandbox_check after each. Auto-restores on failure. Default target PID is SpringBoard (usually 34). The sandbox_label is on writable heap so writes won't crash, but the sandbox evaluator might.",
+                description: "WRITE — Copies SpringBoard's sandbox profile pointer into ours. Tests sandbox_check + posix_spawn after. Profile is on writable heap but SPTM may integrity-check the bytecode, so this can kernel panic. Auto-restores on failure. Previous NULL write and flag zeroing attempts removed (they panicked).",
                 inputSchema: Schema(properties: [
                     "target_pid": Prop(description: "PID to copy profile from (default: 34 for SpringBoard)")
                 ], required: [])),

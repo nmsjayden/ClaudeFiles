@@ -335,10 +335,9 @@ final class ChatViewModel: ObservableObject {
     detail: class names, paths, flags, linked list structure, and RAW HEX DUMPS. It checks \
     BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which \
     layout is correct on this device. ALWAYS run this first before patch_exec.
-    - patch_exec(): WRITE — v3 "rename existing class_node" approach. Scans all 16 buckets for \
-    read-write class_nodes, picks one, and renames it to com.apple.sandbox.executable by writing \
-    the new class name into its extension data buffer. Only writes 8 bytes (one class_name pointer). \
-    Tests sandbox_check + posix_spawn on /bin/sh, /usr/bin/env, /bin/df, /bin/ps.
+    - patch_exec(): READ-ONLY v4 — Analyzes all 16 extension buckets, counts classes/extensions, \
+    checks process-exec/process-fork sandbox status, dumps sandbox_label raw fields. Previous v3 \
+    caused kernel panics by writing into live extension data buffers. This version only reads.
     - try_profile_swap(target_pid): WRITE — Copies target PID's sandbox profile pointer into ours. \
     Tests sandbox_check after swap. Auto-restores on failure. Default: PID 34 (SpringBoard). \
     Dumps full sandbox_label fields for analysis. Does NOT write NULL or zero flags (those panic).
@@ -375,10 +374,11 @@ final class ChatViewModel: ObservableObject {
     - launchd (PID 1) has no sandbox (ptr=0xffffffffffffffff)
     - SpringBoard (PID 34) has a different, larger sandbox profile
 
-    STRATEGY: Run patch_exec first (extension rename to add executable class). If sandbox \
-    still denies exec, try try_profile_swap to copy SpringBoard's profile. If both fail, \
-    use sandbox_label_write to experiment with other fields. NEVER write NULL to profile \
-    or zero flags — those cause kernel panics.
+    STRATEGY: Run patch_exec first (read-only analysis of extension set). Use dump_extensions \
+    for hex dumps. Use sandbox_label_write to carefully experiment with individual fields. \
+    NEVER write NULL to profile, zero flags, or write into live extension data buffers — \
+    all of those cause kernel panics. try_profile_swap copies SpringBoard's profile but \
+    SPTM may integrity-check the bytecode.
 
     Addresses are decimal uint64. For hex addresses like 0xffffffe1234, convert to decimal \
     or pass as a string "0xffffffe1234" — the tool handles both formats.

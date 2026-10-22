@@ -1575,15 +1575,20 @@ char *kresearch_add_exec_extension(void) {
             uint64_t ext = (uint64_t)node.ext_list_head;
             int j = 0;
             while (ext && kaddr_ok(ext) && j < 5) {
-                struct extension e = {0};
-                kreadbuf(ext, &e, sizeof(e));
+                uint8_t eraw[EXT_RAW_SIZE];
+                memset(eraw, 0, sizeof(eraw));
+                kreadbuf(ext, eraw, sizeof(eraw));
                 char path[128] = {0};
-                if (kaddr_ok((uint64_t)e.data_ptr)) {
-                    kreadbuf((uint64_t)e.data_ptr, path, sizeof(path) - 1);
+                uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
+                data_ptr = xpaci(data_ptr);
+                if (kaddr_ok(data_ptr)) {
+                    kreadbuf(data_ptr, path, sizeof(path) - 1);
                 }
-                buf_append("    ext: path=\"%s\" pathlen=%llu sc=%d\n",
-                           path, (unsigned long long)e.path_len, e.file.storage_class);
-                ext = (uint64_t)e.next;
+                uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
+                buf_append("    ext: path=\"%s\" pathlen=%llu\n",
+                           path, (unsigned long long)data_len);
+                uint64_t next_ext = *(uint64_t *)(eraw + 0x00);
+                ext = xpaci(next_ext);
                 j++;
             }
         }

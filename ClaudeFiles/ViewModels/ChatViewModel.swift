@@ -772,13 +772,15 @@ final class ChatViewModel: ObservableObject {
 
             // Matched = IDs present in BOTH the assistant's tool_use AND the following tool_results
             let matchedIds = toolUseIds.intersection(toolResultIds)
+            // Crashed = tool_use IDs with NO matching tool_result (app crashed before result saved)
+            let crashedIds = toolUseIds.subtracting(toolResultIds)
 
-            // Build the assistant message blocks
+            // Build the assistant message blocks — keep ALL tool_use blocks
+            // (including crashed ones so the AI knows what it called)
             var apiBlocks: [APIBlock] = []
             for b in group.blocks {
                 if b.type == "tool_use" {
-                    // Only include if this tool_use has a matching result
-                    guard let id = b.id, matchedIds.contains(id) else { continue }
+                    guard let id = b.id, matchedIds.contains(id) || crashedIds.contains(id) else { continue }
                 }
                 apiBlocks.append(APIBlock(type: b.type, text: b.text, id: b.id, name: b.name, input: b.input))
             }
@@ -791,14 +793,32 @@ final class ChatViewModel: ObservableObject {
             }
             // else: empty assistant message after stripping — drop entirely
 
-            // Build the tool_results user message (only matched IDs)
-            let validResults = group.toolResultMsgs.filter { matchedIds.contains($0.toolUseId) }
-            if !validResults.isEmpty {
-                if validResults.count == 1 {
-                    result.append(ChatMessage(role: .user, content: .toolResult(
-                        toolUseId: validResults[0].toolUseId, result: validResults[0].result)))
+            // Build the tool_results user message
+            // Include matched results + synthetic crash results for crashed tools
+            var allResults = group.toolResultMsgs.filter { matchedIds.contains($0.toolUseId) }
+
+            // For crashed tool calls, inject a synthetic result telling the AI what happened
+            for crashedId in crashedIds {
+                let toolName = group.blocks.first(where: { $0.id == crashedId })?.name ?? "unknown"
+                let lastResult = FileToolsExecutor.readLastResult()
+                var crashMsg = "⚠️ APP CRASHED: This tool call (\(toolName)) caused the app to crash "
+                crashMsg += "(likely kernel panic). The result was never returned to you.\n\n"
+                if lastResult != "(no previous result)" {
+                    // Truncate for API message size
+                    let preview = lastResult.count > 3000 ? String(lastResult.prefix(3000)) + "\n... (truncated, run last_result for full)" : lastResult
+                    crashMsg += "RECOVERED OUTPUT (saved to disk before crash):\n\(preview)"
                 } else {
-                    result.append(ChatMessage(role: .user, content: .toolResults(validResults)))
+                    crashMsg += "No recovered output found. Run device_info to check breadcrumbs."
+                }
+                allResults.append((toolUseId: crashedId, result: crashMsg))
+            }
+
+            if !allResults.isEmpty {
+                if allResults.count == 1 {
+                    result.append(ChatMessage(role: .user, content: .toolResult(
+                        toolUseId: allResults[0].toolUseId, result: allResults[0].result)))
+                } else {
+                    result.append(ChatMessage(role: .user, content: .toolResults(allResults)))
                 }
             }
         }

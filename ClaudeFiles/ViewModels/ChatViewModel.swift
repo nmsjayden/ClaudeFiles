@@ -345,6 +345,12 @@ final class ChatViewModel: ObservableObject {
     Generic tool for experimenting with sandbox label fields. Reports before/after values and \
     tests sandbox_check. Use offset 0x00 for profile ptr, 0x10 for extension_set, 0x50/0x58 \
     for flags.
+    - detect_zones(): READ-ONLY — Show the zone metadata exclusion range. SPTM unmaps zone \
+    metadata pages from kernel page tables. Reading them causes Translation fault → kernel panic. \
+    This shows the current exclusion range and known-good heap addresses. Run after any panic.
+    - set_zone_meta(min, max): Set the zone metadata range from panic log. After a kernel panic, \
+    check the "Zone Meta" line and pass min/max addresses (hex). All pointer chain walks then \
+    avoid this range (± 16 MB margin).
 
     KERNEL RESEARCH METHODOLOGY:
     When investigating the kernel or researching SPTM bypass vectors, follow this approach:
@@ -373,6 +379,14 @@ final class ChatViewModel: ObservableObject {
     +0x50 = 0xa0 (flags?), +0x58 = 0x01 (flags?)
     - launchd (PID 1) has no sandbox (ptr=0xffffffffffffffff)
     - SpringBoard (PID 34) has a different, larger sandbox profile
+
+    ZONE METADATA PROTECTION: On A15+ with SPTM, zone metadata pages are unmapped from \
+    kernel page tables. Reading them via kread causes Translation fault level 3 → kernel panic. \
+    The code now has a zone metadata exclusion range (from the last panic log). All pointer \
+    chain walks (extension lists, class_node chains) validate pointers against this range \
+    before reading. If you see "STOPPED: zone_meta=YES" in output, a freed object's pointer \
+    pointed into zone metadata — this is normal and the walk stopped safely. Run detect_zones \
+    to see the current range. After a new panic, use set_zone_meta with values from the panic log.
 
     STRATEGY: Run patch_exec first (read-only analysis of extension set). Use dump_extensions \
     for hex dumps. Use sandbox_label_write to carefully experiment with individual fields. \

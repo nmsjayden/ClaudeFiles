@@ -136,8 +136,38 @@ char *kresearch_read_breadcrumbs(void) {
     }
 }
 
+// ── Zone metadata guard ──
+// SPTM on A15+ unmaps zone metadata pages from kernel page tables.
+// Reading them through our kread primitive causes Translation fault → panic.
+// These globals hold the detected range; initial values from the last panic log.
+// kresearch_detect_zones() can update them at runtime.
+static uint64_t g_zone_meta_min = 0xffffffee69de4000ULL;
+static uint64_t g_zone_meta_max = 0xffffffee6b5e4000ULL;
+static bool     g_zone_meta_detected = false;
+
+static bool is_zone_meta(uint64_t addr) {
+    // Check if addr falls in the known zone metadata range (± 16 MB margin
+    // to account for slight KASLR shifts between boots).
+    if (g_zone_meta_min && g_zone_meta_max) {
+        uint64_t margin = 0x1000000; // 16 MB
+        uint64_t lo = (g_zone_meta_min > margin) ? g_zone_meta_min - margin : 0;
+        uint64_t hi = g_zone_meta_max + margin;
+        if (addr >= lo && addr <= hi) return true;
+    }
+    return false;
+}
+
 static bool kaddr_ok(uint64_t addr) {
-    return (addr >= VM_MIN_KERNEL_ADDRESS && addr <= VM_MAX_KERNEL_ADDRESS);
+    if (addr < VM_MIN_KERNEL_ADDRESS || addr > VM_MAX_KERNEL_ADDRESS) return false;
+    if (is_zone_meta(addr)) return false;
+    return true;
+}
+
+// Stricter check for struct pointers: must be 8-byte aligned
+static bool kptr_ok(uint64_t addr) {
+    if (!kaddr_ok(addr)) return false;
+    if (addr & 0x7) return false;  // kernel struct pointers are 8-byte aligned
+    return true;
 }
 
 static void hexdump_buf(uint64_t kaddr, size_t len, const char *label) {
@@ -162,6 +192,104 @@ static void kread_string(uint64_t kaddr, char *out, size_t maxlen) {
     }
     kreadbuf(kaddr, out, maxlen - 1);
     out[maxlen - 1] = '\0';
+}
+
+// ── Zone metadata detection ──
+
+extern uint64_t g_kernel_base;
+extern uint64_t g_kernel_slide;
+
+char *kresearch_detect_zones(void) {
+    buf_init();
+    buf_append("=== ZONE METADATA RANGE DETECTION ===\n\n");
+    buf_append("SPTM on A15+ unmaps zone metadata pages from kernel page tables.\n");
+    buf_append("Reading these addresses via kread causes Translation fault → panic.\n\n");
+
+    buf_append("kernel_base:  0x%llx\n", g_kernel_base);
+    buf_append("kernel_slide: 0x%llx\n\n", g_kernel_slide);
+
+    buf_append("Current exclusion range:\n");
+    buf_append("  zone_meta_min: 0x%llx\n", g_zone_meta_min);
+    buf_append("  zone_meta_max: 0x%llx\n", g_zone_meta_max);
+    buf_append("  detected: %s\n", g_zone_meta_detected ? "YES" : "NO (using defaults from last panic log)");
+    buf_append("  margin: ± 16 MB\n\n");
+
+    // Try to discover zone metadata by probing known safe regions.
+    // The zone metadata range is typically 20-30 MB below the kernelcache base
+    // in virtual address space. We can infer approximate bounds from the
+    // kernelcache base and the known relationship.
+    //
+    // On this device (A15 T8110, iOS 18.1):
+    //   kernel_base ≈ 0xfffffff032744000
+    //   zone_meta   ≈ 0xffffffee69de4000 - 0xffffffee6b5e4000
+    //   gap:        ≈ 0x1C8960000 (~7.6 GB below kernel_base)
+    //
+    // Reading our own proc structures lets us see "known good" heap addresses,
+    // which gives us a sense of where zone DATA lives (vs zone METADATA).
+
+    uint64_t self_proc = proc_self();
+    if (self_proc) {
+        uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
+        uint64_t ucred   = kread_ptr(proc_ro + off_proc_ro_p_ucred);
+        uint64_t label   = kread_ptr(ucred + off_ucred_cr_label);
+        uint64_t sbx     = kread_ptr(label + off_label_l_perpolicy_sandbox);
+
+        buf_append("Known-good heap addresses (our process):\n");
+        buf_append("  proc:        0x%llx\n", self_proc);
+        buf_append("  proc_ro:     0x%llx\n", proc_ro);
+        buf_append("  ucred:       0x%llx\n", ucred);
+        buf_append("  label:       0x%llx\n", label);
+        buf_append("  sandbox_lbl: 0x%llx\n", sbx);
+
+        // Verify these are NOT in the zone meta range
+        const char *names[] = {"proc", "proc_ro", "ucred", "label", "sandbox_lbl"};
+        uint64_t addrs[] = {self_proc, proc_ro, ucred, label, sbx};
+        for (int i = 0; i < 5; i++) {
+            if (addrs[i] && is_zone_meta(addrs[i])) {
+                buf_append("  ⚠️ WARNING: %s (0x%llx) falls in zone meta exclusion!\n",
+                           names[i], addrs[i]);
+                buf_append("     Zone meta range may be wrong — widen safe window.\n");
+            }
+        }
+
+        if (sbx) {
+            // Read extension_set and walk one bucket to get extension addresses
+            struct sandbox_label sbx_lbl = {0};
+            kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
+            uint64_t ext_set = (uint64_t)sbx_lbl.extension_set;
+            if (ext_set && kaddr_ok(ext_set)) {
+                buf_append("  ext_set:     0x%llx\n", ext_set);
+                // Read first non-NULL bucket
+                uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
+                kreadbuf(ext_set, buckets, sizeof(buckets));
+                for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
+                    if (buckets[i] && kptr_ok(buckets[i])) {
+                        buf_append("  bucket[%d]:   0x%llx\n", i, buckets[i]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    buf_append("\nTo update the zone meta range (if panic log shows different values):\n");
+    buf_append("  Use: set_zone_meta <min_hex> <max_hex>\n");
+    buf_append("  Values come from panic log 'Zone Meta' line.\n");
+
+    return buf_finish();
+}
+
+char *kresearch_set_zone_meta(uint64_t min_addr, uint64_t max_addr) {
+    buf_init();
+    buf_append("=== SET ZONE METADATA RANGE ===\n\n");
+    buf_append("Old: 0x%llx - 0x%llx\n", g_zone_meta_min, g_zone_meta_max);
+    g_zone_meta_min = min_addr;
+    g_zone_meta_max = max_addr;
+    g_zone_meta_detected = true;
+    buf_append("New: 0x%llx - 0x%llx\n", g_zone_meta_min, g_zone_meta_max);
+    buf_append("Detection: MANUAL\n");
+    buf_append("\nAll kaddr_ok/kptr_ok checks now exclude this range (± 16 MB margin).\n");
+    return buf_finish();
 }
 
 // ── Credential dumping ──
@@ -1574,7 +1702,7 @@ char *kresearch_add_exec_extension(void) {
             // Walk extension list
             uint64_t ext = (uint64_t)node.ext_list_head;
             int j = 0;
-            while (ext && kaddr_ok(ext) && j < 5) {
+            while (ext && kptr_ok(ext) && j < 5) {
                 uint8_t eraw[EXT_RAW_SIZE];
                 memset(eraw, 0, sizeof(eraw));
                 kreadbuf(ext, eraw, sizeof(eraw));
@@ -1586,7 +1714,12 @@ char *kresearch_add_exec_extension(void) {
                 uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
                 buf_append("    ext: path=\"%s\" pathlen=%llu\n",
                            path, (unsigned long long)data_len);
-                ext = *(uint64_t *)(eraw + 0x00);
+                uint64_t next = *(uint64_t *)(eraw + 0x00);
+                if (next && !kptr_ok(next)) {
+                    buf_append("    ⚠️ STOPPED: ext next 0x%llx unsafe\n", next);
+                    break;
+                }
+                ext = next;
                 j++;
             }
         }
@@ -2056,7 +2189,7 @@ char *kresearch_proc_list(const char *name_filter) {
     int shown = 0;
     for (pid_t pid = 0; pid < 2000; pid++) {
         uint64_t proc = proc_find(pid);
-        if (!proc || !kaddr_ok(proc)) continue;
+        if (!proc || !kptr_ok(proc)) continue;
 
         char name[32] = {0};
         kreadbuf(proc + off_proc_p_name, name, 31);
@@ -2451,7 +2584,7 @@ char *kresearch_dump_extensions(void) {
         // Walk the extension_class_node chain in this bucket
         uint64_t class_node_ptr = bucket;
         int chain_idx = 0;
-        while (class_node_ptr && chain_idx < 10) {
+        while (class_node_ptr && kptr_ok(class_node_ptr) && chain_idx < 10) {
             struct extension_class_node cn = {0};
             kreadbuf(class_node_ptr, &cn, sizeof(cn));
 
@@ -2467,7 +2600,7 @@ char *kresearch_dump_extensions(void) {
 
             // Read class name (confirmed at +0x10 in the struct)
             char class_name[256] = {0};
-            if ((uint64_t)cn.class_name) {
+            if (kaddr_ok((uint64_t)cn.class_name)) {
                 kreadbuf((uint64_t)cn.class_name, class_name, 255);
             }
             buf_append("      class_name(+0x10): \"%s\" (ptr=0x%llx)\n", class_name, (uint64_t)cn.class_name);
@@ -2478,7 +2611,7 @@ char *kresearch_dump_extensions(void) {
             // Walk the extension linked list
             uint64_t ext_ptr = (uint64_t)cn.ext_list_head;
             int ext_idx = 0;
-            while (ext_ptr && ext_idx < 20) {
+            while (ext_ptr && kptr_ok(ext_ptr) && ext_idx < 20) {
                 // Raw hex dump of extension (0x60 bytes)
                 uint8_t ext_raw[EXT_RAW_SIZE];
                 kreadbuf(ext_ptr, ext_raw, EXT_RAW_SIZE);
@@ -2489,7 +2622,7 @@ char *kresearch_dump_extensions(void) {
                 uint64_t ext_next = *(uint64_t *)(ext_raw + 0x00);  // next extension in list
 
                 char data_path[256] = {0};
-                if (data_ptr >= VM_MIN_KERNEL_ADDRESS && data_ptr <= VM_MAX_KERNEL_ADDRESS) {
+                if (kaddr_ok(data_ptr)) {
                     kreadbuf(data_ptr, data_path, 255);
                 }
 
@@ -2510,12 +2643,24 @@ char *kresearch_dump_extensions(void) {
                            raw_0x50, raw_0x58, ext_next);
 
                 total_extensions++;
-                // Follow next pointer (at +0x00 in extension struct)
+                // Follow next pointer — validate before reading
+                if (ext_next && !kptr_ok(ext_next)) {
+                    buf_append("          ⚠️ STOPPED: next ptr 0x%llx fails kptr_ok (zone_meta=%s, align=%s)\n",
+                               ext_next, is_zone_meta(ext_next) ? "YES" : "no",
+                               (ext_next & 0x7) ? "BAD" : "ok");
+                    break;
+                }
                 ext_ptr = ext_next;
                 ext_idx++;
             }
 
-            class_node_ptr = (uint64_t)cn.next;
+            // Validate class_node next pointer before following
+            uint64_t cn_next = (uint64_t)cn.next;
+            if (cn_next && !kptr_ok(cn_next)) {
+                buf_append("      ⚠️ STOPPED: class_node next 0x%llx fails kptr_ok\n", cn_next);
+                break;
+            }
+            class_node_ptr = cn_next;
             chain_idx++;
         }
     }
@@ -2586,6 +2731,12 @@ char *kresearch_patch_exec(void) {
             continue;
         }
 
+        if (!kptr_ok(buckets[i])) {
+            buf_append("  bucket[%d]: 0x%llx ⚠️ SKIP (zone_meta=%s)\n",
+                       i, buckets[i], is_zone_meta(buckets[i]) ? "YES" : "no");
+            continue;
+        }
+
         uint8_t cn_raw[0x20];
         kreadbuf(buckets[i], cn_raw, 0x20);
 
@@ -2594,7 +2745,7 @@ char *kresearch_patch_exec(void) {
         uint64_t cn_count     = *(uint64_t *)(cn_raw + CN_OFF_COUNT);
 
         char name[256] = {0};
-        if (cn_classname >= VM_MIN_KERNEL_ADDRESS && cn_classname <= VM_MAX_KERNEL_ADDRESS) {
+        if (kaddr_ok(cn_classname)) {
             kreadbuf(cn_classname, name, 255);
         }
 
@@ -2607,20 +2758,26 @@ char *kresearch_patch_exec(void) {
         // Count extensions in this bucket
         uint64_t ext = cn_ext;
         int ext_count = 0;
-        while (ext && ext >= VM_MIN_KERNEL_ADDRESS && ext <= VM_MAX_KERNEL_ADDRESS && ext_count < 20) {
+        while (ext && kptr_ok(ext) && ext_count < 20) {
             uint8_t eraw[EXT_RAW_SIZE];
             kreadbuf(ext, eraw, EXT_RAW_SIZE);
 
             uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
             uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
             char path[128] = {0};
-            if (data_ptr >= VM_MIN_KERNEL_ADDRESS && data_ptr <= VM_MAX_KERNEL_ADDRESS) {
+            if (kaddr_ok(data_ptr)) {
                 kreadbuf(data_ptr, path, sizeof(path) - 1);
             }
             buf_append("    ext[%d]: data=0x%llx len=%llu path=\"%.60s\"\n",
                        ext_count, data_ptr, (unsigned long long)data_len, path);
 
-            ext = *(uint64_t *)(eraw + 0x00); // next
+            uint64_t next = *(uint64_t *)(eraw + 0x00);
+            if (next && !kptr_ok(next)) {
+                buf_append("    ⚠️ STOPPED: ext next 0x%llx (zone_meta=%s)\n",
+                           next, is_zone_meta(next) ? "YES" : "no");
+                break;
+            }
+            ext = next;
             ext_count++;
             total_exts++;
         }
@@ -2730,11 +2887,22 @@ char *kresearch_try_profile_swap(int target_pid) {
     uint64_t target_profile = 0;
     uint64_t target_sbx = 0;
     if (target_proc) {
+        if (!kptr_ok(target_proc)) {
+            buf_append("ABORT: target proc 0x%llx fails kptr_ok (zone_meta=%s)\n",
+                       target_proc, is_zone_meta(target_proc) ? "YES" : "no");
+            bc_close();
+            return buf_finish();
+        }
         uint64_t target_label = proc_get_cred_label(target_proc);
+        if (!kptr_ok(target_label)) {
+            buf_append("ABORT: target label 0x%llx fails kptr_ok\n", target_label);
+            bc_close();
+            return buf_finish();
+        }
         target_sbx = label_get_sandbox(target_label);
         buf_append("\nTarget sandbox_label @ 0x%llx\n", target_sbx);
 
-        if (target_sbx && target_sbx != (uint64_t)-1) {
+        if (target_sbx && target_sbx != (uint64_t)-1 && kptr_ok(target_sbx)) {
             target_profile = kread64(target_sbx);
             buf_append("Target profile ptr:   0x%llx\n", target_profile);
 

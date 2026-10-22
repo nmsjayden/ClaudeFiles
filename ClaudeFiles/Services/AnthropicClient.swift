@@ -607,6 +607,15 @@ enum FileToolDefinitions {
                     "offset": Prop(description: "Offset within sandbox_label (0x00-0x78, hex or decimal)"),
                     "value": Prop(description: "64-bit value to write (hex with 0x prefix or decimal)")
                 ], required: ["offset", "value"])),
+        ToolDef(name: "detect_zones",
+                description: "READ-ONLY — Detect and report the zone metadata exclusion range. SPTM unmaps zone metadata pages — reading them causes kernel panic (Translation fault). Shows current exclusion range, known-good heap addresses, and kernel base. Run this after a panic to verify/update the zone metadata range.",
+                inputSchema: Schema(properties: [:], required: [])),
+        ToolDef(name: "set_zone_meta",
+                description: "Set the zone metadata exclusion range manually from panic log values. After a kernel panic, check the 'Zone Meta' line in the panic log and pass those min/max addresses here. All pointer chain walks will then avoid this range (± 16 MB margin).",
+                inputSchema: Schema(properties: [
+                    "min": Prop(description: "Zone metadata range start address (hex with 0x prefix)"),
+                    "max": Prop(description: "Zone metadata range end address (hex with 0x prefix)")
+                ], required: ["min", "max"])),
     ]
 }
 

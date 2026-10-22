@@ -163,4 +163,20 @@ char *kresearch_try_profile_swap(int target_pid);
 /// Returns a malloc'd string (caller must free).
 char *kresearch_sandbox_label_write(int offset, uint64_t value);
 
+// ────────────────────────────────────────────────────────────────────
+// Zone metadata protection
+// ────────────────────────────────────────────────────────────────────
+
+/// [READ-ONLY] Detect and report the zone metadata range.
+/// SPTM unmaps zone metadata pages — reading them causes kernel panic.
+/// Shows current exclusion range and known-good heap addresses.
+/// Returns a malloc'd string (caller must free).
+char *kresearch_detect_zones(void);
+
+/// Set the zone metadata exclusion range manually.
+/// Use values from panic log "Zone Meta" line.
+/// All pointer validation checks will exclude this range (± 16 MB margin).
+/// Returns a malloc'd string (caller must free).
+char *kresearch_set_zone_meta(uint64_t min_addr, uint64_t max_addr);
+
 #endif /* kernel_research_h */

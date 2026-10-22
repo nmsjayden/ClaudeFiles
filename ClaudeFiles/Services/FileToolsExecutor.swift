@@ -213,6 +213,28 @@ final class FileToolsExecutor {
             }
             return callKResearch(tool: name) { kresearch_sandbox_label_write(off, val) }
 
+        case "detect_zones":
+            return callKResearch(tool: name) { kresearch_detect_zones() }
+
+        case "set_zone_meta":
+            guard let minStr = input["min"]?.string,
+                  let maxStr = input["max"]?.string else {
+                return "Error: min and max hex addresses required"
+            }
+            let minAddr: UInt64
+            let maxAddr: UInt64
+            if minStr.hasPrefix("0x") || minStr.hasPrefix("0X") {
+                minAddr = UInt64(minStr.dropFirst(2), radix: 16) ?? 0
+            } else {
+                minAddr = UInt64(minStr) ?? 0
+            }
+            if maxStr.hasPrefix("0x") || maxStr.hasPrefix("0X") {
+                maxAddr = UInt64(maxStr.dropFirst(2), radix: 16) ?? 0
+            } else {
+                maxAddr = UInt64(maxStr) ?? 0
+            }
+            return callKResearch(tool: name) { kresearch_set_zone_meta(minAddr, maxAddr) }
+
         default:               return "Unknown tool: \(name)"
         }
     }

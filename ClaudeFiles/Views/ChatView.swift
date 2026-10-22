@@ -329,7 +329,7 @@ private struct MessageList: View {
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
-                            .onAppear  { bottomOnScreen = true }
+                            .onAppear  { bottomOnScreen = true; stickToBottom = true }
                             .onDisappear { bottomOnScreen = false }
                     }
                     .padding(.horizontal, 14)
@@ -346,10 +346,6 @@ private struct MessageList: View {
                             if value.translation.height > 14 {
                                 stickToBottom = false
                             }
-                        }
-                        .onEnded { _ in
-                            // Re-engage if the user scrolled back to bottom
-                            if bottomOnScreen { stickToBottom = true }
                         }
                 )
                 // ── Auto-scroll triggers ──

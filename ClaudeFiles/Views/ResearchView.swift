@@ -22,21 +22,24 @@ struct ResearchView: View {
                                 ("compare",          "Compare to launchd", "Diff our creds vs PID 1"),
                                 ("sandbox_ops",      "Sandbox Ops",        "Which operations are permitted"),
                                 ("sandbox_profile",  "Sandbox Profile",    "Full sandbox_label dump"),
+                                ("dump_extensions",  "Dump Extensions",    "All 16 extension buckets + class names"),
+                                ("detect_zones",     "Detect Zones",       "Zone metadata exclusion range"),
                             ])
                         }
 
                         Section {
                             commandGroup(title: "Active Tests", icon: "bolt.fill", color: .orange, commands: [
-                                ("swap_profile",  "Run Research (v15)", "Deep sandbox, SBS launch, URL schemes, ext set"),
+                                ("patch_exec",    "Patch Exec (v5)",    "Rename class_name → sandbox.executable"),
+                                ("swap_profile",  "Swap Profile",       "Copy SpringBoard's sandbox profile"),
                                 ("exec_ext",      "Add Exec Extension", "Add process-exec sandbox ext"),
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),
                             ])
                         }
 
                         Section {
-                            commandGroup(title: "Diagnostics", icon: "ant.fill", color: .red, commands: [
-                                ("breadcrumbs",      "Research Breadcrumbs", "kernel_research.m crash-safe log"),
-                                ("ssv_breadcrumbs",  "SSV Breadcrumbs",      "sandbox.m escape crash-safe log"),
+                            commandGroup(title: "Logs", icon: "doc.text", color: .gray, commands: [
+                                ("breadcrumbs",      "Research Log",     "kernel_research.m crash-safe log"),
+                                ("ssv_breadcrumbs",  "SSV Log",          "sandbox.m escape crash-safe log"),
                             ])
                         }
                     }
@@ -206,11 +209,14 @@ final class ResearchRunner: ObservableObject {
             "compare": "Compare Creds",
             "sandbox_ops": "Sandbox Ops",
             "sandbox_profile": "Sandbox Profile",
-            "swap_profile": "Research v15",
+            "dump_extensions": "Dump Extensions",
+            "detect_zones": "Detect Zones",
+            "patch_exec": "Patch Exec v5",
+            "swap_profile": "Swap Profile",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",
-            "breadcrumbs": "Research Breadcrumbs",
-            "ssv_breadcrumbs": "SSV Breadcrumbs",
+            "breadcrumbs": "Research Log",
+            "ssv_breadcrumbs": "SSV Log",
         ]
 
         isRunning = true
@@ -276,15 +282,30 @@ final class ResearchRunner: ObservableObject {
                         let s = String(cString: r); free(r); return s
                     } else { return "FAILED" }
 
+                case "dump_extensions":
+                    if let r = kresearch_dump_extensions() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
+
+                case "detect_zones":
+                    if let r = kresearch_detect_zones() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
+
+                case "patch_exec":
+                    if let r = kresearch_patch_exec() {
+                        let s = String(cString: r); free(r); return s
+                    } else { return "FAILED" }
+
                 case "breadcrumbs":
                     if let r = kresearch_read_breadcrumbs() {
                         let s = String(cString: r); free(r); return s
-                    } else { return "(no breadcrumbs file found)" }
+                    } else { return "(no log file found)" }
 
                 case "ssv_breadcrumbs":
                     if let r = read_ssv_breadcrumbs() {
                         let s = String(cString: r); free(r); return s
-                    } else { return "(no SSV breadcrumbs file found)" }
+                    } else { return "(no SSV log file found)" }
 
                 default:
                     return "Unknown command: \(command)"

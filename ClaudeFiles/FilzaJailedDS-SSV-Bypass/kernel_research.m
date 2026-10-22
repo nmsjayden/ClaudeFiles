@@ -1580,15 +1580,13 @@ char *kresearch_add_exec_extension(void) {
                 kreadbuf(ext, eraw, sizeof(eraw));
                 char path[128] = {0};
                 uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
-                data_ptr = xpaci(data_ptr);
                 if (kaddr_ok(data_ptr)) {
                     kreadbuf(data_ptr, path, sizeof(path) - 1);
                 }
                 uint64_t data_len = *(uint64_t *)(eraw + EXT_OFF_DATALEN);
                 buf_append("    ext: path=\"%s\" pathlen=%llu\n",
                            path, (unsigned long long)data_len);
-                uint64_t next_ext = *(uint64_t *)(eraw + 0x00);
-                ext = xpaci(next_ext);
+                ext = *(uint64_t *)(eraw + 0x00);
                 j++;
             }
         }

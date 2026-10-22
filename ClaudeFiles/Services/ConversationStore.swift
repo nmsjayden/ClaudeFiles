@@ -117,6 +117,86 @@ final class ConversationStore: ObservableObject {
         mutateById(id) { $0.messages.append(message) }
     }
 
+    /// Delete a message at a specific display index from the selected conversation.
+    /// Removes the message and any immediately following assistant response + tool results.
+    func deleteMessage(at displayIndex: Int) {
+        guard let convId = selectedId,
+              let conv = selected else { return }
+
+        // Build the same display-index → raw-index mapping
+        var displayToRaw: [Int] = []
+        for (rawIdx, m) in conv.messages.enumerated() {
+            if m.toolUseId != nil { continue }
+            if m.text.isEmpty && (m.apiBlocks?.isEmpty ?? true) { continue }
+            displayToRaw.append(rawIdx)
+        }
+
+        guard displayIndex < displayToRaw.count else { return }
+        let rawIdx = displayToRaw[displayIndex]
+        let msg = conv.messages[rawIdx]
+
+        // Collect indices to remove: the message itself + trailing tool results
+        // and the assistant response if this is a user message
+        var toRemove = IndexSet([rawIdx])
+        if msg.role == "user" {
+            // Remove everything after until the next user message (non-tool-result)
+            var j = rawIdx + 1
+            while j < conv.messages.count {
+                let next = conv.messages[j]
+                if next.role == "user" && next.toolUseId == nil { break }
+                toRemove.insert(j)
+                j += 1
+            }
+        }
+
+        mutateById(convId) { c in
+            // Remove from highest index first so indices don't shift
+            for idx in toRemove.sorted().reversed() {
+                c.messages.remove(at: idx)
+            }
+        }
+    }
+
+    /// Edit a user message at a specific display index (replaces text,
+    /// removes the assistant response so it can be re-sent).
+    func editMessage(at displayIndex: Int, newText: String) {
+        guard let convId = selectedId,
+              let conv = selected else { return }
+
+        var displayToRaw: [Int] = []
+        for (rawIdx, m) in conv.messages.enumerated() {
+            if m.toolUseId != nil { continue }
+            if m.text.isEmpty && (m.apiBlocks?.isEmpty ?? true) { continue }
+            displayToRaw.append(rawIdx)
+        }
+
+        guard displayIndex < displayToRaw.count else { return }
+        let rawIdx = displayToRaw[displayIndex]
+        let msg = conv.messages[rawIdx]
+        guard msg.role == "user" else { return }
+
+        // Remove assistant response(s) after this message
+        var toRemove = IndexSet()
+        var j = rawIdx + 1
+        while j < conv.messages.count {
+            let next = conv.messages[j]
+            if next.role == "user" && next.toolUseId == nil { break }
+            toRemove.insert(j)
+            j += 1
+        }
+
+        mutateById(convId) { c in
+            for idx in toRemove.sorted().reversed() {
+                c.messages.remove(at: idx)
+            }
+            // Replace the message text
+            c.messages[rawIdx] = StoredMessage(
+                role: "user", text: newText,
+                attachments: c.messages[rawIdx].attachments
+            )
+        }
+    }
+
     // MARK: - Persistence
 
     private func load() {

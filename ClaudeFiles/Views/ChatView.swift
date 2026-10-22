@@ -318,7 +318,16 @@ private struct MessageList: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 18) {
                         ForEach(Array(vm.displayMessages.enumerated()), id: \.offset) { idx, msg in
-                            MessageBubble(message: msg).id(idx)
+                            MessageBubble(
+                                message: msg,
+                                index: idx,
+                                onDelete: {
+                                    vm.store.deleteMessage(at: idx)
+                                },
+                                onEdit: msg.role == .user ? { newText in
+                                    vm.store.editMessage(at: idx, newText: newText)
+                                } : nil
+                            ).id(idx)
                         }
 
                         if vm.isSending && vm.streamingBelongsToCurrentChat {
@@ -615,6 +624,12 @@ private struct InputBar: View {
 
 struct MessageBubble: View {
     let message: DisplayMessage
+    let index: Int
+    var onDelete: (() -> Void)? = nil
+    var onEdit: ((String) -> Void)? = nil
+
+    @State private var isEditing = false
+    @State private var editText = ""
 
     var body: some View {
         if message.role == .user {
@@ -657,6 +672,51 @@ struct MessageBubble: View {
                 } label: {
                     Label("Copy", systemImage: "doc.on.doc")
                 }
+                if onEdit != nil {
+                    Button {
+                        editText = message.text
+                        isEditing = true
+                    } label: {
+                        Label("Edit", systemImage: "pencil")
+                    }
+                }
+                if let onDelete = onDelete {
+                    Button(role: .destructive) {
+                        onDelete()
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
+            }
+            .sheet(isPresented: $isEditing) {
+                editSheet
+            }
+        }
+    }
+
+    private var editSheet: some View {
+        NavigationView {
+            VStack {
+                TextEditor(text: $editText)
+                    .padding()
+                    .font(.body)
+            }
+            .navigationTitle("Edit Message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isEditing = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            onEdit?(trimmed)
+                        }
+                        isEditing = false
+                    }
+                    .bold()
+                }
             }
         }
     }
@@ -674,6 +734,13 @@ struct MessageBubble: View {
                                 UIPasteboard.general.string = message.text
                             } label: {
                                 Label("Copy text", systemImage: "doc.on.doc")
+                            }
+                            if let onDelete = onDelete {
+                                Button(role: .destructive) {
+                                    onDelete()
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
                         }
                 }

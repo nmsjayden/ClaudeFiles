@@ -29,7 +29,7 @@ struct ResearchView: View {
 
                         Section {
                             commandGroup(title: "Active Tests", icon: "bolt.fill", color: .orange, commands: [
-                                ("patch_exec",    "Patch Exec (v6)",    "Redirect class_name ptr → sandbox.executable"),
+                                ("patch_exec",    "Patch Exec (v7)",    "Redirect class_name ptr (requires Detect Zones first)"),
                                 ("swap_profile",  "Swap Profile",       "Copy SpringBoard's sandbox profile"),
                                 ("exec_ext",      "Add Exec Extension", "Add process-exec sandbox ext"),
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),
@@ -211,7 +211,7 @@ final class ResearchRunner: ObservableObject {
             "sandbox_profile": "Sandbox Profile",
             "dump_extensions": "Dump Extensions",
             "detect_zones": "Detect Zones",
-            "patch_exec": "Patch Exec v6",
+            "patch_exec": "Patch Exec v7",
             "swap_profile": "Swap Profile",
             "exec_ext": "Exec Extension",
             "test_spawn": "Test Spawn",

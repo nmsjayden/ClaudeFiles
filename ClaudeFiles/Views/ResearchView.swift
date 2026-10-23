@@ -29,7 +29,7 @@ struct ResearchView: View {
 
                         Section {
                             commandGroup(title: "Active Tests", icon: "bolt.fill", color: .orange, commands: [
-                                ("patch_exec",    "Patch Exec (v7)",    "Redirect class_name ptr (requires Detect Zones first)"),
+                                ("patch_exec",    "Patch Exec (v7)",    "Redirect class_name ptr (auto-calibrates zones)"),
                                 ("swap_profile",  "Swap Profile",       "Copy SpringBoard's sandbox profile"),
                                 ("exec_ext",      "Add Exec Extension", "Add process-exec sandbox ext"),
                                 ("test_spawn",    "Test Spawn",         "posix_spawn after modifications"),

@@ -335,9 +335,8 @@ final class ChatViewModel: ObservableObject {
     detail: class names, paths, flags, linked list structure, and RAW HEX DUMPS. It checks \
     BOTH our struct offsets AND lara's offsets (OFF_EXT_DATA=0x40) so you can verify which \
     layout is correct on this device. ALWAYS run this first before patch_exec.
-    - patch_exec(): READ-ONLY v4 — Analyzes all 16 extension buckets, counts classes/extensions, \
-    checks process-exec/process-fork sandbox status, dumps sandbox_label raw fields. Previous v3 \
-    caused kernel panics by writing into live extension data buffers. This version only reads.
+    - patch_exec(): v7 POINTER REDIRECT — Auto-calibrates zone bounds if needed, then redirects \
+    extension class_name pointers to grant process-exec. Tests sandbox_check after patching.
     - try_profile_swap(target_pid): WRITE — Copies target PID's sandbox profile pointer into ours. \
     Tests sandbox_check after swap. Auto-restores on failure. Default: PID 34 (SpringBoard). \
     Dumps full sandbox_label fields for analysis. Does NOT write NULL or zero flags (those panic).
@@ -791,6 +790,7 @@ final class ChatViewModel: ObservableObject {
                 // Avoid consecutive user messages — merge or skip
                 if let last = result.last, last.role == .user {
                     // Skip duplicate user messages (shouldn't normally happen)
+                    continue
                 }
                 result.append(userMsg)
                 continue

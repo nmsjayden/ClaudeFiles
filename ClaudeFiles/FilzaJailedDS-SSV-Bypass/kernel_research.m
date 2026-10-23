@@ -168,6 +168,18 @@ static bool is_zone_meta(uint64_t addr) {
 static bool kaddr_ok(uint64_t addr) {
     if (addr < VM_MIN_KERNEL_ADDRESS || addr > VM_MAX_KERNEL_ADDRESS) return false;
     if (is_zone_meta(addr)) return false;
+    // After calibration, tighten the check: address must be in a region
+    // that actually has mapped pages.  The kernel VA range (0xFFFFFFDC..
+    // 0xFFFFFFFB) is ~128 GB but most of it is unmapped gaps.  Only:
+    //   • Zone map (heap, RO, submaps)    — varies per boot
+    //   • Kernelcache (text, data, SPTM)  — always above 0xfffffff0...
+    // Without this, pointers from wrong struct offsets or garbage fields
+    // pass the range check but fault on kreadbuf (Translation fault → panic).
+    if (g_zone_map_detected) {
+        bool in_zone_map    = (addr >= g_zone_map_min && addr <= g_zone_map_max);
+        bool in_kernelcache = (addr >= 0xfffffff000000000ULL);
+        if (!in_zone_map && !in_kernelcache) return false;
+    }
     return true;
 }
 
@@ -349,7 +361,14 @@ static bool calibrate_zone_bounds(void) {
     for (int i = 0; i < safe_count && heap_count < 64; i++)
         heap_addrs[heap_count++] = safe_addrs[i];
 
-    if (sbx) {
+    // Validate sbx against Phase 1 bounds before reading from it.
+    // The sandbox label struct SHOULD be in the zone map, but if a struct offset
+    // is wrong or the pointer is stale, sbx could be in an unmapped gap.
+    // Phase 1 bounds (proc range ± 1 GB) may not cover the full zone map
+    // (sandbox can be in DATA zone, far from GEN0 proc structs), so also
+    // accept addresses within a wider plausible range (up to zone_map_max
+    // if already set by Phase 1, or within 24 GB of observed heap).
+    if (sbx && sbx >= initial_map_min && sbx <= initial_map_max) {
         struct sandbox_label sbx_lbl = {0};
         kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
         uint64_t ext_set = (uint64_t)sbx_lbl.extension_set;

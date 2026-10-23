@@ -203,6 +203,19 @@ static bool kptr_ok(uint64_t addr) {
     return true;
 }
 
+// Safest check for heap chain pointers: must be a valid struct pointer
+// AND within the calibrated zone map (actual mapped heap memory).
+// Use this when following linked-list next pointers (cn.next, ext_next)
+// which should ALWAYS be heap allocations. Falls back to kptr_ok()
+// if zone map hasn't been calibrated yet.
+static bool kptr_heap_ok(uint64_t addr) {
+    if (!kptr_ok(addr)) return false;
+    if (g_zone_map_detected) {
+        if (addr < g_zone_map_min || addr > g_zone_map_max) return false;
+    }
+    return true;
+}
+
 static void hexdump_buf(uint64_t kaddr, size_t len, const char *label) {
     buf_append("  %s @ 0x%llx (%zu bytes):\n", label, kaddr, len);
     uint8_t data[256];
@@ -2629,6 +2642,24 @@ char *kresearch_dump_extensions(void) {
     buf_init();
     buf_append("=== EXTENSION SET DUMP ===\n\n");
 
+    // Auto-calibrate zone bounds to get current zone meta exclusion range.
+    // Without this, stale hardcoded defaults can miss shifted zone meta
+    // after reboot+KASLR, causing kptr_ok() to approve zone meta addresses
+    // → Translation fault → kernel panic when following chain pointers.
+    if (!g_zone_map_detected) {
+        buf_append("Zone bounds not calibrated — auto-calibrating...\n");
+        bool cal_ok = calibrate_zone_bounds();
+        if (!cal_ok) {
+            buf_append("WARNING: zone calibration failed. Chain walking will be conservative.\n\n");
+        } else {
+            buf_append("Zone meta: 0x%llx - 0x%llx (detected=%s)\n",
+                       g_zone_meta_min, g_zone_meta_max,
+                       g_zone_meta_detected ? "YES" : "no");
+            buf_append("Zone map:  0x%llx - 0x%llx\n\n",
+                       g_zone_map_min, g_zone_map_max);
+        }
+    }
+
     uint64_t self_proc = proc_self();
     if (!self_proc) {
         buf_append("ERROR: proc_self() returned NULL\n");
@@ -2689,10 +2720,18 @@ char *kresearch_dump_extensions(void) {
 
         buf_append("\n  bucket[%d]: 0x%llx\n", i, bucket);
 
+        // Validate bucket pointer is in heap before following
+        if (!kptr_heap_ok(bucket)) {
+            buf_append("    SKIP: 0x%llx outside heap (zone_meta=%s, zone_map=%s)\n",
+                       bucket, is_zone_meta(bucket) ? "YES" : "no",
+                       (g_zone_map_detected && (bucket < g_zone_map_min || bucket > g_zone_map_max)) ? "OUT" : "ok");
+            continue;
+        }
+
         // Walk the extension_class_node chain in this bucket
         uint64_t class_node_ptr = bucket;
         int chain_idx = 0;
-        while (class_node_ptr && kptr_ok(class_node_ptr) && chain_idx < 10) {
+        while (class_node_ptr && kptr_heap_ok(class_node_ptr) && chain_idx < 10) {
             struct extension_class_node cn = {0};
             kreadbuf(class_node_ptr, &cn, sizeof(cn));
 
@@ -2719,7 +2758,7 @@ char *kresearch_dump_extensions(void) {
             // Walk the extension linked list
             uint64_t ext_ptr = (uint64_t)cn.ext_list_head;
             int ext_idx = 0;
-            while (ext_ptr && kptr_ok(ext_ptr) && ext_idx < 20) {
+            while (ext_ptr && kptr_heap_ok(ext_ptr) && ext_idx < 20) {
                 // Raw hex dump of extension (0x60 bytes)
                 uint8_t ext_raw[EXT_RAW_SIZE];
                 kreadbuf(ext_ptr, ext_raw, EXT_RAW_SIZE);
@@ -2751,10 +2790,11 @@ char *kresearch_dump_extensions(void) {
                            raw_0x50, raw_0x58, ext_next);
 
                 total_extensions++;
-                // Follow next pointer — validate before reading
-                if (ext_next && !kptr_ok(ext_next)) {
-                    buf_append("          ⚠️ STOPPED: next ptr 0x%llx fails kptr_ok (zone_meta=%s, align=%s)\n",
+                // Follow next pointer — validate it's in heap before reading
+                if (ext_next && !kptr_heap_ok(ext_next)) {
+                    buf_append("          ⚠️ STOPPED: next ptr 0x%llx fails heap check (zone_meta=%s, zone_map=%s, align=%s)\n",
                                ext_next, is_zone_meta(ext_next) ? "YES" : "no",
+                               (g_zone_map_detected && (ext_next < g_zone_map_min || ext_next > g_zone_map_max)) ? "OUT" : "ok",
                                (ext_next & 0x7) ? "BAD" : "ok");
                     break;
                 }
@@ -2762,10 +2802,12 @@ char *kresearch_dump_extensions(void) {
                 ext_idx++;
             }
 
-            // Validate class_node next pointer before following
+            // Validate class_node next pointer is in heap before following
             uint64_t cn_next = (uint64_t)cn.next;
-            if (cn_next && !kptr_ok(cn_next)) {
-                buf_append("      ⚠️ STOPPED: class_node next 0x%llx fails kptr_ok\n", cn_next);
+            if (cn_next && !kptr_heap_ok(cn_next)) {
+                buf_append("      ⚠️ STOPPED: class_node next 0x%llx fails heap check (zone_meta=%s, zone_map=%s)\n",
+                           cn_next, is_zone_meta(cn_next) ? "YES" : "no",
+                           (g_zone_map_detected && (cn_next < g_zone_map_min || cn_next > g_zone_map_max)) ? "OUT" : "ok");
                 break;
             }
             class_node_ptr = cn_next;

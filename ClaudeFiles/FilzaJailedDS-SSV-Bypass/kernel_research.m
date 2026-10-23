@@ -319,8 +319,13 @@ static bool calibrate_zone_bounds(void) {
         if (safe_addrs[i] > safe_max) safe_max = safe_addrs[i];
     }
 
-    // 8 GB margin each side — generous but safe (zone meta is ~55 GB away)
-    uint64_t expand = 0x200000000ULL;
+    // 1 GB margin each side for Phase 1 bounds.
+    // CRITICAL: zone metadata can be as close as 145 MB below zone map start
+    // (observed on iOS 18.1: meta 0xffffffdd938e8000, map 0xffffffdd9e164000).
+    // 8 GB expansion would swallow zone meta → Translation fault → panic.
+    // 1 GB is safe: even from the lowest zone (GEN0 at ~0xffffffde...),
+    // 1 GB below still leaves a ~4 GB gap above zone meta.
+    uint64_t expand = 0x40000000ULL;  // 1 GB
     uint64_t initial_map_min = (safe_min > expand) ? (safe_min - expand) : VM_MIN_KERNEL_ADDRESS;
     uint64_t initial_map_max = safe_max + expand;
     if (initial_map_max < safe_max) initial_map_max = VM_MAX_KERNEL_ADDRESS;

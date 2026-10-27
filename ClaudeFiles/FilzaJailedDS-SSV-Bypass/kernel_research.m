@@ -347,6 +347,15 @@ static bool calibrate_zone_bounds(void) {
     g_zone_map_max = initial_map_max;
     g_zone_map_detected = true;
 
+    // Also arm the LOW-LEVEL bounds check in early_kread (krw.m).
+    // This makes is_kaddr_valid() reject addresses outside zone map +
+    // kernelcache, preventing Translation faults at the kread primitive
+    // level — defense in depth even if higher-level code has gaps.
+    extern uint64_t g_krw_zone_map_min;
+    extern uint64_t g_krw_zone_map_max;
+    g_krw_zone_map_min = initial_map_min;
+    g_krw_zone_map_max = initial_map_max;
+
     // ── Phase 2: Classify bucket pointers against Phase 1 bounds ──
     // ext_set comes from a live sandbox_label field — always a valid heap pointer.
     // Read bucket pointer VALUES (not contents) and classify each:
@@ -418,6 +427,9 @@ static bool calibrate_zone_bounds(void) {
         g_zone_map_min = (obs_min > expand) ? (obs_min - expand) : VM_MIN_KERNEL_ADDRESS;
         g_zone_map_max = obs_max + expand;
         if (g_zone_map_max < obs_max) g_zone_map_max = VM_MAX_KERNEL_ADDRESS;
+        // Keep the low-level kread bounds in sync with refined zone map
+        g_krw_zone_map_min = g_zone_map_min;
+        g_krw_zone_map_max = g_zone_map_max;
     }
 
     // Set zone meta from candidates (observed addresses outside zone map)

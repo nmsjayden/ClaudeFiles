@@ -787,10 +787,22 @@ final class ChatViewModel: ObservableObject {
 
         for item in groups {
             if let userMsg = item as? ChatMessage {
-                // Avoid consecutive user messages — merge or skip
+                // Avoid consecutive user messages — but NEVER drop the user's
+                // real text query. Only skip orphaned tool_result user messages.
                 if let last = result.last, last.role == .user {
-                    // Skip duplicate user messages (shouldn't normally happen)
-                    continue
+                    switch userMsg.content {
+                    case .text, .textWithImages:
+                        // This is the user's actual message. We must include it.
+                        // Insert a minimal placeholder assistant turn to maintain
+                        // the required user/assistant alternation if the previous
+                        // message was a tool_result user message (e.g. after
+                        // trimConversation cut the preceding context so the history
+                        // starts with an assistant + tool-result chain).
+                        result.append(ChatMessage(role: .assistant, content: .text("…")))
+                    default:
+                        // Orphaned / duplicate tool_result — skip
+                        continue
+                    }
                 }
                 result.append(userMsg)
                 continue
